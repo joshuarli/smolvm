@@ -550,6 +550,12 @@ pub struct VmRecord {
     #[serde(default)]
     pub docker_socket: bool,
 
+    /// Optional host-side path for the Docker socket bridge. `None` keeps the
+    /// historical per-VM `docker.sock` location; a path is persisted so an
+    /// embedded SDK can reconnect to the same endpoint after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_socket_path: Option<String>,
+
     /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
     /// queries against this allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -687,6 +693,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            docker_socket_path: None,
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
@@ -751,6 +758,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            docker_socket_path: None,
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,

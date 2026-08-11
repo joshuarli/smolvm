@@ -1,7 +1,7 @@
 //! DB-backed VM lifecycle helpers for embedded SDK backends.
 
 use crate::agent::{AgentClient, AgentManager, HostMount, LaunchFeatures, VmResources};
-use crate::config::{RecordState, VmRecord};
+use crate::config::{PublishedSocketConfig, RecordState, VmRecord};
 use crate::data::network::PortMapping;
 use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
@@ -22,6 +22,20 @@ pub struct MachineSpec {
     pub mounts: Vec<HostMount>,
     /// Host-to-guest port mappings.
     pub ports: Vec<PortMapping>,
+    /// Explicit Unix-socket bridges between host and guest. These are part of
+    /// the machine record, not a launch-only option, so an embedded SDK can
+    /// safely reconnect to the same service endpoint after a process restart.
+    pub published_sockets: Vec<PublishedSocketConfig>,
+    /// Host-side Unix socket path for the dedicated Docker bridge. `None`
+    /// disables the bridge; the launcher derives `<per-VM dir>/docker.sock`
+    /// when the legacy boolean record has no explicit path.
+    pub docker_socket: Option<std::path::PathBuf>,
+    /// Shell commands to run once after the first successful VM boot.
+    /// Commands run in the bare VM when `image` is absent, or in the
+    /// machine's persistent image overlay otherwise. This is the embedded
+    /// equivalent of the CLI/Smolfile init contract and is persisted with
+    /// the machine record so a restart never repeats successful setup.
+    pub init: Vec<String>,
     /// VM resources for this machine.
     pub resources: VmResources,
     /// OCI image the machine boots from, when it is an image machine rather than
@@ -68,6 +82,14 @@ impl MachineSpec {
         record.cuda = self.resources.cuda;
         record.image = self.image.clone();
         record.labels = self.labels.clone();
+        record.published_sockets = self.published_sockets.clone();
+        record.docker_socket = self.docker_socket.is_some();
+        record.docker_socket_path = self
+            .docker_socket
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        record.init = self.init.clone();
+        record.init_completed = false;
         record.ephemeral = !self.persistent;
         record.runtime_managed = self.runtime_managed;
         record
@@ -133,6 +155,32 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
     let mut features = features;
     if record.forkable_on_start() {
         features.forkable = true;
+    }
+    // `PublishedSocketConfig` is durable VM state. The embedded path used to
+    // create the record but then launch with an empty `LaunchFeatures`, leaving
+    // a requested socket silently unreachable. Carry it through the same boot
+    // path used by the CLI so a native SDK machine has identical semantics.
+    if features.published_sockets.is_empty() {
+        features.published_sockets = record.published_sockets.clone();
+    }
+    if !features.expose_docker {
+        features.expose_docker = record.docker_socket;
+    }
+    if features.docker_socket_path.is_none() {
+        features.docker_socket_path = record
+            .docker_socket_path
+            .as_deref()
+            .map(std::path::PathBuf::from);
+    }
+    // Local archive sources are resolved once by the FFI/SDK creation path to
+    // a durable `local:<hash>` reference. Re-derive its staged host directory
+    // before every boot so the agent receives the archive over virtiofs rather
+    // than misclassifying the stable reference as a registry name.
+    if features.packed_layers_dir.is_none() {
+        features.packed_layers_dir = record
+            .image
+            .as_deref()
+            .and_then(crate::data::image_source::packed_layers_dir_for_ref);
     }
     if features.cuda_fork_pool_size.is_none() {
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;
@@ -410,6 +458,9 @@ mod tests {
             name: name.to_string(),
             mounts: Vec::new(),
             ports: Vec::new(),
+            published_sockets: Vec::new(),
+            docker_socket: None,
+            init: Vec::new(),
             resources: VmResources::default(),
             image: None,
             persistent,
@@ -507,6 +558,35 @@ mod tests {
         assert_eq!(record.image.as_deref(), Some("example/service:latest"));
         assert_eq!(record.env, vec![("SESSION".into(), "golden".into())]);
         assert_eq!(record.workdir.as_deref(), Some("/workspace"));
+    }
+
+    #[test]
+    fn record_carries_published_socket_configuration() {
+        let mut spec = test_spec("published-socket", true);
+        spec.published_sockets.push(PublishedSocketConfig {
+            direction: crate::config::SocketDirection::Expose,
+            guest_path: "/run/service.sock".to_string(),
+            host_path: Some("/tmp/service.sock".to_string()),
+        });
+
+        let record = spec.to_record();
+        assert_eq!(record.published_sockets, spec.published_sockets);
+    }
+
+    #[test]
+    fn record_carries_docker_socket_and_init_configuration() {
+        let mut spec = test_spec("docker-host", true);
+        spec.docker_socket = Some(std::path::PathBuf::from("/tmp/docker-host.sock"));
+        spec.init = vec!["apk add --no-cache docker".into()];
+
+        let record = spec.to_record();
+        assert!(record.docker_socket);
+        assert_eq!(
+            record.docker_socket_path.as_deref(),
+            Some("/tmp/docker-host.sock")
+        );
+        assert_eq!(record.init, spec.init);
+        assert!(!record.init_completed);
     }
 
     #[test]

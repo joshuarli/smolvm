@@ -133,7 +133,7 @@ echo "✓ libkrunfw ${FULL_VERSION} built and installed to lib/linux-${ARCH}/"
 ]
 
 [tasks.build-libkrun]
-description = "Build libkrun with BLK and GPU support and copy into lib/ (run build-libkrunfw first if kernel config changed)"
+description = "Build libkrun with BLK and NET support and copy into lib/ (run build-libkrunfw first if kernel config changed)"
 category = "Build"
 script_runner = "bash"
 script = [
@@ -151,7 +151,7 @@ if ! rustup target list --installed 2>/dev/null | grep -q "${RUST_ARCH}-unknown-
   echo "Fix: rustup target add ${RUST_ARCH}-unknown-linux-musl"
   exit 1
 fi
-make -C libkrun BLK=1 NET=1 GPU=1
+env -u KRUN_INIT_BINARY_PATH make -C libkrun BLK=1 NET=1 GPU=1
 if [ "$(uname -s)" = "Darwin" ]; then
   # macOS: the dylib lives in lib/ (alongside libkrunfw.5.dylib).
   cp libkrun/target/release/libkrun.dylib lib/libkrun.dylib

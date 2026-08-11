@@ -15,6 +15,7 @@ members = [
     "crates/smolvm-registry",
     "crates/smolvm-shim",
     "crates/smolvm-smolfile",
+    "crates/smolvm-swift-ffi",
 ]
 resolver = "2"
 
@@ -35,6 +36,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "smolvm"
 path = "src/main.rs"
+
+[[bin]]
+name = "smolvm-boot"
+path = "src/bin/smolvm-boot.rs"
 
 [dependencies]
 smolvm-network = { path = "crates/smolvm-network", version = "1.7.5" }

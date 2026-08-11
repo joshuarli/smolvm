@@ -61,8 +61,18 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+// `cli/internal_boot.rs` is also compiled as the SDK helper module below. It
+// uses `smolvm::…` paths so that it can be shared verbatim with the CLI crate.
+extern crate self as smolvm;
+
 pub mod agent;
 pub mod api;
+/// Minimal `_boot-vm` entry point used by embedded SDK helper binaries.
+///
+/// The helper contains no CLI command dispatch or daemon server; it reads one
+/// boot configuration and then enters libkrun's blocking VM loop.
+#[path = "cli/internal_boot.rs"]
+pub mod boot_helper;
 pub mod config;
 // The shared CUDA daemon manages unix-domain sockets, flock, and detached
 // process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,

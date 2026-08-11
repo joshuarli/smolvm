@@ -165,6 +165,38 @@ smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 reproducible machine config, and for snapshotting a configured machine into a
 reusable `.smolmachine` image without writing a Dockerfile.
 
+Native Swift SDK service machines
+---------------------------------
+
+The native Swift package can create and start a persistent VM directly through
+the embedded runtime; it does not invoke the `smolvm` CLI. The public
+`SmolVMMachineSpecification` initializer accepts a typed `dockerSocket: URL?`
+and `initCommands: [String]` configuration:
+
+```swift
+let specification = SmolVMMachineSpecification(
+    name: "docker-host",
+    image: nil,
+    dockerSocket: URL(fileURLWithPath: "/tmp/docker-host.sock"),
+    initCommands: [
+        "mkdir -p /storage/docker",
+        "dockerd --data-root=/storage/docker >/var/log/dockerd.log 2>&1 &",
+    ],
+    resources: SmolVMResources(network: true, storageGiB: 20),
+    persistent: true
+)
+let machine = try runtime.openOrCreateMachine(specification)
+try machine.start()
+```
+
+`dockerSocket` enables smolvm's dedicated vsock bridge from the host path to
+the guest's upstream `/var/run/docker.sock`; it is separate from generic
+`publishedSockets`. `initCommands` run once after the first successful boot
+and are persisted with the machine record, so a stopped-and-started machine
+retains its service setup. `resources.storageGiB` provisions the persistent
+ext4 data disk used for Docker state. The VM must contain and start `dockerd`
+(for example through the init commands or a prepared rootfs).
+
 How It Works
 ------------
 

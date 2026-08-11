@@ -55,6 +55,10 @@ pub struct BootConfig {
     /// VM data dir; the guest agent proxies it to `/var/run/docker.sock`.
     #[serde(default)]
     pub expose_docker: bool,
+    /// Optional explicit host-side Docker socket path. If absent, the boot
+    /// helper derives `docker.sock` beside the VM's control socket.
+    #[serde(default)]
+    pub docker_socket_path: Option<PathBuf>,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`),
     /// carried into the boot subprocess and applied by the launcher.
     #[serde(default)]

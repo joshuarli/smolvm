@@ -54,6 +54,20 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Create a machine record when absent, otherwise retain the persisted
+    /// record. Embedded hosts use deterministic, private names and persist the
+    /// authoritative workload specification separately; this makes process
+    /// restart reconnect to that same machine without interpreting a duplicate
+    /// record as a fresh VM request.
+    pub fn open_or_create_machine(&self, spec: MachineSpec) -> Result<()> {
+        self.with_name_lock(&spec.name, || {
+            if self.db.get_vm(&spec.name)?.is_some() {
+                return Ok(());
+            }
+            control::create_vm(&self.db, &spec)
+        })
+    }
+
     /// Reclaim shim-managed sandbox VMs whose process is gone (node reboot or a
     /// shim crash left the record + disks behind). See
     /// [`control::reconcile_runtime_machines`]. Returns the count reclaimed.
@@ -64,9 +78,11 @@ impl EmbeddedRuntime {
     /// Start or reconnect to a persisted machine and cache its handle.
     pub fn start_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
+            let record = control::get_record(&self.db, name)?;
             if let Some(handle) = self.cached_handle(name)? {
                 let alive = lock_handle(&handle)?.is_process_alive();
                 if alive {
+                    self.run_initialization(name, &record)?;
                     return Ok(());
                 }
                 self.remove_cached_handle(name)?;
@@ -82,8 +98,87 @@ impl EmbeddedRuntime {
                 }
             }
             self.insert_handle(name, handle)?;
+            if let Err(error) = self.run_initialization(name, &record) {
+                // Initialization is part of the machine's create/start
+                // contract. Do not leave a VM running when setup failed: the
+                // caller must be able to retry from a clean stopped state.
+                if let Some(handle) = self.remove_cached_handle(name)? {
+                    let _ = lock_handle(&handle)?.stop();
+                }
+                let _ = control::mark_stopped(&self.db, name);
+                return Err(error);
+            }
             Ok(())
         })
+    }
+
+    /// Run a machine's persisted first-boot setup exactly once.
+    ///
+    /// Bare-machine commands execute directly in the VM namespace. Image
+    /// machines first pull their image and then execute in the same persistent
+    /// overlay used by regular SDK `exec` calls. The completion bit is written
+    /// only after every command succeeds, so a failed setup can be retried on
+    /// the next start without silently skipping work.
+    fn run_initialization(&self, name: &str, record: &crate::config::VmRecord) -> Result<()> {
+        if record.init_completed || record.init.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(image) = record.image.as_deref() {
+            self.pull_image(name, image)?;
+        }
+
+        for (index, command) in record.init.iter().enumerate() {
+            let (exit_code, stdout, stderr) = self.exec(
+                name,
+                vec!["sh".into(), "-c".into(), command.clone()],
+                record.env.clone(),
+                record.workdir.clone(),
+                None,
+            )?;
+            if exit_code != 0 {
+                return Err(Error::agent(
+                    "machine init",
+                    format!(
+                        "init command {} exited with {} (stdout: {}; stderr: {})",
+                        index + 1,
+                        exit_code,
+                        String::from_utf8_lossy(&stdout).trim(),
+                        String::from_utf8_lossy(&stderr).trim(),
+                    ),
+                ));
+            }
+        }
+
+        match self.db.update_vm(name, |machine| {
+            machine.init_completed = true;
+        })? {
+            Some(_) => {}
+            None => return Err(Error::vm_not_found(name)),
+        }
+        Ok(())
+    }
+
+    /// Starts the image's configured ENTRYPOINT/CMD as the machine's durable
+    /// workload container. This is deliberately separate from
+    /// [`start_machine`](Self::start_machine): embedded callers such as a
+    /// container engine often start a VM and then supply their own command.
+    /// Service images (for example BuildKit) instead need their image-defined
+    /// process to remain running and accept later `exec` requests.
+    pub fn start_image_workload(&self, name: &str) -> Result<()> {
+        let record = self
+            .db
+            .get_vm(name)?
+            .ok_or_else(|| Error::vm_not_found(name))?;
+        let image = record.image.clone().ok_or_else(|| {
+            Error::config("start image workload", "machine does not declare an image")
+        })?;
+        let handle = self.started_handle(name)?;
+        let mut handle = lock_handle(&handle)?;
+        let config = RunConfig::new(image, Vec::new())
+            .with_mounts(crate::workload::record_mounts_to_bindings(&record.mounts))
+            .with_persistent_overlay(Some(name.to_string()));
+        handle.run_container_detached(config).map(|_| ())
     }
 
     /// Start a persisted machine attached to a Kubernetes pod network namespace.
@@ -195,6 +290,21 @@ impl EmbeddedRuntime {
                 return Ok(());
             }
 
+            control::stop_vm(&self.db, name)
+        })
+    }
+
+    /// Stop a machine even when a concurrent embedded exec currently owns its
+    /// cached agent handle.
+    ///
+    /// `exec` and `exec_streaming_with` hold the per-machine handle mutex for
+    /// the lifetime of a guest request. A host runtime must still be able to
+    /// honour a container stop request, so this variant removes that cached
+    /// handle and constructs a fresh process manager to terminate the VM. The
+    /// in-flight request then observes the terminated guest and returns.
+    pub fn force_stop_machine(&self, name: &str) -> Result<()> {
+        self.with_name_lock(name, || {
+            let _ = self.remove_cached_handle(name)?;
             control::stop_vm(&self.db, name)
         })
     }
@@ -584,6 +694,9 @@ mod tests {
             name: name.to_string(),
             mounts: Vec::new(),
             ports: Vec::new(),
+            published_sockets: Vec::new(),
+            docker_socket: None,
+            init: Vec::new(),
             resources: crate::agent::VmResources::default(),
             image: None,
             persistent,
@@ -635,6 +748,19 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn runtime_open_or_create_reconnects_to_an_existing_record() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        runtime
+            .open_or_create_machine(test_spec("runtime-open-existing", false))
+            .unwrap();
+        runtime
+            .open_or_create_machine(test_spec("runtime-open-existing", false))
+            .unwrap();
+
+        assert_eq!(runtime.state("runtime-open-existing"), "stopped");
     }
 
     #[test]

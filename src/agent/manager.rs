@@ -398,8 +398,19 @@ pub fn read_egress_telemetry(name: &str) -> Option<u64> {
         .ok()
 }
 
-/// Cache root: `<cache_dir>/smolvm/vms/`.
+/// Cache root: `<cache_dir>/smolvm/vms/` by default, or
+/// `$SMOLVM_RUNTIME_ROOT/vms/` for an embedded host that needs private state.
+///
+/// The embedded SDK sets `SMOLVM_RUNTIME_ROOT` before it creates its first
+/// runtime. Keeping this override at the storage boundary, rather than
+/// changing `HOME`, lets one application carry its VM disks, sockets, and
+/// egress telemetry in a caller-selected directory on macOS as well as Linux.
+/// The value is process-wide and therefore must be configured before any VM is
+/// started; callers requiring multiple independent roots use separate hosts.
 pub fn vm_cache_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("SMOLVM_RUNTIME_ROOT") {
+        return PathBuf::from(root).join("vms");
+    }
     dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -2053,6 +2064,7 @@ impl AgentManager {
             // the machine's resources (the embedded SDK/CLI path sets the latter).
             cuda: features.cuda || resources_for_config.cuda,
             expose_docker: features.expose_docker,
+            docker_socket_path: features.docker_socket_path,
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,

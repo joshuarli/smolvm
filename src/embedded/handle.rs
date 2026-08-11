@@ -70,6 +70,14 @@ impl VmHandle {
         self.client_mut()?.run_non_interactive(config)
     }
 
+    /// Starts an image workload in the background and returns the durable crun
+    /// container identifier. Kept as an explicit embedded operation because
+    /// the caller must choose whether an image's own ENTRYPOINT/CMD or a
+    /// caller-supplied exec owns the machine lifecycle.
+    pub fn run_container_detached(&mut self, config: RunConfig) -> Result<String> {
+        self.client_mut()?.run_container_detached(config)
+    }
+
     pub fn run(
         &mut self,
         image: &str,

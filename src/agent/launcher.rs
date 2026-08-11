@@ -276,6 +276,10 @@ pub struct LaunchFeatures {
     /// the VM data dir (`DOCKER_HOST=unix://…`). The guest agent proxies each
     /// host connection to its in-guest `/var/run/docker.sock`.
     pub expose_docker: bool,
+    /// Explicit host-side path for the Docker socket bridge. When absent, the
+    /// boot helper derives `<per-VM dir>/docker.sock` for compatibility with
+    /// CLI machines. This path is host-owned and never supplied by the guest.
+    pub docker_socket_path: Option<std::path::PathBuf>,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,

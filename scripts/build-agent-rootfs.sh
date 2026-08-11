@@ -103,7 +103,12 @@ tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
 #   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd"
+# Docker is intentionally baked into the agent rootfs for the embedded
+# Docker-host VM API. Installing it at VM boot would make Strudel's Docker
+# endpoint depend on guest egress and a third-party Alpine mirror before it can
+# serve a client. It remains a guest-only dependency: the host never launches
+# Docker, `dockerd`, or the smolvm CLI at runtime.
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd docker"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -274,14 +279,25 @@ elif [[ "$CROSS_ARCH" == "1" ]]; then
     echo "       are only supported on Linux (uses apk.static)."
     echo "       On macOS, omit --arch or use the same architecture as your host."
     exit 1
+elif command -v docker &> /dev/null; then
+    # A fresh macOS source checkout has no agent rootfs yet, so smolvm cannot
+    # boot the helper VM it formerly used to populate this directory. Docker is
+    # an optional build-time bootstrap only: no Docker executable, daemon, or
+    # image is staged into the rootfs or required by the embedded SDK at runtime.
+    echo "  Using Docker as the first-rootfs bootstrap..."
+    docker run --rm --platform "linux/${CRANE_ARCH}" \
+        -v "$OUTPUT_DIR:/rootfs" \
+        "alpine:${ALPINE_VERSION}" \
+        sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
+    echo "Packages installed successfully"
 elif command -v smolvm &> /dev/null; then
     echo "  Using smolvm..."
     smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
         -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
     echo "Packages installed successfully"
 else
-    echo "Error: smolvm is required to build the agent rootfs on macOS"
-    echo "Install smolvm first: https://github.com/smolvm/smolvm"
+    echo "Error: Docker or an installed smolvm with an agent rootfs is required to build the first macOS agent rootfs"
+    echo "Docker is used only for bootstrap; it is not required by the staged SDK."
     exit 1
 fi
 
@@ -356,9 +372,18 @@ else
         fi
     fi
 
-    # Strategy 2: smolvm with rust:alpine (dogfooding)
+    # Strategy 2: Docker with rust:alpine. This breaks the first-rootfs
+    # bootstrap cycle on macOS; Docker is never included in the SDK bundle.
     if [[ -z "$AGENT_BINARY" ]] || [[ ! -f "$AGENT_BINARY" ]]; then
-        if command -v smolvm &> /dev/null; then
+        if command -v docker &> /dev/null; then
+            echo "Building via Docker (rust:alpine bootstrap)..."
+            docker run --rm --platform "linux/${CRANE_ARCH}" \
+                -v "$PROJECT_ROOT:/work" \
+                "rust:alpine" \
+                sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile $PROFILE -p smolvm-agent -p smolvm-cuda-guest"
+            AGENT_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-agent"
+            CUDA_GUEST_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-cuda-run"
+        elif command -v smolvm &> /dev/null; then
             echo "Building via smolvm (rust:alpine)..."
             smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
                 -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile $PROFILE -p smolvm-agent -p smolvm-cuda-guest"
@@ -367,7 +392,7 @@ else
         else
             echo "Error: Cannot build smolvm-agent"
             echo "  Either install the musl target: rustup target add $RUST_TARGET"
-            echo "  Or install smolvm for cross-compilation"
+            echo "  Or install Docker / smolvm for cross-compilation"
             exit 1
         fi
     fi

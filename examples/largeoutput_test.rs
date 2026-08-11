@@ -11,6 +11,9 @@ fn main() {
         name: name.into(),
         mounts: vec![],
         ports: vec![],
+        published_sockets: vec![],
+        docker_socket: None,
+        init: vec![],
         resources: VmResources {
             cpus: 1,
             memory_mib: 1024,

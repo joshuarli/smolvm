@@ -61,6 +61,45 @@ cargo make test-pack       # Pack tests only
 cargo make test-lib        # Unit tests (no VM required)
 ```
 
+### Native Swift SDK
+
+The Swift package is an embedded binding: its callers load the built
+`smolvm-swift-ffi` library and never start the `smolvm` CLI. Run its contract
+tests from the package directory:
+
+```bash
+cd sdks/swift
+swift test
+```
+
+For a persistent Docker-host machine, provide
+`SmolVMMachineSpecification(dockerSocket:initCommands:resources:persistent:)`.
+`dockerSocket` is the host `URL` for the dedicated bridge to the guest's
+`/var/run/docker.sock`; `initCommands` are persisted and run once after first
+boot; `resources.storageGiB` selects the persistent ext4 data disk. Keep
+`image` as `nil` when `dockerd` should run in the VM's base namespace.
+
+The FFI/Swift contract tests can be run without a VM or network:
+
+```bash
+LIBKRUN_DIR="$PWD/lib" cargo test -p smolvm-swift-ffi --lib --no-default-features
+```
+
+The ignored `sdks/swift/.build/` and `.build-assets/` directories are generated
+outputs, not source artifacts. On macOS, regenerate the complete non-graphics
+SDK bundle with:
+
+```bash
+./scripts/build-libkrun-swift-sdk-macos.sh
+./scripts/build-agent-rootfs.sh --arch "$(uname -m)"
+./sdks/swift/scripts/stage-native-sdk.sh
+```
+
+This variant includes block storage and Unix-stream virtio networking for the
+Docker host, but deliberately excludes virglrenderer, MoltenVK, libepoxy, and
+virtio-gpu. The staging script refuses a graphics-linked `libkrun` and removes
+those legacy generated assets on rerun.
+
 ## Agent Rootfs
 
 The agent rootfs resolution order is:
@@ -110,7 +149,7 @@ The pre-built library binaries in `lib/` cover most development workflows. If yo
 need to rebuild them (after submodule updates, kernel config changes, or enabling
 new features), see:
 
-- [Building libkrun](building-libkrun.md) — rebuild `lib/libkrun.dylib` (GPU support, blk, net)
+- [Building libkrun](building-libkrun.md) — rebuild `lib/libkrun.dylib` (block and networking support)
 - [Building libkrunfw](building-libkrunfw-macos.md) — rebuild `lib/libkrunfw.5.dylib` (kernel blob)
 
 ## Troubleshooting

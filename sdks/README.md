@@ -24,9 +24,40 @@ Bundled native library rule:
 
 Current status:
 
-- **The embedded SDK currently creates a machine without involving the DB storage.  
-This means machines created via the embedded SDK are not visible via the smolvm CLI.  
-This is a bug, and we are actively working on a fix.**
+- The embedded SDK stores persistent machine records in the configured state
+  directory. Machines are intentionally owned by the embedding application and
+  do not require a running `smolvm` CLI process.
+- The native Swift SDK is in `sdks/swift/`. Its
+  `SmolVMMachineSpecification` supports persistent ext4 storage through
+  `SmolVMResources.storageGiB`, a dedicated Docker bridge through
+  `dockerSocket`, and one-time guest setup through `initCommands`.
+
+### Swift Docker-host machines
+
+Use `dockerSocket: URL(fileURLWithPath: ...)` for the host endpoint. This
+dedicated bridge connects to the guest's `/var/run/docker.sock`; a generic
+`SmolVMPublishedSocket` is still available for other Unix sockets. Set
+`image: nil` when the VM itself should run `dockerd`, so init commands execute
+in the VM's base namespace rather than an image workload namespace.
+
+```swift
+let machine = try runtime.openOrCreateMachine(
+    SmolVMMachineSpecification(
+        name: "docker-host",
+        image: nil,
+        dockerSocket: URL(fileURLWithPath: "/tmp/docker-host.sock"),
+        initCommands: ["dockerd --data-root=/storage/docker &"],
+        resources: SmolVMResources(network: true, storageGiB: 20),
+        persistent: true
+    )
+)
+try machine.start()
+```
+
+The FFI wire keys are `dockerSocket`, `initCommands`, and
+`resources.storageGiB` (the decoder also accepts the historical lowercase
+`Mib`/`Gib` spellings). Init commands are recorded and run once after the
+first successful boot; subsequent starts reuse the persistent service state.
 
 ## Hint
 

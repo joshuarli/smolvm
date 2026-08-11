@@ -46,3 +46,6 @@
 
 # Registry infrastructure (separate git repo)
 /smolmachines-registry/
+
+sdks/swift/.build/
+sdks/swift/.build-assets/

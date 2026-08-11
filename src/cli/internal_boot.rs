@@ -586,11 +586,25 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // Unix socket in the per-VM dir. libkrun listens on this path (listen=true),
     // so we only need to hand it the path and clear any stale socket first.
     let docker_socket: Option<std::path::PathBuf> = if config.expose_docker {
-        config.vsock_socket.parent().map(|dir| {
-            let path = dir.join("docker.sock");
-            let _ = std::fs::remove_file(&path);
-            path
-        })
+        config
+            .docker_socket_path
+            .clone()
+            .or_else(|| {
+                config
+                    .vsock_socket
+                    .parent()
+                    .map(|dir| dir.join("docker.sock"))
+            })
+            .map(|path| {
+                // The SDK may choose a socket under its own state directory;
+                // create that parent before libkrun asks it to bind. Existing
+                // CLI paths already have a parent, so this is harmless there.
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::remove_file(&path);
+                path
+            })
     } else {
         None
     };
