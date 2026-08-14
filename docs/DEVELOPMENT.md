@@ -3,10 +3,10 @@
 ## Prerequisites
 
 - Rust toolchain
-- [git-lfs](https://git-lfs.com) (required for library binaries)
+- [git-lfs](https://git-lfs.com) (required for the committed platform libraries)
 - smolvm itself (for cross-compiling the agent — builds inside a `rust:alpine` VM)
 - e2fsprogs (for storage template creation; `mkfs.ext4`; on macOS: `brew install e2fsprogs`)
-- LLVM (macOS only, for building libkrun: `brew install llvm`)
+- LLVM and virglrenderer (macOS only, for building libkrun: `brew install llvm virglrenderer`)
 - [cargo-make](https://github.com/sagiegurari/cargo-make): `cargo install cargo-make`
 
 ## Quick Start
@@ -106,11 +106,19 @@ The `cargo make dist` task wraps `scripts/build-dist.sh`. Other scripts:
 
 ## Rebuilding Libraries
 
-The pre-built library binaries in `lib/` cover most development workflows. If you
-need to rebuild them (after submodule updates, kernel config changes, or enabling
-new features), see:
+The macOS `libkrun.dylib` is generated from the pinned `libkrun` submodule and is
+intentionally not committed or stored in Git LFS. Build it locally when needed:
 
-- [Building libkrun](building-libkrun.md) — rebuild `lib/libkrun.dylib` (GPU support, blk, net)
+```bash
+rustup target add aarch64-unknown-linux-musl  # arm64 macOS
+cargo make build-libkrun
+```
+
+The other platform library binaries remain committed for cross-platform
+development. If you need to rebuild them (after submodule updates, kernel config
+changes, or enabling new features), see:
+
+- [Building libkrun](building-libkrun.md) — rebuild platform libkrun artifacts
 - [Building libkrunfw](building-libkrunfw-macos.md) — rebuild `lib/libkrunfw.5.dylib` (kernel blob)
 
 ## Troubleshooting

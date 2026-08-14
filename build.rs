@@ -59,6 +59,11 @@ fn has_library(name: &str) -> bool {
     pkg_config::Config::new().probe(name).is_ok()
 }
 
+#[cfg(target_os = "macos")]
+fn has_bundled_libkrun(path: &std::path::Path) -> bool {
+    path.join("libkrun.dylib").exists()
+}
+
 fn main() {
     // Build scripts run on the HOST: `cfg!(target_os)` here describes the
     // build machine, not the artifact. Cross-compiling smolvm from macOS to
@@ -121,6 +126,15 @@ fn link_libkrun() {
 
     // Option 1: Bundle libraries with the binary
     if let Ok(bundle_path) = std::env::var("LIBKRUN_BUNDLE") {
+        #[cfg(target_os = "macos")]
+        if !has_bundled_libkrun(std::path::Path::new(&bundle_path)) {
+            println!(
+                "cargo:warning=libkrun bundle not found at {}/libkrun.dylib; build it locally before running a VM",
+                bundle_path
+            );
+            return;
+        }
+
         // On Linux, check that the library is not an LFS pointer before linking
         #[cfg(target_os = "linux")]
         {
@@ -188,6 +202,14 @@ fn link_libkrun() {
 
     // Option 3: Custom directory
     if let Ok(dir) = std::env::var("LIBKRUN_DIR") {
+        #[cfg(target_os = "macos")]
+        if !has_bundled_libkrun(std::path::Path::new(&dir)) {
+            println!(
+                "cargo:warning=libkrun not found at {}/libkrun.dylib; build it locally before running a VM",
+                dir
+            );
+            return;
+        }
         println!("cargo:rustc-link-search=native={}", dir);
         link_krun();
         return;
@@ -270,8 +292,12 @@ fn link_libkrun() {
         }
     }
 
-    // Fallback
-    link_krun();
+    // Runtime loading is dynamic. A source checkout can therefore compile
+    // without a local libkrun; VM execution still requires a generated or
+    // installed library bundle. Keep the weak link when a known system copy
+    // was found above, but do not make a missing generated artifact a link
+    // error for ordinary Rust builds and tests.
+    println!("cargo:warning=libkrun not found; build lib/libkrun.dylib before running a VM");
 }
 
 /// Build libkrun from the vendored submodule.

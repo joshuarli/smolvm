@@ -30,6 +30,7 @@
 
 # Bundled libraries are in the /lib (large binaries - download or build locally)
 # These are bundled into release tarballs by build-dist.sh
+/lib/libkrun.dylib
 
 # Agent rootfs is generated in target/ by build-agent-rootfs.sh
 

@@ -133,7 +133,7 @@ echo "✓ libkrunfw ${FULL_VERSION} built and installed to lib/linux-${ARCH}/"
 ]
 
 [tasks.build-libkrun]
-description = "Build libkrun with BLK and GPU support and copy into lib/ (run build-libkrunfw first if kernel config changed)"
+description = "Build libkrun with BLK, NET, and GPU support and copy the generated dylib/so into lib/ (run build-libkrunfw first if kernel config changed)"
 category = "Build"
 script_runner = "bash"
 script = [
