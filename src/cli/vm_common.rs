@@ -2715,6 +2715,126 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
 // List
 // ============================================================================
 
+/// Resource observations behind the versioned TSV companion boundary.
+///
+/// This contains only the resource envelope and host-observed process/disk
+/// gauges. Unavailable observations remain absent until TSV rendering, where
+/// they become empty fields in the fixed record.
+#[derive(Debug)]
+struct MachineStats {
+    name: String,
+    state: String,
+    pid: Option<i32>,
+    cpus: u8,
+    memory_mb: u32,
+    storage_gb: u64,
+    overlay_gb: u64,
+    cpu_seconds: Option<u64>,
+    cpu_millis: Option<u64>,
+    rss_mb: Option<u64>,
+    disk_used_mb: Option<u64>,
+}
+
+const MACHINE_STATS_TSV_ABI: &str = "machine-stats-v1";
+
+/// Build the shared stats snapshot from the same record, state, process, and
+/// disk helpers used by the existing machine status/API paths.
+fn machine_stats_snapshot(name: &str, record: &VmRecord) -> MachineStats {
+    let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
+    // Do not expose a stale PID after a clean stop. For other states,
+    // process_stats() remains the authority on whether the process is still
+    // sampleable.
+    let pid = if actual_state == RecordState::Stopped {
+        None
+    } else {
+        record.pid
+    };
+    let process = pid.and_then(smolvm::process::process_stats);
+
+    MachineStats {
+        name: name.to_string(),
+        state: actual_state.to_string(),
+        pid,
+        cpus: record.cpus,
+        memory_mb: record.mem,
+        storage_gb: record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB),
+        overlay_gb: record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB),
+        cpu_seconds: process.map(|stats| stats.cpu_time_ns / 1_000_000_000),
+        cpu_millis: process.map(|stats| stats.cpu_time_ns / 1_000_000),
+        rss_mb: process.map(|stats| stats.rss_bytes / (1024 * 1024)),
+        disk_used_mb: smolvm::agent::disk_used_mb(name),
+    }
+}
+
+fn load_machine_stats(name: &Option<String>) -> smolvm::Result<MachineStats> {
+    let label = vm_label(name);
+    let config = SmolvmConfig::load()?;
+    let stats = config
+        .list_vms()
+        .find(|(machine, _)| *machine == &label)
+        .map(|(_, record)| machine_stats_snapshot(&label, record))
+        .ok_or_else(|| {
+            smolvm::Error::config("machine stats", format!("machine '{}' not found", label))
+        })?;
+    Ok(stats)
+}
+
+fn tsv_optional(value: Option<u64>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn format_machine_stats_tsv(stats: &MachineStats) -> String {
+    format!(
+        "{MACHINE_STATS_TSV_ABI}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        stats.name,
+        stats.state,
+        stats.pid.map(|pid| pid.to_string()).unwrap_or_default(),
+        stats.cpus,
+        stats.memory_mb,
+        stats.storage_gb,
+        stats.overlay_gb,
+        tsv_optional(stats.cpu_seconds),
+        tsv_optional(stats.cpu_millis),
+        tsv_optional(stats.rss_mb),
+        tsv_optional(stats.disk_used_mb),
+    )
+}
+
+/// Emit the closed, versioned machine-statistics subprocess ABI.
+pub fn stats_vm_tsv(name: &Option<String>) -> smolvm::Result<()> {
+    let stats = load_machine_stats(name)?;
+    println!("{}", format_machine_stats_tsv(&stats));
+    Ok(())
+}
+
+#[cfg(test)]
+mod machine_stats_tests {
+    use super::*;
+
+    #[test]
+    fn machine_stats_tsv_has_the_closed_12_field_abi() {
+        let mut record = VmRecord::new("fixture".into(), 3, 768, vec![], vec![], false);
+        record.storage_gb = Some(12);
+        record.overlay_gb = Some(5);
+
+        let line = format_machine_stats_tsv(&machine_stats_snapshot("fixture", &record));
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 12);
+        assert_eq!(fields[0], MACHINE_STATS_TSV_ABI);
+        assert_eq!(fields[1], "fixture");
+        assert_eq!(fields[2], "created");
+        assert_eq!(fields[3], "");
+        assert_eq!(fields[4], "3");
+        assert_eq!(fields[5], "768");
+        assert_eq!(fields[6], "12");
+        assert_eq!(fields[7], "5");
+        assert_eq!(fields[8], "");
+        assert_eq!(fields[9], "");
+        assert_eq!(fields[10], "");
+        assert_eq!(fields[11], "");
+    }
+}
+
 /// List all machines.
 pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
     let config = SmolvmConfig::load()?;

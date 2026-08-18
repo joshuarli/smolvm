@@ -334,7 +334,7 @@ pub fn shared_pack_cache_root() -> PathBuf {
 /// a 20 GiB image that the guest has barely written to consumes only a few MiB.
 /// This is the gauge the control integrates over time for active-disk billing.
 /// `None` if the dir can't be read (machine gone / not yet created).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn disk_used_mb(name: &str) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     fn walk_blocks(dir: &Path) -> u64 {
@@ -360,8 +360,9 @@ pub fn disk_used_mb(name: &str) -> Option<u64> {
     Some(walk_blocks(&dir) / (1024 * 1024))
 }
 
-/// macOS host has no VMs (dev stub) — no disk to measure.
-#[cfg(not(target_os = "linux"))]
+/// Platforms without Unix sparse-file block accounting cannot report this
+/// gauge through the shared helper.
+#[cfg(not(unix))]
 pub fn disk_used_mb(_name: &str) -> Option<u64> {
     None
 }

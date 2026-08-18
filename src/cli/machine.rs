@@ -15,7 +15,7 @@ use crate::cli::parsers::{
     mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list, parse_image,
 };
 use crate::cli::vm_common::{self, DeleteVmOptions};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
@@ -472,6 +472,10 @@ pub enum MachineCmd {
 
     /// Show egress denials — outbound connections the machine's egress policy refused
     EgressEvents(EgressEventsCmd),
+
+    /// Show closed host resource metrics for one machine
+    #[command(hide = true)]
+    Stats(StatsCmd),
 
     /// List all machines
     #[command(visible_alias = "list")]
@@ -4386,6 +4390,36 @@ impl StatusCmd {
             return vm_common::status_vm_json(&self.name);
         }
         vm_common::status_vm(&self.name, |_| {})
+    }
+}
+
+/// The sole machine-readable form of the `machine stats` companion boundary.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum StatsFormat {
+    Tsv,
+}
+
+/// Show one machine's host-side resource metrics.
+///
+/// The command is read-only. It reports the configured resource envelope and
+/// samples the host VMM process for CPU/RSS, while the disk value comes from
+/// the machine data directory. It does not inspect guest processes or guest
+/// filesystem usage.
+#[derive(Args, Debug)]
+pub struct StatsCmd {
+    /// Machine to inspect (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// The stable TSV record for machine-oriented orchestration.
+    #[arg(long, value_enum, default_value = "tsv")]
+    pub format: StatsFormat,
+}
+
+impl StatsCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        debug_assert!(matches!(self.format, StatsFormat::Tsv));
+        vm_common::stats_vm_tsv(&self.name)
     }
 }
 
