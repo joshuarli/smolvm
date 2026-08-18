@@ -11,7 +11,7 @@ use crate::data::network;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use crate::error::Result;
-use crate::network::NetworkBackend;
+use crate::network::{ExternalNetworkConfig, NetworkBackend};
 use serde::{Deserialize, Serialize};
 pub use smolvm_protocol::publish_socket::SocketDirection;
 use std::collections::HashMap;
@@ -402,7 +402,7 @@ pub struct VmRecord {
     #[serde(default)]
     pub published_sockets: Vec<PublishedSocketConfig>,
 
-    /// Enable outbound network access (TSI).
+    /// Attach a guest network device.
     #[serde(default)]
     pub network: bool,
 
@@ -476,6 +476,10 @@ pub struct VmRecord {
     /// Preferred network backend override for machine launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<NetworkBackend>,
+
+    /// Static virtio-net attachment managed by an external local switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_network: Option<ExternalNetworkConfig>,
 
     /// Custom DNS resolver for the guest. None = backend default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -680,6 +684,7 @@ impl VmRecord {
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            external_network: None,
             dns: None,
             network_name: None,
             image: None,
@@ -746,6 +751,7 @@ impl VmRecord {
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            external_network: None,
             dns: None,
             network_name: None,
             image: None,
@@ -919,6 +925,7 @@ impl VmRecord {
             memory_mib: self.mem,
             network: self.network,
             network_backend: self.network_backend,
+            external_network: self.external_network.clone(),
             gpu: self.gpu.unwrap_or(false),
             gpu_vram_mib: self.gpu_vram_mib,
             cuda: self.cuda,

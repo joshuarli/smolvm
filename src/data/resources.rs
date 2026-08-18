@@ -18,7 +18,7 @@ pub const DEFAULT_MICROVM_MEMORY_MIB: u32 = 8192;
 /// `--gpu-vram <MiB>` or Smolfile `gpu_vram = <MiB>`.
 pub const DEFAULT_GPU_VRAM_MIB: u32 = 4096;
 
-use crate::network::NetworkBackend;
+use crate::network::{ExternalNetworkConfig, NetworkBackend};
 
 /// Resources available to a micro vm.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -27,11 +27,16 @@ pub struct VmResources {
     pub cpus: u8,
     /// Memory in MiB.
     pub memory_mib: u32,
-    /// Enable outbound network access (TSI).
+    /// Attach a guest network device.
     pub network: bool,
     /// Preferred network backend override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<NetworkBackend>,
+    /// Static settings for a virtio-net link owned by an external local switch.
+    ///
+    /// When set, smolvm does not start its built-in gateway or NAT runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_network: Option<ExternalNetworkConfig>,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     #[serde(default)]
     pub gpu: bool,
@@ -119,6 +124,11 @@ impl VmResources {
                 "overlay disk size must be greater than 0 GiB",
             ));
         }
+        if let Some(external_network) = &self.external_network {
+            external_network
+                .validate()
+                .map_err(|reason| crate::Error::config("validate external virtio-net", reason))?;
+        }
         Ok(())
     }
 }
@@ -130,6 +140,7 @@ impl Default for VmResources {
             memory_mib: DEFAULT_MICROVM_MEMORY_MIB,
             network: false,
             network_backend: None,
+            external_network: None,
             gpu: false,
             gpu_vram_mib: None,
             cuda: false,
@@ -204,6 +215,26 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let back: VmResources = serde_json::from_str(&json).unwrap();
         assert_eq!(back.gpu_vram_mib, Some(2048));
+    }
+
+    #[test]
+    fn vm_resources_serde_roundtrip_preserves_external_network() {
+        let r = VmResources {
+            network: true,
+            network_backend: Some(NetworkBackend::VirtioNet),
+            external_network: Some(ExternalNetworkConfig {
+                unixstream_path: std::path::PathBuf::from("/tmp/external-net/p-web.sock"),
+                guest_ip: std::net::Ipv4Addr::new(10, 89, 0, 2),
+                prefix_len: 24,
+                gateway: std::net::Ipv4Addr::new(10, 89, 0, 1),
+                dns_server: std::net::Ipv4Addr::new(10, 89, 0, 1),
+                guest_mac: [0x02, 0, 0, 0, 0, 2],
+                egress: false,
+            }),
+            ..Default::default()
+        };
+        let back: VmResources = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.external_network, r.external_network);
     }
 
     #[test]

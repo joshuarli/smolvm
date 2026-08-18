@@ -21,7 +21,10 @@ use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, V
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
-use smolvm::network::{validate_requested_network_backend, NetworkBackend};
+use smolvm::network::{
+    parse_ipv4_cidr, parse_mac, validate_requested_network_backend, ExternalNetworkConfig,
+    NetworkBackend,
+};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -107,6 +110,92 @@ fn resolve_egress_flags(
     };
 
     Ok((allow_cidr, net, dns_filter_hosts))
+}
+
+/// Assemble the all-or-nothing static attachment used by a local external L2
+/// switch. Keeping this CLI-only avoids widening Smolfile's network contract
+/// for a deliberately narrow orchestration seam.
+fn external_network_config(
+    unixstream_path: Option<PathBuf>,
+    address: Option<String>,
+    gateway: Option<std::net::Ipv4Addr>,
+    dns_server: Option<std::net::Ipv4Addr>,
+    mac: Option<String>,
+    egress: bool,
+) -> smolvm::Result<Option<ExternalNetworkConfig>> {
+    let supplied = [
+        unixstream_path.is_some(),
+        address.is_some(),
+        gateway.is_some(),
+        dns_server.is_some(),
+        mac.is_some(),
+    ]
+    .into_iter()
+    .filter(|supplied| *supplied)
+    .count();
+    if supplied == 0 {
+        if egress {
+            return Err(smolvm::Error::config(
+                "external virtio-net egress",
+                "--net-egress requires the complete external virtio-net tuple",
+            ));
+        }
+        return Ok(None);
+    }
+    if supplied != 5 {
+        return Err(smolvm::Error::config(
+            "external virtio-net",
+            "--net-unixstream, --net-address, --net-gateway, --net-dns, and --net-mac must be supplied together",
+        ));
+    }
+
+    let (guest_ip, prefix_len) = parse_ipv4_cidr(&address.expect("checked above"))
+        .map_err(|reason| smolvm::Error::config("--net-address", reason))?;
+    let config = ExternalNetworkConfig {
+        unixstream_path: unixstream_path.expect("checked above"),
+        guest_ip,
+        prefix_len,
+        gateway: gateway.expect("checked above"),
+        dns_server: dns_server.expect("checked above"),
+        guest_mac: parse_mac(&mac.expect("checked above"))
+            .map_err(|reason| smolvm::Error::config("--net-mac", reason))?,
+        egress,
+    };
+    config
+        .validate()
+        .map_err(|reason| smolvm::Error::config("external virtio-net", reason))?;
+    Ok(Some(config))
+}
+
+/// Apply static external-network intent after CLI and Smolfile settings have
+/// been merged. It deliberately owns backend and guest DNS selection, because
+/// smolvm's regular `--dns` configures its built-in gateway instead.
+fn apply_external_network_config(
+    params: &mut vm_common::CreateVmParams,
+    external_network: Option<ExternalNetworkConfig>,
+) -> smolvm::Result<()> {
+    let Some(external_network) = external_network else {
+        return Ok(());
+    };
+    if params
+        .network_backend
+        .is_some_and(|backend| backend != NetworkBackend::VirtioNet)
+    {
+        return Err(smolvm::Error::config(
+            "external virtio-net",
+            "--net-unixstream requires --net-backend virtio-net when --net-backend is supplied",
+        ));
+    }
+    if params.dns.is_some() {
+        return Err(smolvm::Error::config(
+            "external virtio-net",
+            "--dns configures smolvm's built-in gateway; use --net-dns for the external network",
+        ));
+    }
+    params.net = true;
+    params.network_backend = Some(NetworkBackend::VirtioNet);
+    params.external_network = Some(external_network);
+    Ok(())
 }
 
 fn smolmachine_egress_fields(
@@ -540,6 +629,57 @@ pub struct RunCmd {
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum, help_heading = "Network")]
     pub net_backend: Option<NetworkBackend>,
+
+    /// Attach virtio-net to an externally owned Unix-stream listener. Requires
+    /// --net-address, --net-gateway, --net-dns, and --net-mac.
+    #[arg(
+        long = "net-unixstream",
+        value_name = "PATH",
+        help_heading = "Network",
+        conflicts_with = "from"
+    )]
+    pub net_unixstream: Option<PathBuf>,
+
+    /// Static external-network guest address in IPv4/prefix form.
+    #[arg(
+        long = "net-address",
+        value_name = "IP/PREFIX",
+        help_heading = "Network",
+        conflicts_with = "from"
+    )]
+    pub net_address: Option<String>,
+
+    /// Static external-network IPv4 gateway.
+    #[arg(
+        long = "net-gateway",
+        value_name = "IP",
+        help_heading = "Network",
+        conflicts_with = "from"
+    )]
+    pub net_gateway: Option<std::net::Ipv4Addr>,
+
+    /// Static external-network IPv4 DNS server.
+    #[arg(
+        long = "net-dns",
+        value_name = "IP",
+        help_heading = "Network",
+        conflicts_with = "from"
+    )]
+    pub net_dns: Option<std::net::Ipv4Addr>,
+
+    /// Static external-network guest NIC MAC address.
+    #[arg(
+        long = "net-mac",
+        value_name = "MAC",
+        help_heading = "Network",
+        conflicts_with = "from"
+    )]
+    pub net_mac: Option<String>,
+
+    /// Add smolvm's host-side NAT as a second virtio-net NIC (`eth1`) while
+    /// retaining the externally switched NIC as `eth0`.
+    #[arg(long = "net-egress", help_heading = "Network")]
+    pub net_egress: bool,
 
     /// Custom DNS resolver for the guest (implies --net). Use this when the
     /// default public resolvers (8.8.8.8/1.1.1.1) are blocked on your network.
@@ -1092,6 +1232,15 @@ impl RunCmd {
             .run();
         }
 
+        let external_network = external_network_config(
+            self.net_unixstream.clone(),
+            self.net_address.clone(),
+            self.net_gateway,
+            self.net_dns,
+            self.net_mac.clone(),
+            self.net_egress,
+        )?;
+
         let requested_name = self.name.clone();
         let vm_name = if self.detach {
             requested_name.unwrap_or_else(|| "default".to_string())
@@ -1145,6 +1294,7 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        apply_external_network_config(&mut params, external_network)?;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -1172,6 +1322,12 @@ impl RunCmd {
         // the normal in-guest pull.
         if let Some(img) = params.image.clone() {
             if let Some(sidecar) = smolvm::data::pack_ref::resolve_pack_ref_blocking(&img)? {
+                if params.external_network.is_some() {
+                    return Err(Error::config(
+                        "external virtio-net",
+                        "external virtio-net requires machine create/start and is unavailable for packed runs",
+                    ));
+                }
                 if self.detach {
                     // pack-run is ephemeral-only; a persistent machine from a
                     // pack ref goes through create (which reroutes the same way).
@@ -1424,6 +1580,7 @@ impl RunCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            external_network: params.external_network.clone(),
             dns: params.dns,
             network_name: params.network_name.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
@@ -1765,6 +1922,7 @@ impl RunCmd {
                                 ports: port_tuples,
                                 network: params.net,
                                 network_backend: params.network_backend,
+                                external_network: params.external_network.clone(),
                                 dns: params.dns,
                                 network_name: params.network_name.clone(),
                                 storage_gb: params.storage_gb,
@@ -1928,6 +2086,7 @@ impl RunCmd {
                             ports: port_tuples,
                             network: params.net,
                             network_backend: params.network_backend,
+                            external_network: params.external_network.clone(),
                             dns: params.dns,
                             network_name: params.network_name.clone(),
                             storage_gb: params.storage_gb,
@@ -2987,6 +3146,36 @@ pub struct CreateCmd {
     #[arg(long = "net-backend", value_enum)]
     pub net_backend: Option<NetworkBackend>,
 
+    /// Attach virtio-net to an externally owned Unix-stream listener. Requires
+    /// --net-address, --net-gateway, --net-dns, and --net-mac.
+    #[arg(long = "net-unixstream", value_name = "PATH", conflicts_with = "from")]
+    pub net_unixstream: Option<PathBuf>,
+
+    /// Static external-network guest address in IPv4/prefix form.
+    #[arg(
+        long = "net-address",
+        value_name = "IP/PREFIX",
+        conflicts_with = "from"
+    )]
+    pub net_address: Option<String>,
+
+    /// Static external-network IPv4 gateway.
+    #[arg(long = "net-gateway", value_name = "IP", conflicts_with = "from")]
+    pub net_gateway: Option<std::net::Ipv4Addr>,
+
+    /// Static external-network IPv4 DNS server.
+    #[arg(long = "net-dns", value_name = "IP", conflicts_with = "from")]
+    pub net_dns: Option<std::net::Ipv4Addr>,
+
+    /// Static external-network guest NIC MAC address.
+    #[arg(long = "net-mac", value_name = "MAC", conflicts_with = "from")]
+    pub net_mac: Option<String>,
+
+    /// Add smolvm's host-side NAT as a second virtio-net NIC (`eth1`) while
+    /// retaining the externally switched NIC as `eth0`.
+    #[arg(long = "net-egress", help_heading = "Network")]
+    pub net_egress: bool,
+
     /// Custom DNS resolver for the guest (implies --net). Use this when the
     /// default public resolvers (8.8.8.8/1.1.1.1) are blocked on your network.
     #[arg(long, value_name = "IP")]
@@ -3132,6 +3321,15 @@ impl CreateCmd {
             return self.run_from_smolmachine(sidecar_path);
         }
 
+        let external_network = external_network_config(
+            self.net_unixstream.clone(),
+            self.net_address.clone(),
+            self.net_gateway,
+            self.net_dns,
+            self.net_mac.clone(),
+            self.net_egress,
+        )?;
+
         // A registry --image can name a smolmachine PACK artifact (e.g.
         // registry.smolmachines.com/library/alpine), whose single "layer" is a
         // full .smolmachine sidecar — not an OCI filesystem layer the in-guest
@@ -3141,6 +3339,12 @@ impl CreateCmd {
         // normal in-guest pull.
         if let Some(img) = self.image.as_deref() {
             if let Some(sidecar) = smolvm::data::pack_ref::resolve_pack_ref_blocking(img)? {
+                if external_network.is_some() {
+                    return Err(smolvm::Error::config(
+                        "external virtio-net",
+                        "external virtio-net requires machine create/start and is unavailable for packed machines",
+                    ));
+                }
                 return self.run_from_smolmachine(&sidecar);
             }
         }
@@ -3194,6 +3398,7 @@ impl CreateCmd {
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
+        apply_external_network_config(&mut params, external_network)?;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -3218,6 +3423,7 @@ impl CreateCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            external_network: params.external_network.clone(),
             dns: params.dns,
             network_name: params.network_name.clone(),
             gpu: params.gpu,
@@ -3404,6 +3610,7 @@ impl CreateCmd {
             port: self.port.clone(),
             net: network,
             network_backend: self.net_backend,
+            external_network: None,
             dns: self.dns,
             network_name: self.network_name.clone(),
             init: self.init.clone(),
@@ -3447,6 +3654,7 @@ impl CreateCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            external_network: params.external_network.clone(),
             dns: params.dns,
             network_name: params.network_name.clone(),
             gpu: params.gpu,

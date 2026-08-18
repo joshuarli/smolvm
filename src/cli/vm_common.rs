@@ -12,7 +12,7 @@ use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_
 use smolvm::data::storage::HostMount;
 use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
-use smolvm::network::NetworkBackend;
+use smolvm::network::{ExternalNetworkConfig, NetworkBackend};
 use smolvm::secrets::SecretRef;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm_protocol::ImageInfo;
@@ -432,6 +432,8 @@ pub struct CreateVmParams {
     pub port: Vec<PortMapping>,
     pub net: bool,
     pub network_backend: Option<NetworkBackend>,
+    /// Static virtio-net attachment managed by an external local switch.
+    pub external_network: Option<ExternalNetworkConfig>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub network_name: Option<String>,
     pub init: Vec<String>,
@@ -677,6 +679,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
+    record.external_network = params.external_network.clone();
     record.dns = params.dns;
     record.network_name = params.network_name.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
@@ -1728,6 +1731,7 @@ pub fn persist_named_running(
                 r.ports = o.ports.clone();
                 r.network = o.network;
                 r.network_backend = o.network_backend;
+                r.external_network = o.external_network.clone();
                 r.dns = o.dns;
                 r.network_name = o.network_name.clone();
                 r.storage_gb = o.storage_gb;
@@ -1769,6 +1773,7 @@ pub struct DefaultVmOverrides {
     pub ports: Vec<(u16, u16)>,
     pub network: bool,
     pub network_backend: Option<NetworkBackend>,
+    pub external_network: Option<ExternalNetworkConfig>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub network_name: Option<String>,
     pub storage_gb: Option<u64>,

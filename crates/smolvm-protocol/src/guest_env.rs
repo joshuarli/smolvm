@@ -102,6 +102,24 @@ pub const GATEWAY6: &str = "SMOLVM_NETWORK_GATEWAY6";
 pub const PREFIX_LEN6: &str = "SMOLVM_NETWORK_PREFIX_LEN6";
 /// Guest-visible DNS server IPv4 address.
 pub const DNS: &str = "SMOLVM_NETWORK_DNS";
+/// Optional second virtio-net guest IPv4 address.
+pub const SECONDARY_GUEST_IP: &str = "SMOLVM_NETWORK_SECONDARY_GUEST_IP";
+/// Optional second virtio-net default gateway IPv4 address.
+pub const SECONDARY_GATEWAY: &str = "SMOLVM_NETWORK_SECONDARY_GATEWAY";
+/// Optional second virtio-net IPv4 prefix length.
+pub const SECONDARY_PREFIX_LEN: &str = "SMOLVM_NETWORK_SECONDARY_PREFIX_LEN";
+/// Optional second virtio-net guest MAC address.
+pub const SECONDARY_GUEST_MAC: &str = "SMOLVM_NETWORK_SECONDARY_GUEST_MAC";
+/// Optional second virtio-net guest IPv6 address.
+pub const SECONDARY_GUEST_IP6: &str = "SMOLVM_NETWORK_SECONDARY_GUEST_IP6";
+/// Optional second virtio-net IPv6 gateway.
+pub const SECONDARY_GATEWAY6: &str = "SMOLVM_NETWORK_SECONDARY_GATEWAY6";
+/// Optional second virtio-net IPv6 prefix length.
+pub const SECONDARY_PREFIX_LEN6: &str = "SMOLVM_NETWORK_SECONDARY_PREFIX_LEN6";
+/// Optional second virtio-net DNS server IPv4 address.
+pub const SECONDARY_DNS: &str = "SMOLVM_NETWORK_SECONDARY_DNS";
+/// Interface that owns the guest's default route when a secondary NIC exists.
+pub const DEFAULT_ROUTE_INTERFACE: &str = "SMOLVM_NETWORK_DEFAULT_ROUTE_INTERFACE";
 /// Enables the guest-side DNS filtering proxy.
 pub const DNS_FILTER: &str = "SMOLVM_DNS_FILTER";
 /// Enables the guest-side Docker socket bridge: the agent listens on the

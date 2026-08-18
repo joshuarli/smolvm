@@ -18,8 +18,7 @@ const IFA_F_NODAD: u8 = 0x02;
 /// 3. set MTU                             (SIOCSIFMTU)
 /// 4. add IPv4 address/prefix             (RTM_NEWADDR via NETLINK_ROUTE)
 /// 5. mark the interface UP               (SIOCGIFFLAGS + SIOCSIFFLAGS)
-/// 6. add the default route               (RTM_NEWROUTE via NETLINK_ROUTE)
-/// 7. write /etc/resolv.conf              (plain file write)
+/// 6. optionally add the default route    (RTM_NEWROUTE via NETLINK_ROUTE)
 /// ```
 ///
 /// Read these functions as:
@@ -34,8 +33,8 @@ const IFA_F_NODAD: u8 = 0x02;
 ///
 /// Outcome:
 /// - the guest ends up with a configured `eth0`
-/// - traffic to non-local destinations is sent to `gateway`
-/// - libc DNS resolution uses `dns_server`
+/// - traffic to non-local destinations is sent to `gateway` when
+///   `default_route` is true
 ///
 /// Why this order:
 /// - MAC and MTU are link attributes, so we set them before bringing the
@@ -67,19 +66,22 @@ pub fn configure_interface(
     prefix_len: u8,
     gateway: Ipv4Addr,
     ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
-    dns_server: Ipv4Addr,
+    default_route: bool,
 ) -> Result<(), String> {
     let ifindex = get_ifindex(ifname)?;
     set_mac_address(ifname, &mac)?;
     set_mtu(ifname, mtu)?;
     add_address_v4(ifindex, address, prefix_len)?;
     bring_interface_up(ifname)?;
-    add_default_route_v4(gateway)?;
+    if default_route {
+        add_default_route_v4(gateway)?;
+    }
     if let Some((address6, prefix_len6, gateway6)) = ipv6 {
         add_address_v6(ifindex, address6, prefix_len6)?;
-        add_default_route_v6(gateway6)?;
+        if default_route {
+            add_default_route_v6(gateway6)?;
+        }
     }
-    write_resolv_conf(dns_server)?;
     Ok(())
 }
 
@@ -311,8 +313,11 @@ fn add_default_route_v6(gateway: Ipv6Addr) -> Result<(), String> {
 /// This step is intentionally plain file I/O rather than a C networking API.
 /// DNS configuration in a minimal Linux guest is usually conveyed through
 /// `/etc/resolv.conf`, and that is enough for the MVP.
-fn write_resolv_conf(dns_server: Ipv4Addr) -> Result<(), String> {
-    let contents = format!("nameserver {}\n", dns_server);
+pub fn write_resolv_conf(dns_servers: &[Ipv4Addr]) -> Result<(), String> {
+    let contents = dns_servers
+        .iter()
+        .map(|server| format!("nameserver {server}\n"))
+        .collect::<String>();
     let direct_err = match std::fs::write("/etc/resolv.conf", &contents) {
         Ok(()) => return Ok(()),
         Err(err) => err,

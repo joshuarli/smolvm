@@ -108,6 +108,12 @@ pub fn launch_agent_vm_dynamic(
     krun: &KrunFunctions,
     config: &PackedLaunchConfig,
 ) -> Result<(), String> {
+    if config.resources.external_network.is_some() {
+        return Err(
+            "external virtio-net is not supported by packed/sidecar launches; use machine create/start"
+                .into(),
+        );
+    }
     crate::network::validate_requested_network_backend(
         &config.resources,
         config.dns_filter_hosts.as_deref(),
@@ -655,7 +661,9 @@ pub fn launch_agent_vm_dynamic(
     // TSI (PR #466).
     env_strings.extend(crate::agent::guest_network_env(
         guest_network,
+        None,
         config.resources.dns,
+        true,
     ));
 
     let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();

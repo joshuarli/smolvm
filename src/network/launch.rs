@@ -99,8 +99,12 @@ pub fn plan_launch_network(
     let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
     let has_host_service = guest_host_service_configured();
     let has_fabric = resources.network_name.is_some();
-    let wants_network =
-        resources.network || has_ports || has_cidr_policy || has_dns_filter || has_fabric;
+    let wants_network = resources.network
+        || has_ports
+        || has_cidr_policy
+        || has_dns_filter
+        || has_fabric
+        || resources.external_network.is_some();
 
     if !wants_network {
         return LaunchNetworkPlan {
@@ -170,6 +174,52 @@ pub fn validate_requested_network_backend(
     dns_filter_hosts: Option<&[String]>,
     port_count: usize,
 ) -> crate::Result<()> {
+    if let Some(external) = &resources.external_network {
+        external
+            .validate()
+            .map_err(|reason| crate::Error::config("external virtio-net", reason))?;
+        if !resources.network {
+            return Err(crate::Error::config(
+                "external virtio-net",
+                "external virtio-net requires --net",
+            ));
+        }
+        if resources.network_backend != Some(NetworkBackend::VirtioNet) {
+            return Err(crate::Error::config(
+                "external virtio-net",
+                "external virtio-net requires --net-backend virtio-net",
+            ));
+        }
+        if port_count > 0 {
+            return Err(crate::Error::config(
+                "external virtio-net",
+                "external virtio-net does not support smolvm published ports",
+            ));
+        }
+        if !external.egress
+            && (resources.allowed_cidrs.is_some()
+                || dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty()))
+        {
+            return Err(crate::Error::config(
+                "external virtio-net",
+                "external virtio-net does not support smolvm egress policy unless --net-egress is enabled",
+            ));
+        }
+        if resources.dns.is_some() && !external.egress {
+            return Err(crate::Error::config(
+                "external virtio-net",
+                "external virtio-net uses its configured DNS server; enable --net-egress before setting --dns",
+            ));
+        }
+        if guest_host_service_configured() {
+            return Err(crate::Error::config(
+                "external virtio-net",
+                "external virtio-net cannot be used while a smolvm guest host service is configured",
+            ));
+        }
+        return Ok(());
+    }
+
     // An egress policy is only enforced under virtio-net; TSI would silently let
     // it through.
     let has_egress_policy = resources
@@ -246,9 +296,24 @@ pub fn validate_requested_network_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::ExternalNetworkConfig;
+    use std::net::Ipv4Addr;
+    use std::path::PathBuf;
 
     fn resources() -> VmResources {
         VmResources::default()
+    }
+
+    fn external_config() -> ExternalNetworkConfig {
+        ExternalNetworkConfig {
+            unixstream_path: PathBuf::from("/tmp/external-net/p-web.sock"),
+            guest_ip: Ipv4Addr::new(10, 89, 0, 2),
+            prefix_len: 24,
+            gateway: Ipv4Addr::new(10, 89, 0, 1),
+            dns_server: Ipv4Addr::new(10, 89, 0, 1),
+            guest_mac: [0x02, 0, 0, 0, 0, 2],
+            egress: false,
+        }
     }
 
     #[test]
@@ -403,5 +468,43 @@ mod tests {
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         let hosts = ["example.com".to_string()];
         validate_requested_network_backend(&resources, Some(&hosts), 0).unwrap();
+    }
+
+    #[test]
+    fn external_attachment_selects_and_validates_virtio_net() {
+        let mut resources = resources();
+        resources.network = true;
+        resources.network_backend = Some(NetworkBackend::VirtioNet);
+        resources.external_network = Some(external_config());
+
+        assert_eq!(
+            plan_launch_network(&resources, None, 0).backend,
+            EffectiveNetworkBackend::VirtioNet
+        );
+        validate_requested_network_backend(&resources, None, 0).unwrap();
+    }
+
+    #[test]
+    fn external_egress_attachment_allows_smolvm_egress_policy() {
+        let mut resources = resources();
+        resources.network = true;
+        resources.network_backend = Some(NetworkBackend::VirtioNet);
+        let mut external = external_config();
+        external.egress = true;
+        resources.external_network = Some(external);
+        resources.allowed_cidrs = Some(vec!["1.1.1.1/32".into()]);
+
+        validate_requested_network_backend(&resources, None, 0).unwrap();
+    }
+
+    #[test]
+    fn external_attachment_rejects_smolvm_port_forwarding() {
+        let mut resources = resources();
+        resources.network = true;
+        resources.network_backend = Some(NetworkBackend::VirtioNet);
+        resources.external_network = Some(external_config());
+
+        let error = validate_requested_network_backend(&resources, None, 1).unwrap_err();
+        assert!(error.to_string().contains("published ports"));
     }
 }

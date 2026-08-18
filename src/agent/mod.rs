@@ -78,13 +78,15 @@ fn gpu_virgl_flags() -> u32 {
 /// backend (PR #466). With one source of truth, the guest's resolver is decided
 /// in exactly one place and the agent remains the sole writer of resolv.conf.
 ///
-/// `guest_network` is `Some` for virtio-net (the agent derives its resolver from
-/// `dns_server`, the gateway address). For TSI it is `None`: there is no host
-/// gateway to route a resolver through, so a `--dns` override must be passed
-/// straight through for the agent to write into resolv.conf.
+/// `guest_network` is `Some` for the primary virtio-net interface. An optional
+/// `secondary_network` is configured as `eth1` when a caller combines a
+/// custom primary attachment with smolvm's host-side NAT.
+/// For TSI both are `None`, so a `--dns` override is passed straight through.
 pub(crate) fn guest_network_env(
     guest_network: Option<smolvm_network::GuestNetworkConfig>,
+    secondary_network: Option<smolvm_network::GuestNetworkConfig>,
     dns_override: Option<std::net::Ipv4Addr>,
+    include_ipv6: bool,
 ) -> Vec<std::ffi::CString> {
     use smolvm_protocol::guest_env;
     let mut env: Vec<std::ffi::CString> = Vec::new();
@@ -100,17 +102,47 @@ pub(crate) fn guest_network_env(
         push(guest_env::GATEWAY, n.gateway_ip.to_string());
         push(guest_env::PREFIX_LEN, n.prefix_len.to_string());
         push(guest_env::GUEST_MAC, format_mac(n.guest_mac));
-        // Only hand the guest an IPv6 identity when the host can actually
-        // route v6: a global-scope guest address makes dual-stack clients
-        // sort AAAA answers first (RFC 6724), and on a v6-less host every
-        // such connection is refused. Omitting the trio keeps the guest
-        // v4-first; the agent treats the absent set as a valid contract.
-        if smolvm_network::host_has_ipv6_route() {
+        // External attachments declare only their supplied IPv4 identity.
+        // For native virtio-net, advertise IPv6 only when the host can route
+        // it; otherwise dual-stack clients prefer unreachable AAAA answers.
+        if include_ipv6 && smolvm_network::host_has_ipv6_route() {
             push(guest_env::GUEST_IP6, n.guest_ip6.to_string());
             push(guest_env::GATEWAY6, n.gateway_ip6.to_string());
             push(guest_env::PREFIX_LEN6, n.prefix_len6.to_string());
         }
         push(guest_env::DNS, n.dns_server.to_string());
+        if let Some(secondary) = secondary_network {
+            push(
+                guest_env::SECONDARY_GUEST_IP,
+                secondary.guest_ip.to_string(),
+            );
+            push(
+                guest_env::SECONDARY_GATEWAY,
+                secondary.gateway_ip.to_string(),
+            );
+            push(
+                guest_env::SECONDARY_PREFIX_LEN,
+                secondary.prefix_len.to_string(),
+            );
+            push(
+                guest_env::SECONDARY_GUEST_MAC,
+                format_mac(secondary.guest_mac),
+            );
+            push(
+                guest_env::SECONDARY_GUEST_IP6,
+                secondary.guest_ip6.to_string(),
+            );
+            push(
+                guest_env::SECONDARY_GATEWAY6,
+                secondary.gateway_ip6.to_string(),
+            );
+            push(
+                guest_env::SECONDARY_PREFIX_LEN6,
+                secondary.prefix_len6.to_string(),
+            );
+            push(guest_env::SECONDARY_DNS, secondary.dns_server.to_string());
+            push(guest_env::DEFAULT_ROUTE_INTERFACE, "eth1".to_string());
+        }
     } else if let Some(dns) = dns_override {
         push(guest_env::DNS, dns.to_string());
     }
@@ -122,4 +154,58 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_network_env_omits_ipv6_configuration() {
+        let env: Vec<String> = guest_network_env(
+            Some(smolvm_network::GuestNetworkConfig::default()),
+            None,
+            None,
+            false,
+        )
+        .into_iter()
+        .map(|value| value.into_string().unwrap())
+        .collect();
+
+        assert!(env
+            .iter()
+            .any(|value| value.starts_with("SMOLVM_NETWORK_GUEST_IP=")));
+        assert!(!env
+            .iter()
+            .any(|value| value.starts_with("SMOLVM_NETWORK_GUEST_IP6=")));
+    }
+
+    #[test]
+    fn external_egress_env_describes_eth1_and_moves_default_route() {
+        let env: Vec<String> = guest_network_env(
+            Some(smolvm_network::GuestNetworkConfig {
+                guest_ip: "10.89.0.2".parse().unwrap(),
+                gateway_ip: "10.89.0.1".parse().unwrap(),
+                prefix_len: 24,
+                dns_server: "10.89.0.1".parse().unwrap(),
+                ..smolvm_network::GuestNetworkConfig::default()
+            }),
+            Some(smolvm_network::GuestNetworkConfig::default()),
+            None,
+            false,
+        )
+        .into_iter()
+        .map(|value| value.into_string().unwrap())
+        .collect();
+
+        assert!(env
+            .iter()
+            .any(|value| value == "SMOLVM_NETWORK_SECONDARY_GUEST_IP=100.96.0.2"));
+        assert!(env
+            .iter()
+            .any(|value| value == "SMOLVM_NETWORK_DEFAULT_ROUTE_INTERFACE=eth1"));
+        assert!(env
+            .iter()
+            .any(|value| value == "SMOLVM_NETWORK_SECONDARY_DNS=100.96.0.1"));
+    }
 }

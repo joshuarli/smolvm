@@ -66,6 +66,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// - `SMOLVM_NETWORK_DNS`
 /// - `SMOLVM_NETWORK_GUEST_IP6` / `SMOLVM_NETWORK_GATEWAY6` /
 ///   `SMOLVM_NETWORK_PREFIX_LEN6` (optional trio — absent means IPv4-only)
+/// - `SMOLVM_NETWORK_SECONDARY_*` (optional second NIC, configured as `eth1`)
+/// - `SMOLVM_NETWORK_DEFAULT_ROUTE_INTERFACE` (optional; defaults to `eth0`)
 ///
 /// Example:
 ///
@@ -86,14 +88,14 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 ///
 /// 1. Decide whether the current boot even wants guest virtio networking.
 /// 2. Parse the environment strings into typed values.
-/// 3. Call the Linux backend to program `eth0`.
+/// 3. Call the Linux backend to program `eth0` and optional `eth1`.
 ///
 /// Outcome
 /// -------
 ///
 /// - `Ok(false)`: no virtio-net request was present, so the agent leaves the
 ///   guest network untouched.
-/// - `Ok(true)`: `eth0` was configured successfully.
+/// - `Ok(true)`: the requested guest interfaces were configured successfully.
 /// - `Err(...)`: virtio-net was requested but the configuration was incomplete
 ///   or malformed, so boot should fail instead of continuing with a
 ///   half-configured NIC.
@@ -117,11 +119,114 @@ pub fn configure_from_env() -> Result<bool, String> {
     let guest_mac = env_mac(guest_env::GUEST_MAC)?;
     let dns_server = env_ipv4(guest_env::DNS)?;
     let ipv6 = env_ipv6_config()?;
+    let secondary = secondary_network_config()?;
+    let default_route = match std::env::var(guest_env::DEFAULT_ROUTE_INTERFACE)
+        .ok()
+        .as_deref()
+    {
+        None | Some("eth0") => "eth0",
+        Some("eth1") if secondary.is_some() => "eth1",
+        Some(value) => {
+            return Err(format!(
+                "{} must be eth0, or eth1 when a secondary NIC is configured (got {})",
+                guest_env::DEFAULT_ROUTE_INTERFACE,
+                value
+            ));
+        }
+    };
 
     linux::configure_interface(
-        "eth0", guest_mac, 1500, guest_ip, prefix_len, gateway, ipv6, dns_server,
+        "eth0",
+        guest_mac,
+        1500,
+        guest_ip,
+        prefix_len,
+        gateway,
+        ipv6,
+        default_route == "eth0",
     )?;
+
+    let mut dns_servers = vec![dns_server];
+    if let Some(secondary) = secondary {
+        linux::configure_interface(
+            "eth1",
+            secondary.guest_mac,
+            1500,
+            secondary.guest_ip,
+            secondary.prefix_len,
+            secondary.gateway,
+            secondary.ipv6,
+            default_route == "eth1",
+        )?;
+        dns_servers.push(secondary.dns_server);
+    }
+    linux::write_resolv_conf(&dns_servers)?;
     Ok(true)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SecondaryNetworkConfig {
+    guest_ip: Ipv4Addr,
+    gateway: Ipv4Addr,
+    prefix_len: u8,
+    guest_mac: [u8; 6],
+    ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
+    dns_server: Ipv4Addr,
+}
+
+fn secondary_network_config() -> Result<Option<SecondaryNetworkConfig>, String> {
+    let required = [
+        guest_env::SECONDARY_GUEST_IP,
+        guest_env::SECONDARY_GATEWAY,
+        guest_env::SECONDARY_PREFIX_LEN,
+        guest_env::SECONDARY_GUEST_MAC,
+        guest_env::SECONDARY_DNS,
+    ];
+    let present = required
+        .iter()
+        .filter(|name| std::env::var(name).is_ok_and(|value| !value.is_empty()))
+        .count();
+    if present == 0 {
+        return Ok(None);
+    }
+    if present != required.len() {
+        return Err(format!(
+            "incomplete secondary network config: {} / {} / {} / {} / {} must be set together",
+            required[0], required[1], required[2], required[3], required[4]
+        ));
+    }
+    Ok(Some(SecondaryNetworkConfig {
+        guest_ip: env_ipv4(guest_env::SECONDARY_GUEST_IP)?,
+        gateway: env_ipv4(guest_env::SECONDARY_GATEWAY)?,
+        prefix_len: env_u8(guest_env::SECONDARY_PREFIX_LEN)?,
+        guest_mac: env_mac(guest_env::SECONDARY_GUEST_MAC)?,
+        ipv6: secondary_ipv6_config()?,
+        dns_server: env_ipv4(guest_env::SECONDARY_DNS)?,
+    }))
+}
+
+fn secondary_ipv6_config() -> Result<Option<(Ipv6Addr, u8, Ipv6Addr)>, String> {
+    let vars = [
+        guest_env::SECONDARY_GUEST_IP6,
+        guest_env::SECONDARY_GATEWAY6,
+        guest_env::SECONDARY_PREFIX_LEN6,
+    ];
+    let present = vars
+        .iter()
+        .filter(|name| std::env::var(name).is_ok_and(|value| !value.is_empty()))
+        .count();
+    match present {
+        0 => Ok(None),
+        3 => Ok(Some((
+            env_ipv6(guest_env::SECONDARY_GUEST_IP6)?,
+            env_u8(guest_env::SECONDARY_PREFIX_LEN6)?,
+            env_ipv6(guest_env::SECONDARY_GATEWAY6)?,
+        ))),
+        _ => Err(format!(
+            "incomplete secondary IPv6 network config: {} / {} / {} must be set together",
+            vars[0], vars[1], vars[2]
+        )),
+    }
 }
 
 /// Parse the optional IPv6 trio. All three vars must be present together; a
@@ -224,8 +329,12 @@ mod linux {
         _prefix_len: u8,
         _gateway: Ipv4Addr,
         _ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
-        _dns_server: Ipv4Addr,
+        _default_route: bool,
     ) -> Result<(), String> {
+        Err("guest virtio networking is only supported on Linux".to_string())
+    }
+
+    pub fn write_resolv_conf(_dns_servers: &[Ipv4Addr]) -> Result<(), String> {
         Err("guest virtio networking is only supported on Linux".to_string())
     }
 }
