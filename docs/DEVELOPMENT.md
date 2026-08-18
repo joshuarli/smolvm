@@ -6,8 +6,8 @@
 - [git-lfs](https://git-lfs.com) (required for the committed platform libraries)
 - smolvm itself (for cross-compiling the agent — builds inside a `rust:alpine` VM)
 - e2fsprogs (for storage template creation; `mkfs.ext4`; on macOS: `brew install e2fsprogs`)
-- LLVM and virglrenderer (macOS only, for building libkrun: `brew install llvm virglrenderer`)
-- [cargo-make](https://github.com/sagiegurari/cargo-make): `cargo install cargo-make`
+- LLVM (macOS only, for building the default headless libkrun runtime)
+- [cargo-make](https://github.com/sagiegurari/cargo-make) (only for the optional GPU-enabled libkrun build)
 
 ## Quick Start
 
@@ -107,16 +107,18 @@ The `cargo make dist` task wraps `scripts/build-dist.sh`. Other scripts:
 ## Rebuilding Libraries
 
 The macOS `libkrun.dylib` is generated from the pinned `libkrun` submodule and is
-intentionally not committed or stored in Git LFS. Build it locally when needed:
+intentionally not committed or stored in Git LFS. Build the default headless
+block-and-network runtime locally when needed:
 
 ```bash
-rustup target add aarch64-unknown-linux-musl  # arm64 macOS
-cargo make build-libkrun
+make setup
 ```
 
 The other platform library binaries remain committed for cross-platform
-development. If you need to rebuild them (after submodule updates, kernel config
-changes, or enabling new features), see:
+development. A GPU-enabled macOS libkrun build additionally needs a compatible
+`virglrenderer` installation visible to `pkg-config`; after providing it, run
+`cargo make build-libkrun`. If you need to rebuild other platform artifacts,
+see:
 
 - [Building libkrun](building-libkrun.md) — rebuild platform libkrun artifacts
 - [Building libkrunfw](building-libkrunfw-macos.md) — rebuild `lib/libkrunfw.5.dylib` (kernel blob)
