@@ -172,8 +172,11 @@ impl CrunCommand {
     /// Create a container: `crun create --bundle <path> <id>`
     ///
     /// This puts the container in "created" state, ready for `crun start`.
-    /// Stdio defaults to null because capturing pipes can block when child
-    /// processes inherit file descriptors.
+    /// All streams stay detached. In particular, `crun create` leaves the
+    /// container init alive in the created state; a piped stderr would be
+    /// inherited by that init, so `Command::output()` could wait forever for
+    /// EOF. Callers that need diagnostics must redirect stderr to a regular
+    /// bundle-local file and use [`Self::status`].
     pub fn create(bundle_dir: &Path, container_id: &str) -> Self {
         let mut c = Self::new();
         c.cmd.args([
@@ -182,9 +185,7 @@ impl CrunCommand {
             &bundle_dir.to_string_lossy(),
             container_id,
         ]);
-        c.cmd.stdin(Stdio::null());
-        c.cmd.stdout(Stdio::null());
-        c.cmd.stderr(Stdio::null());
+        configure_create_stdio(&mut c.cmd);
         c
     }
 
@@ -501,6 +502,16 @@ impl CrunCommand {
         self
     }
 
+    /// Redirect stderr to a regular file.
+    ///
+    /// This is safe for `crun create`: unlike a pipe, an inherited file
+    /// descriptor does not make the host wait for the created container init
+    /// to exit before it can observe crun's status.
+    pub fn stderr_file(mut self, file: std::fs::File) -> Self {
+        self.cmd.stderr(Stdio::from(file));
+        self
+    }
+
     /// Capture both stdout and stderr.
     pub fn capture_output(self) -> Self {
         self.stdout_piped().stderr_piped()
@@ -539,6 +550,12 @@ impl CrunCommand {
         self.apply_pending();
         self.cmd.status()
     }
+}
+
+fn configure_create_stdio(command: &mut Command) {
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
 }
 
 #[cfg(test)]
@@ -596,6 +613,35 @@ mod tests {
         std::fs::write(&path, "4242\n").unwrap();
         assert_eq!(read_pid_file(&path), Some(4242));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn create_stdio_keeps_agent_streams_detached() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'crun detail' >&2; exit 1"]);
+        configure_create_stdio(&mut command);
+
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn create_stderr_file_preserves_diagnostics_without_a_pipe() {
+        let diagnostic = tempfile::NamedTempFile::new().unwrap();
+        let diagnostic_reader = diagnostic.reopen().unwrap();
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf 'crun detail' >&2; exit 1"]);
+        configure_create_stdio(&mut command);
+        command.stderr(Stdio::from(diagnostic.reopen().unwrap()));
+
+        let status = command.status().unwrap();
+        assert!(!status.success());
+        assert_eq!(
+            std::io::read_to_string(diagnostic_reader).unwrap(),
+            "crun detail"
+        );
     }
 
     #[test]

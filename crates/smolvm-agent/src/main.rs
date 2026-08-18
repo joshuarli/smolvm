@@ -3609,6 +3609,47 @@ fn write_oci_bundle(
     Ok(oci::generate_container_id())
 }
 
+/// Run `crun create` without a pipe inherited by the created container init.
+///
+/// `crun create` returns while that init remains alive, waiting for a later
+/// `crun start`. Capturing stderr with [`Command::output`] therefore waits for
+/// the init to close the pipe and deadlocks the two-step lifecycle. A temporary
+/// regular file keeps diagnostics available on failure without making EOF part
+/// of the completion contract.
+#[cfg(target_os = "linux")]
+fn create_container_with_diagnostics(
+    bundle_path: &std::path::Path,
+    container_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let diagnostic_path = bundle_path.join(".smolvm-crun-create.stderr");
+    let diagnostic = std::fs::File::create(&diagnostic_path).map_err(|e| {
+        format!(
+            "create crun diagnostic file {}: {e}",
+            diagnostic_path.display()
+        )
+    })?;
+    let status = crun::CrunCommand::create(bundle_path, container_id)
+        .stderr_file(diagnostic)
+        .status()
+        .map_err(|e| format!("spawn crun create: {e}"))?;
+
+    let stderr = if status.success() {
+        String::new()
+    } else {
+        std::fs::read_to_string(&diagnostic_path)
+            .unwrap_or_else(|e| format!("unable to read {}: {e}", diagnostic_path.display()))
+    };
+    let _ = std::fs::remove_file(&diagnostic_path);
+
+    if status.success() {
+        Ok(())
+    } else if stderr.trim().is_empty() {
+        Err("crun create failed without stderr output".into())
+    } else {
+        Err(format!("crun create failed: {}", stderr.trim()).into())
+    }
+}
+
 /// Handle a detached run request: start a container in the background and
 /// return its container ID to the caller.
 ///
@@ -3816,27 +3857,12 @@ fn handle_run_detached(
     // `crun run --detach` which hangs in the smolvm VM environment. The
     // two-step approach registers the container state so `crun exec` can join
     // it, and `crun start` returns immediately once the container is running.
-    let create_output = crun::CrunCommand::create(&bundle_path, &container_id).output();
-    match create_output {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            send_response(
-                stream,
-                &AgentResponse::error(
-                    format!("crun create failed: {}", stderr.trim()),
-                    error_codes::SPAWN_FAILED,
-                ),
-            )?;
-            return Ok(());
-        }
-        Err(e) => {
-            send_response(
-                stream,
-                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
-            )?;
-            return Ok(());
-        }
+    if let Err(e) = create_container_with_diagnostics(&bundle_path, &container_id) {
+        send_response(
+            stream,
+            &AgentResponse::error(e.to_string(), error_codes::SPAWN_FAILED),
+        )?;
+        return Ok(());
     }
 
     let start_output = crun::CrunCommand::start(&container_id).output();
@@ -4296,13 +4322,8 @@ fn ensure_main_container(
         true,
     )?;
 
-    let create = crun::CrunCommand::create(&bundle_path, &container_id).output()?;
-    if !create.status.success() {
-        return Err(format!(
-            "keep-alive crun create failed: {}",
-            String::from_utf8_lossy(&create.stderr).trim()
-        )
-        .into());
+    if let Err(e) = create_container_with_diagnostics(&bundle_path, &container_id) {
+        return Err(format!("keep-alive {e}").into());
     }
     let start = crun::CrunCommand::start(&container_id).output()?;
     if !start.status.success() {
