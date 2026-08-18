@@ -1,9 +1,9 @@
 [submodule "libkrun"]
 	path = libkrun
-	url = https://github.com/joshuarli/libkrun.git
+	url = git@github.com:joshuarli/libkrun.git
 [submodule "libkrunfw"]
 	path = libkrunfw
-	url = git@github.com:smol-machines/libkrunfw.git
+	url = git@github.com:joshuarli/libkrunfw.git
 [submodule "smolvm-sdk"]
 	path = smolvm-sdk
-	url = git@github.com:smol-machines/smolvm-sdk.git
+	url = git@github.com:joshuarli/smolvm-sdk.git
