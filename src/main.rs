@@ -40,6 +40,10 @@ enum Commands {
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
 
+    /// Internal immutable image materialization boundary.
+    #[command(subcommand, hide = true)]
+    Image(cli::image::ImageCmd),
+
     /// Internal: boot a VM subprocess (not for direct use)
     #[command(name = "_boot-vm", hide = true)]
     BootVm {
@@ -170,6 +174,7 @@ fn main() {
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => (*cmd).run(),
         Commands::Config(cmd) => cmd.run(),
+        Commands::Image(cmd) => cmd.run(),
         Commands::BootVm { config } => cli::internal_boot::run(config),
         #[cfg(unix)]
         Commands::CudaDaemon { socket } => {

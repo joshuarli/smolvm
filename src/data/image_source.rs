@@ -17,7 +17,7 @@
 //!   registry reference, even if a same-named file happens to sit in the cwd.
 
 use crate::{Error, Result};
-use sha2::{Digest, Sha256};
+use blake3::Hasher;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -138,6 +138,89 @@ pub enum ResolvedImage {
     },
 }
 
+/// The host-local image material observed without staging or mutating the
+/// image cache. This is the read-only counterpart to [`resolve`], intended for
+/// orchestration preflight and lockfile generation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalImageMaterial {
+    /// Canonical source path.
+    pub path: PathBuf,
+    /// Whether the source is an archive or an unpacked rootfs directory.
+    pub kind: LocalImageMaterialKind,
+    /// Archive byte length, or `None` for a directory.
+    pub bytes: Option<u64>,
+    /// BLAKE3 of an archive, or `None` for a directory.
+    ///
+    /// This is a local-material identity, not an OCI descriptor digest. It is
+    /// emitted with the explicit `blake3:` algorithm prefix so callers cannot
+    /// accidentally pass it to a registry boundary.
+    pub blake3_digest: Option<String>,
+}
+
+/// Kind of local image material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalImageMaterialKind {
+    /// A Docker/OCI save archive.
+    Archive,
+    /// An already-unpacked root filesystem directory.
+    Directory,
+}
+
+/// Inspect one local image source without creating cache entries or changing
+/// any smolvm machine state.
+pub fn inspect_local(path: &Path) -> Result<LocalImageMaterial> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        Error::config(
+            "inspect local image",
+            format!("cannot read {}: {}", path.display(), e),
+        )
+    })?;
+    let canonical = path.canonicalize().map_err(|e| {
+        Error::config(
+            "inspect local image",
+            format!("cannot resolve {}: {}", path.display(), e),
+        )
+    })?;
+
+    if metadata.is_dir() {
+        return Ok(LocalImageMaterial {
+            path: canonical,
+            kind: LocalImageMaterialKind::Directory,
+            bytes: None,
+            blake3_digest: None,
+        });
+    }
+    if !metadata.is_file() {
+        return Err(Error::config(
+            "inspect local image",
+            format!(
+                "{} is neither a regular file nor a directory",
+                path.display()
+            ),
+        ));
+    }
+    if looks_like_dockerfile(path) {
+        return Err(Error::config(
+            "inspect local image",
+            format!(
+                "{} looks like a Dockerfile, not an image; build and export an image first",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.len() > max_archive_bytes() {
+        return Err(too_large(metadata.len()));
+    }
+
+    Ok(LocalImageMaterial {
+        path: canonical,
+        kind: LocalImageMaterialKind::Archive,
+        bytes: Some(metadata.len()),
+        blake3_digest: Some(format!("blake3:{}", hash_file(path)?)),
+    })
+}
+
 /// Largest archive accepted. The staged copy plus the guest's flattened rootfs
 /// both consume disk, so the default guards against runaway/hostile inputs while
 /// still covering very large dev images.
@@ -220,7 +303,17 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
             format!("{} is not a file", path.display()),
         ));
     }
-    if looks_like_dockerfile(path) {
+    // Stage the resolved archive, not a symlink that happens to name it. A
+    // hard link to a symlink stays a symlink; its target is outside the
+    // virtiofs archive cache exposed to the guest and then /packed_layers is
+    // empty at boot. Canonicalizing keeps the staged material path stable.
+    let archive_source = path.canonicalize().map_err(|e| {
+        Error::config(
+            "--image",
+            format!("cannot resolve archive {}: {}", path.display(), e),
+        )
+    })?;
+    if looks_like_dockerfile(&archive_source) {
         return Err(Error::config(
             "--image",
             format!(
@@ -235,11 +328,11 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
     if meta.len() > max_archive_bytes() {
         return Err(too_large(meta.len()));
     }
-    let hash = hash_file(path)?;
+    let hash = hash_file(&archive_source)?;
     let archive_path = cache_base.join(&hash).join(ARCHIVE_FILE);
     if !archive_path.exists() {
         std::fs::create_dir_all(archive_path.parent().expect("hash dir has a parent"))?;
-        link_or_copy(path, &archive_path)?;
+        link_or_copy(&archive_source, &archive_path)?;
     }
     Ok(hash)
 }
@@ -248,7 +341,7 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
 /// `cache/<hash>/`. Single-pass, so one write is unavoidable.
 fn stage_from_stdin(cache_base: &Path) -> Result<String> {
     let mut tmp = tempfile::NamedTempFile::new_in(cache_base)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     let mut stdin = std::io::stdin().lock();
     let mut buf = vec![0u8; COPY_CHUNK];
     let mut total: u64 = 0;
@@ -265,7 +358,7 @@ fn stage_from_stdin(cache_base: &Path) -> Result<String> {
         tmp.write_all(&buf[..n])?;
     }
     tmp.flush()?;
-    let hash = hex::encode(hasher.finalize());
+    let hash = hasher.finalize().to_hex().to_string();
     let archive_path = cache_base.join(&hash).join(ARCHIVE_FILE);
     if archive_path.exists() {
         return Ok(hash); // already staged; the temp file is dropped/removed
@@ -278,7 +371,7 @@ fn stage_from_stdin(cache_base: &Path) -> Result<String> {
 
 fn hash_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     let mut buf = vec![0u8; COPY_CHUNK];
     loop {
         let n = file.read(&mut buf)?;
@@ -287,7 +380,7 @@ fn hash_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Hardlink `src` into the cache, copying as a fallback across filesystems.
@@ -321,7 +414,9 @@ pub fn packed_layers_dir_for_ref(reference: &str) -> Option<PathBuf> {
     reference.strip_prefix(LOCAL_DIR_PREFIX).map(PathBuf::from)
 }
 
-fn archive_cache_base() -> Result<PathBuf> {
+/// Shared content-addressed archive cache used by local imports and the
+/// Dockerless registry materializer.
+pub(crate) fn archive_cache_base() -> Result<PathBuf> {
     let base = dirs::cache_dir()
         .ok_or_else(|| Error::storage("image archive cache", "no cache directory available"))?;
     Ok(base.join("smolvm-image-archives"))
@@ -429,6 +524,39 @@ mod tests {
     }
 
     #[test]
+    fn inspect_local_archive_is_read_only_and_hashes_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("image.tar");
+        std::fs::write(&archive, b"fake archive").unwrap();
+
+        let inspected = inspect_local(&archive).unwrap();
+
+        assert_eq!(inspected.kind, LocalImageMaterialKind::Archive);
+        assert_eq!(inspected.bytes, Some(12));
+        assert_eq!(
+            inspected.blake3_digest.as_deref(),
+            Some("blake3:17bd9af11267258312a8532e2d665681ed7227a51c81c47d2055564e5b65cb63")
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn inspect_local_directory_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        std::fs::write(rootfs.join("marker"), b"rootfs").unwrap();
+
+        let inspected = inspect_local(&rootfs).unwrap();
+
+        assert_eq!(inspected.kind, LocalImageMaterialKind::Directory);
+        assert_eq!(inspected.bytes, None);
+        assert_eq!(inspected.blake3_digest, None);
+        assert!(inspected.path.is_absolute());
+        assert_eq!(std::fs::read(rootfs.join("marker")).unwrap(), b"rootfs");
+    }
+
+    #[test]
     fn bare_name_matching_a_cwd_file_still_resolves_to_registry() {
         // A registry ref like `alpine` must not be hijacked by a same-named
         // file: it isn't an explicit path and has no archive suffix.
@@ -453,6 +581,10 @@ mod tests {
         std::fs::write(src.path(), b"fake docker save archive").unwrap();
 
         let h1 = stage_from_file(src.path(), cache.path()).unwrap();
+        assert_eq!(
+            h1,
+            "4149d044ddafeeff5c8389bcae356fff4d193e6d62001d9653c74a2b48269be5"
+        );
         let staged = cache.path().join(&h1).join(ARCHIVE_FILE);
         assert!(staged.exists(), "archive staged at {}", staged.display());
         assert_eq!(std::fs::read(&staged).unwrap(), b"fake docker save archive");
@@ -460,6 +592,29 @@ mod tests {
         // Identical content → identical hash, idempotent (no error, reused).
         let h2 = stage_from_file(src.path(), cache.path()).unwrap();
         assert_eq!(h1, h2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_from_file_follows_a_source_symlink_before_staging() {
+        let cache = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("image.tar");
+        std::fs::write(&source, b"fake docker save archive").unwrap();
+        let alias = source_dir.path().join("image-alias.tar");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+
+        let hash = stage_from_file(&alias, cache.path()).unwrap();
+        let staged = cache.path().join(hash).join(ARCHIVE_FILE);
+
+        assert!(
+            std::fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the guest-visible archive must be a regular file, not a symlink"
+        );
+        assert_eq!(std::fs::read(staged).unwrap(), b"fake docker save archive");
     }
 
     #[test]

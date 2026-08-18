@@ -198,6 +198,34 @@ fn apply_external_network_config(
     Ok(())
 }
 
+/// Resolve the image source that `machine create` will persist. Explicit
+/// `--image` takes precedence; when the image comes from a Smolfile, relative
+/// local paths are based at that Smolfile and local material is staged through
+/// the same resolver as explicit image arguments. Registry references remain
+/// unchanged and are handled by the normal start-time pull path.
+fn resolve_machine_create_image(
+    cli_image: Option<&str>,
+    smolfile_path: Option<&Path>,
+) -> smolvm::Result<Option<String>> {
+    if let Some(image) = cli_image {
+        use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+        return Ok(Some(match resolve(classify(image))? {
+            ResolvedImage::Registry(reference) => reference,
+            ResolvedImage::Local { reference, .. } => reference,
+        }));
+    }
+
+    let Some(smolfile_path) = smolfile_path else {
+        return Ok(None);
+    };
+    let smolfile = smolvm::smolfile::load(smolfile_path)?;
+    smolfile
+        .image
+        .as_deref()
+        .map(|reference| smolvm::smolfile::resolve_smolfile_image(smolfile_path, reference))
+        .transpose()
+}
+
 fn smolmachine_egress_fields(
     manifest_network: bool,
     allow_cidrs: Vec<String>,
@@ -2401,6 +2429,33 @@ mod tests {
     }
 
     #[test]
+    fn machine_create_resolves_smolfile_relative_rootfs_before_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs = dir.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        let smolfile = dir.path().join("Smolfile");
+        std::fs::write(&smolfile, "image = \"./rootfs\"\n").unwrap();
+
+        let image = resolve_machine_create_image(None, Some(&smolfile)).unwrap();
+
+        assert_eq!(
+            image.as_deref(),
+            Some(format!("local-dir:{}", rootfs.canonicalize().unwrap().display()).as_str())
+        );
+    }
+
+    #[test]
+    fn machine_create_keeps_smolfile_registry_image_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let smolfile = dir.path().join("Smolfile");
+        std::fs::write(&smolfile, "image = \"alpine:latest\"\n").unwrap();
+
+        let image = resolve_machine_create_image(None, Some(&smolfile)).unwrap();
+
+        assert_eq!(image.as_deref(), Some("alpine:latest"));
+    }
+
+    #[test]
     fn parse_cli_secret_refs_rejects_bad_specs() {
         // Missing '='.
         assert!(parse_cli_secret_refs(&["NO_EQUALS".to_string()], &[]).is_err());
@@ -3359,21 +3414,13 @@ impl CreateCmd {
         let name = self
             .name
             .unwrap_or_else(smolvm::util::generate_machine_name);
-
         // Resolve a local image source (archive/dir) on the host now: stage it
         // into the content-addressed cache and persist the resulting `local:…`
         // reference, so `start` re-derives the mount dir without a registry
-        // pull. Registry refs pass through unchanged.
-        let image = match self.image.as_deref() {
-            Some(img) => {
-                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
-                Some(match resolve(classify(img))? {
-                    ResolvedImage::Registry(reference) => reference,
-                    ResolvedImage::Local { reference, .. } => reference,
-                })
-            }
-            None => None,
-        };
+        // pull. This applies equally to an explicit --image and to the image
+        // declared by a Smolfile; Smolfile-relative paths are based at that
+        // file's directory. Registry refs pass through unchanged.
+        let image = resolve_machine_create_image(self.image.as_deref(), self.smolfile.as_deref())?;
 
         let params = crate::cli::smolfile::build_create_params(
             name,

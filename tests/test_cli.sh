@@ -56,6 +56,16 @@ test_machine_run_help() {
     [[ "$output" == *"--oci-platform"* ]]
 }
 
+test_image_materialize_help() {
+    local output
+    output=$($SMOLVM image materialize --help 2>&1)
+    [[ "$output" == *"OCI image"* ]] && \
+    [[ "$output" == *"--reference"* ]] && \
+    [[ "$output" == *"--format"* ]] && \
+    [[ "$output" == *"tsv"* ]] && \
+    [[ "$output" != *"--json"* ]]
+}
+
 test_no_container_command() {
     # Container subcommand was removed — should not exist
     local exit_code=0
@@ -104,7 +114,8 @@ test_machine_create_flags() {
     [[ "$output" == *"--overlay"* ]] && \
     [[ "$output" == *"--storage"* ]] && \
     [[ "$output" == *"--net"* ]] && \
-    [[ "$output" == *"--smolfile"* ]]
+    [[ "$output" == *"--smolfile"* ]] && \
+    [[ "$output" != *"--seed-file"* ]]
 }
 
 test_machine_run_flags() {
@@ -176,6 +187,7 @@ run_test "Version command" test_version || true
 run_test "Help command" test_help || true
 run_test "Machine help" test_machine_help || true
 run_test "Machine run help" test_machine_run_help || true
+run_test "Image materialize help" test_image_materialize_help || true
 run_test "No container command" test_no_container_command || true
 run_test "Pack help" test_pack_help || true
 run_test "vm alias works" test_vm_alias || true

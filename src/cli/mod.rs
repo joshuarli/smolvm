@@ -2,6 +2,7 @@
 
 pub mod cleanup_ephemeral;
 pub mod config;
+pub mod image;
 pub mod internal_boot;
 pub mod machine;
 pub mod openapi;
