@@ -2358,8 +2358,18 @@ impl AgentManager {
             .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let spawn_start = Instant::now();
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
-        // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of self.
-        let boot_binary = std::env::var_os("SMOLVM_BOOT_BINARY");
+        // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of
+        // self. A packaged/source-built install may also place the minimal helper
+        // beside the main CLI; prefer it automatically to avoid loading the full
+        // command surface for every VM launch. Fall back to the main executable so
+        // a standalone CLI binary remains self-contained.
+        let configured_boot_binary = std::env::var_os("SMOLVM_BOOT_BINARY");
+        let boot_binary = configured_boot_binary.clone().or_else(|| {
+            exe.parent().and_then(|parent| {
+                let helper = parent.join(format!("smolvm-boot{}", std::env::consts::EXE_SUFFIX));
+                helper.is_file().then_some(helper.into_os_string())
+            })
+        });
         // An in-process embedder (the Node/Python SDK) sets SMOLVM_BOOT_BINARY and
         // owns the VM's lifetime — when that host process dies, the VM must die
         // too, or it leaks as an orphan holding the VM's full RAM. The CLI (which
@@ -2372,7 +2382,9 @@ impl AgentManager {
         // serve `_boot-vm`, e.g. `smol`) but DETACHES the VM must opt out via
         // `features.watch_parent = Some(false)` — otherwise its persistent
         // machines die the moment the CLI process exits.
-        let watch_parent = features.watch_parent.unwrap_or(boot_binary.is_some());
+        let watch_parent = features
+            .watch_parent
+            .unwrap_or(configured_boot_binary.is_some());
         let boot_exe = boot_binary
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
