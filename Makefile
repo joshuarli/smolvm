@@ -1,4 +1,8 @@
-.PHONY: setup push
+SMOLVM_UPSTREAM_URL ?= git@github.com:smol-machines/smolvm
+LIBKRUN_UPSTREAM_URL ?= git@github.com:smol-machines/libkrun
+LIBKRUNFW_UPSTREAM_URL ?= https://github.com/smol-machines/libkrunfw
+
+.PHONY: setup sync push
 
 # Prepare the supported Apple-Silicon headless development runtime. The
 # generated lib/libkrun.dylib intentionally stays out of Git; this target
@@ -24,6 +28,16 @@ setup:
 	env -u KRUN_INIT_BINARY_PATH make -C libkrun BLK=1 NET=1; \
 	cp libkrun/target/release/libkrun.2.0.0.dylib lib/libkrun.dylib; \
 	./scripts/stamp-libkrun-provenance.sh lib --skip-libkrunfw
+
+# Fetch the explicit upstream main tips into local rebase references. This does
+# not check out or rebase any branch; `make setup` initializes the submodules.
+sync:
+	@set -eu; \
+	test -e libkrun/.git || { echo "smolvm: libkrun is not initialized; run make setup first" >&2; exit 1; }; \
+	test -e libkrunfw/.git || { echo "smolvm: libkrunfw is not initialized; run make setup first" >&2; exit 1; }; \
+	git fetch --no-tags "$(SMOLVM_UPSTREAM_URL)" "+refs/heads/main:refs/smolvm-sync/smolvm-main"; \
+	git -C libkrun fetch --no-tags "$(LIBKRUN_UPSTREAM_URL)" "+refs/heads/main:refs/smolvm-sync/libkrun-main"; \
+	git -C libkrunfw fetch --no-tags "$(LIBKRUNFW_UPSTREAM_URL)" "+refs/heads/main:refs/smolvm-sync/libkrunfw-main"
 
 # Push the libkrun commit referenced by this checkout before publishing the
 # parent smolvm commit. libkrun is commonly checked out detached by Git
