@@ -214,26 +214,85 @@ struct AgentInner {
     vm_lock_handle: Option<std::fs::File>,
 }
 
+/// Socket endpoints created inside every named VM runtime directory.
+///
+/// Keep this list in sync with the launch and teardown paths. The directory is
+/// selected only after *all* of these full paths fit `sockaddr_un.sun_path`,
+/// because a single long-lived endpoint is enough to make a VM unstartable.
+const VM_SOCKET_NAMES: &[&str] = &[
+    "agent.sock",
+    "agent.ready",
+    "agent.net",
+    "control.sock",
+    "dns-filter.sock",
+    "docker.sock",
+    "cuda.sock",
+];
+
+/// Return whether an AF_UNIX path fits the host kernel's path budget.
+///
+/// `socket2` uses the same `sockaddr_un` representation as the actual socket
+/// bind/connect calls, so this keeps the check aligned with Darwin's shorter
+/// limit without baking a platform-specific byte count into the layout.
+#[cfg(unix)]
+fn unix_socket_path_fits(path: &Path) -> bool {
+    socket2::SockAddr::unix(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn unix_socket_path_fits(_path: &Path) -> bool {
+    true
+}
+
+fn vm_runtime_path_fits(dir: &Path) -> bool {
+    VM_SOCKET_NAMES
+        .iter()
+        .all(|socket| unix_socket_path_fits(&dir.join(socket)))
+}
+
+/// A short, per-user fallback root for systems where the configured cache
+/// prefix leaves too little room for a Unix socket path.
+///
+/// Do not use `temp_dir()` here: `TMPDIR` is user-controlled and can itself be
+/// longer than `sockaddr_un.sun_path`. The uid component keeps users from
+/// sharing a fallback namespace while the name marker below still protects
+/// against hash collisions.
+#[cfg(unix)]
+fn bounded_vm_cache_root() -> PathBuf {
+    PathBuf::from("/tmp")
+        .join(format!("smolvm-{}", unsafe { libc::geteuid() }))
+        .join("vms")
+}
+
+#[cfg(not(unix))]
+fn bounded_vm_cache_root() -> PathBuf {
+    vm_cache_root()
+}
+
+fn vm_data_dir_for_roots(cache_root: &Path, fallback_root: &Path, name: &str) -> PathBuf {
+    let hash = vm_dir_hash(name);
+    let normal = cache_root.join(&hash);
+    if vm_runtime_path_fits(&normal) {
+        normal
+    } else {
+        // Keep the hash and therefore the VM identity exactly the same when a
+        // fallback is needed; only the containing root changes.
+        fallback_root.join(hash)
+    }
+}
+
 /// Get the data directory for a named VM.
 ///
-/// Uses a fixed-length hash of the name as the directory name so the socket
-/// path length is constant regardless of the name. This lets us support
-/// arbitrary-length VM names portably across hosts — the kernel's
-/// `sockaddr_un.sun_path` limit (~104 bytes) applies to the full socket
-/// path, and a 16-char hash keeps that path bounded.
+/// The ordinary layout is `<cache_dir>/smolvm/vms/<hash16>/`, where the hash is
+/// the first 16 hex characters of SHA-256 of the name. If the complete cache
+/// prefix is too long for any per-VM Unix socket endpoint, the same hash is
+/// placed under the short per-user fallback `/tmp/smolvm-<uid>/vms/`.
 ///
-/// Layout: `<cache_dir>/smolvm/vms/<hash16>/`
-///   - `<hash16>` = first 16 hex chars (8 bytes) of SHA-256 of the name
-///   - A plaintext `name` file inside the directory records the original
-///     name. This is load-bearing: [`ensure_vm_dir`] reads it to detect
-///     hash collisions. External tooling can use it for debugging too.
-///
-/// **No legacy fallback, no migration**: smolvm is alpha. VMs created under
-/// any older layout scheme are not readable by this version — users recreate
-/// them. Dual-path support would silently expire VMs when their legacy
-/// name-path exceeds the kernel socket budget, so we don't offer it.
+/// A plaintext `name` file inside the directory records the original name.
+/// This is load-bearing: [`ensure_vm_dir`] reads it to detect hash collisions.
+/// No name truncation or legacy-path migration is performed.
 pub fn vm_data_dir(name: &str) -> PathBuf {
-    vm_cache_root().join(vm_dir_hash(name))
+    vm_data_dir_for_roots(&vm_cache_root(), &bounded_vm_cache_root(), name)
 }
 
 /// Reclaim CUDA transport state after a named VM process is confirmed dead.
@@ -561,8 +620,8 @@ pub fn vm_dir_hash(name: &str) -> String {
 /// marker in the shared rootfs — so the rootfs accumulates one stale marker per
 /// VM ever booted. Under uid isolation those markers are foreign-owned `0600`,
 /// which also broke `pack create` (BUG-151). Remove any marker whose VM data dir
-/// (`vm_cache_root()/<hash>`) no longer exists. The host owns the rootfs
-/// directory, so it can unlink the markers regardless of their file owner.
+/// is absent from both the normal and bounded fallback roots. The host owns the
+/// rootfs directory, so it can unlink the markers regardless of their file owner.
 /// Best-effort: I/O errors are ignored.
 ///
 /// NOTE: this says the host "owns the rootfs directory", which is only true of
@@ -570,7 +629,10 @@ pub fn vm_dir_hash(name: &str) -> String {
 /// where the unlink below silently fails — see [`ready_marker_unwritable`].
 pub fn prune_orphaned_ready_markers() {
     if let Ok(rootfs) = AgentManager::default_rootfs_path() {
-        prune_orphaned_ready_markers_in(&rootfs, &vm_cache_root());
+        let cache_root = vm_cache_root();
+        let fallback_root = bounded_vm_cache_root();
+        let alternate = (fallback_root != cache_root).then_some(fallback_root.as_path());
+        prune_orphaned_ready_markers_in(&rootfs, &cache_root, alternate);
     }
 }
 
@@ -620,7 +682,11 @@ fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
 }
 
 /// Path-injectable core of [`prune_orphaned_ready_markers`] (unit-testable).
-fn prune_orphaned_ready_markers_in(rootfs: &Path, vm_cache_root: &Path) {
+fn prune_orphaned_ready_markers_in(
+    rootfs: &Path,
+    vm_cache_root: &Path,
+    alternate_cache_root: Option<&Path>,
+) {
     let prefix = format!("{}.", AGENT_READY_MARKER);
     let Ok(entries) = std::fs::read_dir(rootfs) else {
         return;
@@ -635,7 +701,11 @@ fn prune_orphaned_ready_markers_in(rootfs: &Path, vm_cache_root: &Path) {
         };
         // A marker with no hash suffix is the shared/legacy `.smolvm-ready`; leave
         // it. Otherwise the marker is stale iff its VM data dir is gone.
-        if !hash.is_empty() && !vm_cache_root.join(hash).exists() {
+        let live_in_primary = vm_cache_root.join(hash).exists();
+        let live_in_alternate = alternate_cache_root
+            .map(|root| root.join(hash).exists())
+            .unwrap_or(false);
+        if !hash.is_empty() && !live_in_primary && !live_in_alternate {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -654,7 +724,58 @@ fn prune_orphaned_ready_markers_in(rootfs: &Path, vm_cache_root: &Path) {
 /// agent launch setup). Safe to call repeatedly: the `name` file is written
 /// once and verified on subsequent calls.
 pub fn ensure_vm_dir(name: &str) -> std::io::Result<PathBuf> {
-    ensure_vm_dir_at(&vm_data_dir(name), name)
+    let dir = vm_data_dir(name);
+    let fallback_root = bounded_vm_cache_root();
+    if dir.parent() == Some(fallback_root.as_path()) {
+        ensure_bounded_vm_cache_root(&fallback_root)?;
+    }
+    ensure_vm_dir_at(&dir, name)
+}
+
+/// Create and verify the per-user fallback root used for long cache prefixes.
+///
+/// The fallback is under `/tmp`, so it must not be left as a world-writable
+/// shared namespace. Refuse symlinks or another user's pre-existing directory
+/// before creating any VM data beneath it.
+#[cfg(unix)]
+fn ensure_bounded_vm_cache_root(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("fallback VM path is not a directory: {}", path.display()),
+            ));
+        }
+        // SAFETY: geteuid has no preconditions and does not borrow memory.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "fallback VM directory is not owned by this user: {}",
+                    path.display()
+                ),
+            ));
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+
+    let parent = root.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("fallback VM root has no parent: {}", root.display()),
+        )
+    })?;
+    ensure_private_dir(parent)?;
+    ensure_private_dir(root)
+}
+
+#[cfg(not(unix))]
+fn ensure_bounded_vm_cache_root(_root: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Lower-level form of [`ensure_vm_dir`] that operates on an explicit
@@ -698,8 +819,9 @@ pub fn ensure_vm_dir_at(dir: &std::path::Path, name: &str) -> std::io::Result<Pa
 /// Manages the lifecycle of the agent VM which handles OCI image operations
 /// and command execution.
 ///
-/// Each VM gets its own agent with isolated paths under
-/// `~/.cache/smolvm/vms/{name}/` (socket, PID file, storage, overlay).
+/// Each VM gets its own agent with isolated paths under the hashed cache
+/// directory (socket, PID file, storage, overlay). Long cache prefixes use the
+/// bounded per-user fallback selected by [`vm_data_dir`].
 pub struct AgentManager {
     /// VM name (None only for low-level `new()` callers; CLI always sets a name).
     name: Option<String>,
@@ -778,9 +900,9 @@ impl AgentManager {
         // Named VMs colocate runtime artifacts (sockets, logs, pid, config) in
         // their hash-derived data directory — matching where `storage_disk`
         // lives via `ensure_vm_dir` and what `vm_data_dir` / `machine data-dir`
-        // report. Using the hash path bounds socket paths under the
-        // `sockaddr_un.sun_path` budget (104 bytes macOS / 108 Linux) for any
-        // VM name length.
+        // report. The hash keeps the variable name portion bounded, and
+        // `vm_data_dir` selects a short per-user root when the configured cache
+        // prefix would still overflow `sockaddr_un.sun_path`.
         //
         // Unnamed VMs (ephemeral) don't have a data dir, so they fall back to
         // the platform runtime dir (`/run/user/<uid>/smolvm` on Linux,
@@ -2371,6 +2493,7 @@ impl AgentManager {
         tracing::info!(
             pid = child_pid,
             spawn_ms = spawn_start.elapsed().as_millis(),
+            boot_binary = %boot_exe.display(),
             "boot: subprocess spawned"
         );
 
@@ -3429,12 +3552,29 @@ mod tests {
             std::fs::write(p, b"1").unwrap();
         }
 
-        prune_orphaned_ready_markers_in(&rootfs, &cache);
+        prune_orphaned_ready_markers_in(&rootfs, &cache, None);
 
         assert!(live.exists(), "marker for a live VM must be kept");
         assert!(!orphan.exists(), "marker for a deleted VM must be removed");
         assert!(legacy.exists(), "the hash-less shared marker must be kept");
         assert!(real_file.exists(), "non-marker files must be untouched");
+    }
+
+    #[test]
+    fn prune_keeps_ready_marker_for_fallback_vm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rootfs = tmp.path().join("agent-rootfs");
+        let cache = tmp.path().join("vms");
+        let fallback = tmp.path().join("fallback-vms");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(fallback.join("aaaa")).unwrap();
+
+        let marker = rootfs.join(format!("{AGENT_READY_MARKER}.aaaa"));
+        std::fs::write(&marker, b"1").unwrap();
+
+        prune_orphaned_ready_markers_in(&rootfs, &cache, Some(&fallback));
+
+        assert!(marker.exists(), "a fallback VM marker must be kept");
     }
 
     #[test]
@@ -3456,16 +3596,75 @@ mod tests {
 
     #[test]
     fn vm_data_dir_path_length_is_bounded_regardless_of_name() {
-        // Core correctness property: socket-path overflow is impossible
-        // because the variable section is fixed at 16 chars. A 200-char name
-        // produces the same-length path as a 1-char name. No legacy fallback
-        // means this holds deterministically, regardless of filesystem state.
+        // The hash remains fixed-width, so a 200-char name produces the same
+        // path length as a 1-char name. The long-root fallback is independent
+        // of the VM name and does not alter this identity property.
         let short = vm_data_dir("x");
         let long = vm_data_dir(&"a".repeat(200));
         assert_eq!(
             short.as_os_str().len(),
             long.as_os_str().len(),
             "path length must be independent of name length"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_path_fit_matches_sun_path_boundary() {
+        let sun_path_len = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+            .sun_path
+            .len();
+        let under_limit = PathBuf::from("a".repeat(sun_path_len.saturating_sub(1)));
+        let at_limit = PathBuf::from("a".repeat(sun_path_len));
+
+        assert!(unix_socket_path_fits(&under_limit));
+        assert!(!unix_socket_path_fits(&at_limit));
+    }
+
+    #[test]
+    fn vm_data_dir_preserves_normal_cache_layout_when_it_fits() {
+        let cache = PathBuf::from("/Users/test/Library/Caches/smolvm/vms");
+        let fallback = PathBuf::from("/tmp/smolvm-test/vms");
+        let dir = vm_data_dir_for_roots(&cache, &fallback, "ordinary-vm");
+
+        assert_eq!(dir, cache.join(vm_dir_hash("ordinary-vm")));
+    }
+
+    #[test]
+    fn vm_data_dir_uses_bounded_root_for_long_cache_and_all_socket_endpoints_fit() {
+        let cache = PathBuf::from("/").join("long-cache-root-".repeat(20));
+        let fallback = PathBuf::from("/tmp/smolvm-test/vms");
+        let dir = vm_data_dir_for_roots(&cache, &fallback, "long-root-vm");
+
+        assert_eq!(dir, fallback.join(vm_dir_hash("long-root-vm")));
+        assert!(vm_runtime_path_fits(&dir));
+        for socket in VM_SOCKET_NAMES {
+            assert!(
+                unix_socket_path_fits(&dir.join(socket)),
+                "socket path does not fit: {}",
+                dir.join(socket).display()
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_layout_keeps_identity_and_collision_safety() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = PathBuf::from("/").join("long-cache-root-".repeat(20));
+        let fallback = tmp.path().join("vms");
+        let dir = vm_data_dir_for_roots(&cache, &fallback, "first-vm");
+
+        assert_eq!(
+            dir.file_name().unwrap().to_string_lossy(),
+            vm_dir_hash("first-vm")
+        );
+        ensure_vm_dir_at(&dir, "first-vm").unwrap();
+        let error = ensure_vm_dir_at(&dir, "second-vm").unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("name")).unwrap(),
+            "first-vm"
         );
     }
 

@@ -3,24 +3,13 @@
 //! These handlers manage persistent machines via the shared database,
 //! accessible to both API and CLI commands.
 //!
-//! ## Limitations
+//! ## Path layout
 //!
-//! ### Name Length Limit
-//!
-//! Machine name length is bounded by the kernel's `sockaddr_un.sun_path`
-//! limit (104 bytes on macOS, 108 on Linux). The full socket path is:
-//!
-//! ```text
-//! ~/Library/Caches/smolvm/vms/{name}/agent.sock
-//! ```
-//!
-//! Maximum usable name length therefore depends on the user's home directory.
-//! For a typical macOS home (`/Users/<username>/`, ~20 chars), names can be
-//! 50+ characters. The actual socket path is validated at create time via
-//! [`crate::data::validate_socket_path_fits`] so overly-long names are
-//! rejected with a clear error up front.
-//!
-//! Recommended: keep names short and descriptive (e.g., "dev-vm", "test-1").
+//! Machine names are not embedded directly in Unix socket paths. They map to a
+//! fixed-width hash directory, and a long cache or `HOME` prefix automatically
+//! selects smolvm's bounded per-user runtime root. The original name remains in
+//! the directory's `name` marker so hash collisions are rejected rather than
+//! sharing storage or sockets.
 
 use axum::{
     extract::{Path, Query, State},
