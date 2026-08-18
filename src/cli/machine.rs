@@ -451,6 +451,12 @@ pub enum MachineCmd {
     /// Fork a running forkable machine into a new clone (CoW memory + disks)
     Fork(ForkCmd),
 
+    /// Capture one forkable machine into a durable checkpoint and stop it
+    Checkpoint(CheckpointCmd),
+
+    /// Restore a machine from a durable checkpoint with fresh host endpoints
+    Restore(RestoreCmd),
+
     /// Assign parameters and release one held fork-pool slot
     ForkRelease(ForkReleaseCmd),
 
@@ -527,11 +533,14 @@ impl MachineCmd {
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Fork(cmd) => cmd.run(),
+            MachineCmd::Checkpoint(cmd) => cmd.run(),
+            MachineCmd::Restore(cmd) => cmd.run(),
             MachineCmd::ForkRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
             MachineCmd::EgressEvents(cmd) => cmd.run(),
+            MachineCmd::Stats(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
             MachineCmd::Resize(cmd) => cmd.run(),
             MachineCmd::Update(cmd) => cmd.run(),
@@ -2586,6 +2595,55 @@ mod tests {
     }
 
     #[test]
+    fn durable_checkpoint_and_restore_require_explicit_paths() {
+        let checkpoint = TestMachineCli::parse_from([
+            "machine",
+            "checkpoint",
+            "--name",
+            "sentry-backend",
+            "--output",
+            "/private/tmp/checkpoints/w1",
+        ]);
+        let MachineCmd::Checkpoint(checkpoint) = checkpoint.command else {
+            panic!("expected machine checkpoint command");
+        };
+        assert_eq!(checkpoint.name, "sentry-backend");
+        assert_eq!(
+            checkpoint.output,
+            PathBuf::from("/private/tmp/checkpoints/w1")
+        );
+
+        let restore = TestMachineCli::parse_from([
+            "machine",
+            "restore",
+            "--name",
+            "sentry-backend",
+            "--checkpoint",
+            "/private/tmp/checkpoints/w1",
+        ]);
+        let MachineCmd::Restore(restore) = restore.command else {
+            panic!("expected machine restore command");
+        };
+        assert_eq!(restore.name, "sentry-backend");
+        assert_eq!(
+            restore.checkpoint,
+            PathBuf::from("/private/tmp/checkpoints/w1")
+        );
+
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "checkpoint",
+            "--name",
+            "sentry-backend",
+        ])
+        .is_err());
+        assert!(TestMachineCli::try_parse_from(
+            ["machine", "restore", "--name", "sentry-backend",]
+        )
+        .is_err());
+    }
+
+    #[test]
     fn indexed_fork_env_renders_each_clone() {
         let specs = vec![
             "TRIAL={index}".to_string(),
@@ -3905,6 +3963,48 @@ impl StartCmd {
 // ============================================================================
 // Fork Command
 // ============================================================================
+
+/// Capture a running forkable machine into a process-exit-safe checkpoint.
+///
+/// The initial durable ABI is deliberately narrow: macOS/Apple Silicon, one
+/// machine, static external Unix-stream networking, and no mutable host-side
+/// attachments. It captures RAM/device state plus APFS-cloned writable disks,
+/// writes a verified receipt, then stops the source. `restore` brings it back
+/// under the same machine name with fresh agent and NIC host handles.
+#[derive(Args, Debug)]
+pub struct CheckpointCmd {
+    /// Running forkable machine to checkpoint.
+    #[arg(long, value_name = "NAME")]
+    pub name: String,
+
+    /// Absolute, not-yet-existing output directory for the checkpoint artifact.
+    #[arg(long, value_name = "DIR")]
+    pub output: PathBuf,
+}
+
+impl CheckpointCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        vm_common::checkpoint_vm_named(&self.name, &self.output)
+    }
+}
+
+/// Restore a stopped machine from a durable checkpoint.
+#[derive(Args, Debug)]
+pub struct RestoreCmd {
+    /// Original machine name recorded by the checkpoint receipt.
+    #[arg(long, value_name = "NAME")]
+    pub name: String,
+
+    /// Absolute checkpoint directory produced by `machine checkpoint`.
+    #[arg(long, value_name = "DIR")]
+    pub checkpoint: PathBuf,
+}
+
+impl RestoreCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        vm_common::restore_vm_named_from_checkpoint(&self.name, &self.checkpoint)
+    }
+}
 
 /// Fork a running forkable machine into a new clone.
 ///

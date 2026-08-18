@@ -135,3 +135,13 @@ pkill -f "smolvm-bin machine start"
 ```bash
 ps aux | grep smolvm
 ```
+
+### Recovering an orphaned machine directory
+
+The persistent machine record and its host data directory are normally removed
+together. If a host crash or interrupted delete leaves the exact data directory
+behind after the SQLite record is gone, `machine delete --force --name NAME`
+also removes that one directory, detaches its exact layers volume, and prunes
+stale readiness markers. It never scans or removes unrecorded machine names
+without an explicit name and `--force`; this narrow recovery path is used by
+world managers that own deterministic machine names.

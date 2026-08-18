@@ -18,6 +18,7 @@ use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm_protocol::ImageInfo;
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::path::Path;
 
 // ============================================================================
 // Shared helpers
@@ -754,6 +755,11 @@ pub(crate) fn print_create_success(params: &CreateVmParams) {
 pub struct ForkLaunch {
     /// Start as a fork base: memfd-back guest RAM and expose `control_socket`.
     pub forkable: bool,
+    /// Ignore the record's ordinary fork-base default. A durable restore uses a
+    /// snapshot produced by a forkable source, but its fresh VMM must restore
+    /// that source's state rather than allocate another fork-base RAM/control
+    /// configuration around it.
+    pub suppress_record_forkable: bool,
     /// Boot as a fork clone, restoring from the golden's snapshot at this dir.
     pub snapshot_dir: Option<std::path::PathBuf>,
     /// Clone boot only: share the golden's loaded CUDA weights instead of
@@ -774,6 +780,7 @@ pub struct ForkLaunch {
 pub fn forkable_launch() -> ForkLaunch {
     ForkLaunch {
         forkable: true,
+        suppress_record_forkable: false,
         snapshot_dir: None,
         share_weights: false,
         preload_modules: false,
@@ -799,8 +806,8 @@ pub struct ForkVmOptions<'a> {
 }
 
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
+    let fork_started = std::time::Instant::now();
     let db = SmolvmDb::open()?;
-
     // A live FUSE mount does not survive the freeze/restore: the restored
     // clone's mount wedges its container namespace and every exec hangs.
     // Refuse cleanly until fork remounts remote volumes on restore.
@@ -815,10 +822,14 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             ));
         }
     }
-
     if let Some(timeout) = options.wait_ready {
         eprintln!("Waiting for golden '{golden}' to reach its forkpoint...");
         smolvm::agent::fork::wait_for_forkpoint(golden, timeout)?;
+        tracing::info!(
+            golden,
+            elapsed_ms = fork_started.elapsed().as_secs_f64() * 1000.0,
+            "fork: precondition complete"
+        );
     }
 
     // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
@@ -845,6 +856,12 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
             options.fork_secrets,
         )?
     };
+    tracing::info!(
+        golden,
+        clone,
+        elapsed_ms = fork_started.elapsed().as_secs_f64() * 1000.0,
+        "fork: clone prepared"
+    );
     for (golden_host, guest, clone_host) in &prep.port_remaps {
         if options.pinned_ports.is_empty() {
             eprintln!(
@@ -867,6 +884,12 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
     ) {
         return rollback_failed_fork(golden, &snapshot_dir, resume_golden, error);
     }
+    tracing::info!(
+        golden,
+        clone,
+        elapsed_ms = fork_started.elapsed().as_secs_f64() * 1000.0,
+        "fork: clone boot and identity complete"
+    );
     if options.wait_ready.is_some() && !options.hold {
         if let Err(error) = smolvm::agent::fork::fail_closed_on_rejuvenation(
             smolvm::agent::fork::release_forkpoint(clone),
@@ -874,6 +897,12 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         ) {
             return rollback_failed_fork(golden, &snapshot_dir, resume_golden, error);
         }
+        tracing::info!(
+            golden,
+            clone,
+            elapsed_ms = fork_started.elapsed().as_secs_f64() * 1000.0,
+            "fork: clone release complete"
+        );
     }
     if options.hold {
         eprintln!(
@@ -886,6 +915,60 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
              (do not start it again while clones exist)."
         );
     }
+    tracing::info!(
+        golden,
+        clone,
+        elapsed_ms = fork_started.elapsed().as_secs_f64() * 1000.0,
+        "fork: complete"
+    );
+    Ok(())
+}
+
+/// Capture one running external-network machine into a durable fork artifact.
+///
+/// The lower-level capture operation stops the source only after it has made
+/// checkpoint-owned RAM and writable-disk clonefiles durable. This command is
+/// intentionally same-machine/same-lineage; coordinated multi-machine
+/// checkpointing belongs to the caller that composes these receipts.
+pub fn checkpoint_vm_named(name: &str, output: &Path) -> smolvm::Result<()> {
+    let checkpoint = smolvm::agent::fork::capture_durable_fork(name, output)?;
+    println!(
+        "Checkpointed machine '{}' at {} ({} verified files, ABI {}).",
+        name,
+        output.display(),
+        checkpoint.files.len(),
+        checkpoint.materializer_abi
+    );
+    Ok(())
+}
+
+/// Restore a checkpointed machine under its original identity.
+///
+/// Disk files are validated and staged before launch. The snapshot launch uses
+/// new vsock and external-NIC host handles, while the stable guest MAC/IP come
+/// from the unchanged machine record. Ordinary cold start stays blocked until
+/// this snapshot-backed boot completes.
+pub fn restore_vm_named_from_checkpoint(name: &str, checkpoint: &Path) -> smolvm::Result<()> {
+    let receipt = smolvm::agent::fork::restore_durable_fork_files(name, checkpoint)?;
+    let db = SmolvmDb::open()?;
+    start_vm_named_with_db(
+        &db,
+        name,
+        None,
+        None,
+        true,
+        ForkLaunch {
+            snapshot_dir: Some(smolvm::agent::fork::durable_fork_snapshot_dir(checkpoint)),
+            suppress_record_forkable: true,
+            ..Default::default()
+        },
+    )?;
+    println!(
+        "Restored machine '{}' from {} ({} verified files).",
+        name,
+        checkpoint.display(),
+        receipt.files.len()
+    );
     Ok(())
 }
 
@@ -1291,8 +1374,42 @@ fn start_vm_named_with_db(
     // to repeat `--forkable`. Older records that persisted a CUDA pool before
     // the explicit field existed get the same behavior, but clones remain
     // leaves even though they inherit the golden's CUDA capacity policy.
-    if record.forkable_on_start() {
+    if record.forkable_on_start() && !fork.suppress_record_forkable {
         fork.forkable = true;
+    }
+
+    let durable_restore_marker = smolvm::agent::fork::durable_restore_incomplete_marker(name);
+    match std::fs::symlink_metadata(&durable_restore_marker) {
+        Ok(metadata) if metadata.file_type().is_file() && !from_snapshot => {
+            return Err(Error::agent(
+                "start",
+                format!(
+                    "'{name}' has checkpoint-restored disks waiting for snapshot RAM; repeat `machine restore --name {name} --checkpoint <DIR>` instead of cold-starting it"
+                ),
+            ));
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(Error::agent(
+                "start",
+                format!(
+                    "'{name}' has an invalid durable restore marker at {}; remove nothing manually and rerun the restore",
+                    durable_restore_marker.display()
+                ),
+            ));
+        }
+        // A snapshot-backed restore is the only start path allowed to consume
+        // this marker. It removes the marker after the restored VMM is live.
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::agent(
+                "start",
+                format!(
+                    "inspect durable restore marker {}: {error}",
+                    durable_restore_marker.display()
+                ),
+            ));
+        }
     }
 
     // Resolve via the shared probe (PID + vsock ping). The plain
@@ -1690,6 +1807,28 @@ fn start_vm_named_with_db(
         r.pid_start_time = pid_start_time;
     }) {
         tracing::warn!(error = %e, vm = %name, "failed to persist running state");
+    }
+
+    if from_snapshot {
+        match std::fs::remove_file(&durable_restore_marker) {
+            Ok(()) => {
+                if let Some(parent) = durable_restore_marker.parent() {
+                    if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+                        tracing::warn!(
+                            path = %durable_restore_marker.display(),
+                            %error,
+                            "durable restore marker removed but parent sync failed"
+                        );
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                path = %durable_restore_marker.display(),
+                %error,
+                "snapshot restore started but durable restore marker could not be removed"
+            ),
+        }
     }
 
     // Keep VM running (persistent)
@@ -2268,10 +2407,36 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     let config = SmolvmConfig::load()?;
 
     // Check if exists
-    let record = config
-        .get_vm(name)
-        .ok_or_else(|| smolvm::Error::vm_not_found(name))?
-        .clone();
+    let Some(record) = config.get_vm(name).cloned() else {
+        // An orchestrator can lose the SQLite record after a host crash while
+        // the exact per-machine directory remains. A force delete may reap
+        // only that requested orphan, avoiding stale disks being adopted by a
+        // later deterministic machine creation. Without force, preserve the
+        // usual not-found behavior and never delete an unrecorded directory.
+        if force {
+            let data_dir = vm_data_dir(name);
+            if data_dir.exists() {
+                // A lost record can also mean the boot PID was never
+                // persisted. Reuse the same argv-checked reaper as normal
+                // delete recovery before removing the exact data directory.
+                kill_orphaned_boot_process(name);
+                smolvm_pack::extract::force_detach_layers_volume(
+                    &smolvm::agent::machine_layers_cache_dir(name),
+                );
+                smolvm::process::free_vm_uid(&smolvm::agent::vm_uid_registry_dir(), &data_dir);
+                std::fs::remove_dir_all(&data_dir).map_err(|e| {
+                    smolvm::Error::storage(
+                        "delete orphaned machine data",
+                        format!("{}: {e}", data_dir.display()),
+                    )
+                })?;
+                smolvm::agent::prune_orphaned_ready_markers();
+                println!("Deleted orphaned machine data: {}", name);
+                return Ok(());
+            }
+        }
+        return Err(smolvm::Error::vm_not_found(name));
+    };
 
     // A golden's disks are the copy-on-write backing for its clones' overlays,
     // so it must outlive them. Refuse to delete a golden while clones depend on

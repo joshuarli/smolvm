@@ -9,14 +9,93 @@
 //! everything up to and including the snapshot + disk clone is shared so the two
 //! entry points can never silently diverge.
 
-use crate::agent::{resolve_disk_image, vm_data_dir, AgentClient};
-use crate::config::VmRecord;
+use crate::agent::{resolve_disk_image, vm_data_dir, AgentClient, AgentManager};
+use crate::config::{RecordState, VmRecord};
 use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Versioned, durable checkpoint receipt for one forkable machine.
+///
+/// A live fork's `checkpoint.bin` and `manifest.bin` normally borrow the
+/// frozen golden process's RAM files. This receipt is written only after the
+/// manifest has been rewritten to checkpoint-owned APFS clonefiles and the
+/// writable disks have been cloned beside it. It is therefore the boundary
+/// between a live fork and a process-exit-safe checkpoint artifact.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct DurableForkCheckpoint {
+    /// Artifact schema, bumped for incompatible receipt changes.
+    pub schema_version: u32,
+    /// The materializer/restore ABI that produced this artifact.
+    pub materializer_abi: String,
+    /// Machine name whose state was captured. Restore is same-lineage only in
+    /// this first vertical slice, so it must match the target machine exactly.
+    pub source_name: String,
+    /// Fingerprint of the source's non-runtime configuration. It prevents a
+    /// stale checkpoint from being restored with changed CPU, device, network,
+    /// image, or mount settings.
+    pub source_config_fingerprint: String,
+    /// Receipt of the original machine record for inspection and future world
+    /// composition. Secret references are identifiers, never secret plaintext.
+    pub source_record: VmRecord,
+    /// Every checkpoint-owned regular file except this receipt itself.
+    pub files: Vec<DurableForkFile>,
+}
+
+/// One bounded receipt for a file in a [`DurableForkCheckpoint`].
+///
+/// The small VMM control files are content-addressed. RAM and writable-disk
+/// clonefiles are local immutable artifacts, so the checkpoint hot path seals
+/// their exact APFS file identity and stable metadata instead of reading every
+/// logical byte merely to compute a second content copy. A later offline audit
+/// may compute deep content hashes without delaying the frozen world cut.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct DurableForkFile {
+    /// Safe slash-separated path relative to the artifact root.
+    pub path: String,
+    /// Logical byte size of the file.
+    pub bytes: u64,
+    /// Versioned bounded integrity receipt appropriate to this artifact file.
+    pub integrity: DurableForkFileIntegrity,
+}
+
+/// Closed integrity receipts for a checkpoint-owned regular file.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DurableForkFileIntegrity {
+    /// Full BLAKE3 identity for the small VMM control files.
+    Blake3 {
+        /// BLAKE3 digest of the control-file contents.
+        digest: String,
+    },
+    /// APFS/local filesystem identity for immutable RAM or disk clonefiles.
+    /// A restore rejects a different file, changed logical size, or changed
+    /// modification timestamp before handing it to the VMM.
+    FileIdentity {
+        /// Filesystem device number at artifact publication.
+        device: u64,
+        /// Filesystem inode number at artifact publication.
+        inode: u64,
+        /// Whole seconds in the modification timestamp at publication.
+        modified_seconds: i64,
+        /// Nanosecond component of the modification timestamp at publication.
+        modified_nanoseconds: i64,
+    },
+}
+
+const DURABLE_FORK_SCHEMA_VERSION: u32 = 2;
+const DURABLE_FORK_MATERIALIZER_ABI: &str = "smolvm-durable-fork-macos-v2";
+const DURABLE_FORK_RECEIPT_NAME: &str = "smolvm-checkpoint.json";
+const DURABLE_FORK_CHECKPOINT_FILE: &str = "checkpoint.bin";
+const DURABLE_FORK_MANIFEST_FILE: &str = "manifest.bin";
+const DURABLE_FORK_RAM_DIR: &str = "ram";
+const DURABLE_FORK_DISKS_DIR: &str = "disks";
 
 /// Path to a forkable machine's control socket (pause/resume/checkpoint/FORK).
 pub fn control_socket_path(name: &str) -> PathBuf {
@@ -83,6 +162,7 @@ fn persist_forkpoint_profile(golden: &str, profile: ForkpointProfile) -> Result<
 /// marker and blocks. Keeping the wait in the VM namespace avoids coupling the
 /// host to container logs, PIDs, or workload-specific files.
 pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
+    let started = std::time::Instant::now();
     // A successful first fork leaves the golden paused permanently as the CoW
     // base. Pool replenishment must not try to run a new agent exec inside that
     // paused VM: its vCPUs cannot answer, even though the already-proven
@@ -92,7 +172,11 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
     if control.exists() {
         if let Ok(status) = control_socket_cmd(&control, "STATUS") {
             if fork_base_already_paused(&status) {
-                tracing::debug!(golden, %status, "fork base is already paused; reusing its forkpoint");
+                tracing::info!(
+                    golden,
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "fork: reused paused golden forkpoint"
+                );
                 return Ok(());
             }
         }
@@ -115,6 +199,11 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
         Ok((0, stdout, _)) => {
             let profile = parse_forkpoint_profile(&stdout);
             persist_forkpoint_profile(golden, profile)?;
+            tracing::info!(
+                golden,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "fork: golden forkpoint ready"
+            );
             Ok(())
         }
         Ok((code, _, stderr)) => Err(Error::agent(
@@ -144,6 +233,7 @@ fn fork_base_already_paused(status: &str) -> bool {
 /// release marker wakes only this clone even though every clone inherited the
 /// same blocked helper process.
 pub fn release_forkpoint(clone: &str) -> Result<()> {
+    let started = std::time::Instant::now();
     let socket = vm_data_dir(clone).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|e| Error::agent("release forkpoint", format!("agent connect: {e}")))?;
@@ -159,7 +249,14 @@ pub fn release_forkpoint(clone: &str) -> Result<()> {
         Some(Duration::from_secs(10)),
         None,
     ) {
-        Ok((0, _, _)) => Ok(()),
+        Ok((0, _, _)) => {
+            tracing::info!(
+                clone,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "fork: clone forkpoint released"
+            );
+            Ok(())
+        }
         Ok((code, _, stderr)) => Err(Error::agent(
             "release forkpoint",
             format!(
@@ -210,6 +307,1008 @@ pub fn resume_golden(golden: &str, snapshot_dir: &Path) -> Result<()> {
             format!("golden '{golden}' RESUME failed: {reply}"),
         ))
     }
+}
+
+/// Capture one running machine as a process-exit-safe checkpoint artifact.
+///
+/// This is intentionally the Gate 1 machine primitive, not a world snapshot:
+/// it has one source name, one set of writable disks, and one external
+/// Unix-stream NIC. The source is stopped only after the receipt and every
+/// file it names are durable. Any failure before that point rolls the frozen
+/// golden back to its running device state and removes only this call's
+/// staging directory.
+pub fn capture_durable_fork(name: &str, output: &Path) -> Result<DurableForkCheckpoint> {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (name, output);
+        return Err(Error::agent(
+            "durable checkpoint",
+            "durable fork checkpoints currently require macOS on Apple Silicon",
+        ));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        validate_vm_name(name, "machine name").map_err(|e| Error::config("checkpoint", e))?;
+        let parent = durable_checkpoint_output_parent(output)?;
+        let staging = create_durable_checkpoint_staging(&parent, output)?;
+        let mut progress = DurableCaptureProgress::default();
+        let result = capture_durable_fork_into(name, &staging, &mut progress);
+
+        match result {
+            Ok(receipt) => {
+                if let Err(error) = fs::rename(&staging, output) {
+                    return Err(Error::agent(
+                        "publish durable checkpoint",
+                        format!(
+                            "source is stopped and complete checkpoint is preserved at {}: {error}",
+                            staging.display()
+                        ),
+                    ));
+                }
+                if let Err(error) = File::open(&parent).and_then(|directory| directory.sync_all()) {
+                    return Err(Error::agent(
+                        "publish durable checkpoint",
+                        format!(
+                            "checkpoint is published at {} but parent directory sync failed: {error}",
+                            output.display()
+                        ),
+                    ));
+                }
+                Ok(receipt)
+            }
+            Err(error) if progress.source_stopped => Err(Error::agent(
+                "durable checkpoint",
+                format!(
+                    "{error}; source is stopped and checkpoint staging is preserved at {} for recovery",
+                    staging.display()
+                ),
+            )),
+            Err(error) => {
+                let mut recovery_errors = Vec::new();
+                if progress.frozen {
+                    if let Err(resume_error) = resume_golden(name, &staging) {
+                        recovery_errors.push(format!("golden rollback failed: {resume_error}"));
+                    }
+                }
+                if recovery_errors.is_empty() {
+                    if let Err(remove_error) = fs::remove_dir_all(&staging) {
+                        if remove_error.kind() != std::io::ErrorKind::NotFound {
+                            recovery_errors.push(format!("staging cleanup failed: {remove_error}"));
+                        }
+                    }
+                }
+                if recovery_errors.is_empty() {
+                    Err(error)
+                } else {
+                    Err(Error::agent(
+                        "durable checkpoint",
+                        format!(
+                            "{error}; {}; checkpoint staging preserved at {}",
+                            recovery_errors.join("; "),
+                            staging.display()
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+/// Verify and stage the disk side of a durable checkpoint for same-lineage
+/// restore. The caller then starts the VM from `checkpoint.bin`/`manifest.bin`
+/// with fresh host handles. A restore-incomplete marker denies ordinary starts
+/// if a later filesystem error interrupts the disk replacement sequence.
+pub fn restore_durable_fork_files(name: &str, checkpoint: &Path) -> Result<DurableForkCheckpoint> {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        let _ = (name, checkpoint);
+        return Err(Error::agent(
+            "durable restore",
+            "durable fork checkpoints currently require macOS on Apple Silicon",
+        ));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        validate_vm_name(name, "machine name").map_err(|e| Error::config("restore", e))?;
+        validate_durable_checkpoint_root(checkpoint)?;
+        let receipt = read_durable_checkpoint_receipt(checkpoint)?;
+        validate_durable_checkpoint_receipt(checkpoint, &receipt)?;
+        if receipt.source_name != name {
+            return Err(Error::agent(
+                "durable restore",
+                format!(
+                    "checkpoint belongs to machine '{}' rather than requested machine '{name}'",
+                    receipt.source_name
+                ),
+            ));
+        }
+
+        let db = SmolvmDb::open()?;
+        let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+        if record.state != RecordState::Stopped {
+            return Err(Error::agent(
+                "durable restore",
+                format!(
+                    "machine '{name}' must be stopped before restore (current state: {})",
+                    record.state
+                ),
+            ));
+        }
+        validate_durable_fork_record(&record)?;
+        let fingerprint = durable_fork_config_fingerprint(&record)?;
+        if fingerprint != receipt.source_config_fingerprint {
+            return Err(Error::agent(
+                "durable restore",
+                "machine configuration differs from the checkpoint receipt; create a new checkpoint instead of restoring it with changed launch semantics",
+            ));
+        }
+
+        let machine_dir = vm_data_dir(name);
+        let metadata = fs::symlink_metadata(&machine_dir).map_err(|error| {
+            Error::agent(
+                "durable restore",
+                format!(
+                    "inspect machine data directory {}: {error}",
+                    machine_dir.display()
+                ),
+            )
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(Error::agent(
+                "durable restore",
+                format!(
+                    "machine data directory is not a real directory: {}",
+                    machine_dir.display()
+                ),
+            ));
+        }
+
+        restore_durable_fork_disks(checkpoint, &receipt, &machine_dir)?;
+        Ok(receipt)
+    }
+}
+
+/// Absolute path to the libkrun snapshot directory within a durable receipt.
+pub fn durable_fork_snapshot_dir(checkpoint: &Path) -> PathBuf {
+    checkpoint.to_path_buf()
+}
+
+/// Marker written before checkpoint disks are replaced and retained until the
+/// snapshot-backed launch succeeds. Keep this public to the launcher layer so
+/// ordinary `machine start` can fail closed instead of cold-booting either a
+/// half-replaced disk pair or a fully restored disk with stale guest RAM.
+pub fn durable_restore_incomplete_marker(name: &str) -> PathBuf {
+    vm_data_dir(name).join("durable-restore-incomplete")
+}
+
+#[derive(Default)]
+struct DurableCaptureProgress {
+    frozen: bool,
+    source_stopped: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn capture_durable_fork_into(
+    name: &str,
+    staging: &Path,
+    progress: &mut DurableCaptureProgress,
+) -> Result<DurableForkCheckpoint> {
+    let db = SmolvmDb::open()?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    validate_durable_fork_record(&record)?;
+    let clones = db.dependent_clones(name)?;
+    if !clones.is_empty() {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!(
+                "machine '{name}' has {} dependent fork clone(s) ({}); retire them before making the source process-exit-safe",
+                clones.len(),
+                clones.join(", ")
+            ),
+        ));
+    }
+
+    let control = control_socket_path(name);
+    let status = control_socket_cmd(&control, "STATUS").map_err(|error| {
+        Error::agent(
+            "durable checkpoint",
+            format!(
+                "machine '{name}' is not running as a forkable golden ({error}); start it with `machine start --forkable --name {name}`"
+            ),
+        )
+    })?;
+    if status.trim() != "OK running" {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!("machine '{name}' is not a running fork base: {status}"),
+        ));
+    }
+
+    let reply = control_socket_cmd(&control, &format!("FORK {}", staging.display()))?;
+    if !reply.starts_with("OK") {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!("machine '{name}' FORK failed: {reply}"),
+        ));
+    }
+    progress.frozen = true;
+
+    let reply = control_socket_cmd(
+        &control,
+        &format!("PERSIST_FORK_MEMORY {}", staging.display()),
+    )?;
+    if !reply.starts_with("OK") {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!("machine '{name}' did not persist fork RAM: {reply}"),
+        ));
+    }
+
+    clone_durable_fork_disks(&vm_data_dir(name), staging)?;
+    let receipt = DurableForkCheckpoint {
+        schema_version: DURABLE_FORK_SCHEMA_VERSION,
+        materializer_abi: DURABLE_FORK_MATERIALIZER_ABI.to_string(),
+        source_name: name.to_string(),
+        source_config_fingerprint: durable_fork_config_fingerprint(&record)?,
+        source_record: record.clone(),
+        files: durable_checkpoint_files(staging)?,
+    };
+    write_durable_checkpoint_receipt(staging, &receipt)?;
+    sync_directory(staging)?;
+
+    let manager = AgentManager::for_vm(name)
+        .map_err(|error| Error::agent("durable checkpoint", format!("open VM manager: {error}")))?;
+    manager.stop()?;
+    progress.source_stopped = true;
+    db.update_vm(name, |machine| {
+        machine.state = RecordState::Stopped;
+        machine.pid = None;
+        machine.pid_start_time = None;
+    })?
+    .ok_or_else(|| Error::vm_not_found(name))?;
+    Ok(receipt)
+}
+
+fn validate_durable_fork_record(record: &VmRecord) -> Result<()> {
+    if record.golden.is_some() {
+        return Err(Error::agent(
+            "durable checkpoint",
+            "a fork clone cannot be a durable checkpoint source because its disks still depend on its live golden",
+        ));
+    }
+    if record.external_network.is_none() {
+        return Err(Error::agent(
+            "durable checkpoint",
+            "the first durable checkpoint ABI requires an external Unix-stream virtio-net attachment so the restored VM can reconnect with its stable identity",
+        ));
+    }
+    if !record.mounts.is_empty()
+        || !record.published_sockets.is_empty()
+        || record.ssh_agent
+        || record.docker_socket
+        || record.source_smolmachine.is_some()
+        || !record.ports.is_empty()
+    {
+        return Err(Error::agent(
+            "durable checkpoint",
+            "host mounts, published sockets, SSH-agent forwarding, Docker bridges, bundle volumes, and host port forwards are not yet receipt-backed durable checkpoint resources",
+        ));
+    }
+    if record.cuda || record.gpu == Some(true) {
+        return Err(Error::agent(
+            "durable checkpoint",
+            "CUDA and GPU devices are not yet supported by the durable checkpoint ABI",
+        ));
+    }
+    if (!record.init.is_empty() || record.image.is_some()) && !record.init_completed {
+        return Err(Error::agent(
+            "durable checkpoint",
+            "machine initialization is incomplete; a durable restore must not rerun image pulls or init commands over captured RAM",
+        ));
+    }
+    Ok(())
+}
+
+fn durable_fork_config_fingerprint(record: &VmRecord) -> Result<String> {
+    let mut stable = record.clone();
+    stable.state = RecordState::Created;
+    stable.pid = None;
+    stable.pid_start_time = None;
+    stable.last_exit_code = None;
+    let encoded = serde_json::to_vec(&stable).map_err(|error| {
+        Error::agent(
+            "durable checkpoint",
+            format!("encode config receipt: {error}"),
+        )
+    })?;
+    Ok(blake3::hash(&encoded).to_hex().to_string())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn durable_checkpoint_output_parent(output: &Path) -> Result<PathBuf> {
+    if !output.is_absolute() {
+        return Err(Error::config(
+            "checkpoint output",
+            "--output must be an absolute, not-yet-existing directory",
+        ));
+    }
+    match fs::symlink_metadata(output) {
+        Ok(_) => {
+            return Err(Error::config(
+                "checkpoint output",
+                format!("refusing to overwrite existing path {}", output.display()),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::agent(
+                "checkpoint output",
+                format!("inspect {}: {error}", output.display()),
+            ));
+        }
+    }
+    let parent = output.parent().ok_or_else(|| {
+        Error::config(
+            "checkpoint output",
+            "--output must have an existing parent directory",
+        )
+    })?;
+    let metadata = fs::symlink_metadata(parent).map_err(|error| {
+        Error::agent(
+            "checkpoint output",
+            format!("inspect parent {}: {error}", parent.display()),
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(Error::config(
+            "checkpoint output",
+            format!("parent is not a real directory: {}", parent.display()),
+        ));
+    }
+    Ok(parent.to_path_buf())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn create_durable_checkpoint_staging(parent: &Path, output: &Path) -> Result<PathBuf> {
+    let stem = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            Error::config(
+                "checkpoint output",
+                "--output directory name must be valid UTF-8",
+            )
+        })?;
+    for _ in 0..128 {
+        let staging = parent.join(format!(
+            ".{stem}.smolvm-durable-{}.partial",
+            host_random_hex(12)
+        ));
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(Error::agent(
+                    "checkpoint output",
+                    format!("create staging directory {}: {error}", staging.display()),
+                ));
+            }
+        }
+    }
+    Err(Error::agent(
+        "checkpoint output",
+        "could not allocate a unique checkpoint staging directory",
+    ))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn clone_durable_fork_disks(source_dir: &Path, checkpoint: &Path) -> Result<()> {
+    let disks_dir = checkpoint.join(DURABLE_FORK_DISKS_DIR);
+    fs::create_dir(&disks_dir).map_err(|error| {
+        Error::agent(
+            "durable checkpoint",
+            format!("create disks directory: {error}"),
+        )
+    })?;
+    for raw in [
+        crate::data::storage::STORAGE_DISK_FILENAME,
+        crate::data::storage::OVERLAY_DISK_FILENAME,
+    ] {
+        let (source, _) = resolve_disk_image(source_dir, raw);
+        let metadata = fs::symlink_metadata(&source).map_err(|error| {
+            Error::agent(
+                "durable checkpoint",
+                format!("inspect writable disk {}: {error}", source.display()),
+            )
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::agent(
+                "durable checkpoint",
+                format!("writable disk is not a regular file: {}", source.display()),
+            ));
+        }
+        let destination =
+            disks_dir.join(source.file_name().ok_or_else(|| {
+                Error::agent("durable checkpoint", "writable disk has no filename")
+            })?);
+        clone_regular_file_apfs(&source, &destination)?;
+
+        let source_marker = source.with_extension("formatted");
+        if let Ok(marker_metadata) = fs::symlink_metadata(&source_marker) {
+            if !marker_metadata.file_type().is_file() {
+                return Err(Error::agent(
+                    "durable checkpoint",
+                    format!(
+                        "disk format marker is not a regular file: {}",
+                        source_marker.display()
+                    ),
+                ));
+            }
+            clone_regular_file_apfs(&source_marker, &destination.with_extension("formatted"))?;
+        }
+    }
+    sync_directory(&disks_dir)?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn clone_regular_file_apfs(source: &Path, destination: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    File::open(source)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            Error::agent(
+                "durable checkpoint",
+                format!("sync source file {}: {error}", source.display()),
+            )
+        })?;
+    let source_c = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        Error::agent(
+            "durable checkpoint",
+            format!("source path contains NUL: {}", source.display()),
+        )
+    })?;
+    let destination_c = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        Error::agent(
+            "durable checkpoint",
+            format!("destination path contains NUL: {}", destination.display()),
+        )
+    })?;
+    // SAFETY: both C strings name local, NUL-free paths. The destination is a
+    // fresh filename in a checkpoint directory created by this call.
+    if unsafe { libc::clonefile(source_c.as_ptr(), destination_c.as_ptr(), 0) } != 0 {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!(
+                "APFS clonefile {} -> {}: {}",
+                source.display(),
+                destination.display(),
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    File::open(destination)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            Error::agent(
+                "durable checkpoint",
+                format!("sync cloned file {}: {error}", destination.display()),
+            )
+        })?;
+    Ok(())
+}
+
+fn durable_checkpoint_files(root: &Path) -> Result<Vec<DurableForkFile>> {
+    let mut paths = vec![
+        PathBuf::from(DURABLE_FORK_CHECKPOINT_FILE),
+        PathBuf::from(DURABLE_FORK_MANIFEST_FILE),
+    ];
+    paths.extend(durable_checkpoint_child_files(
+        root,
+        DURABLE_FORK_RAM_DIR,
+        true,
+    )?);
+    paths.extend(durable_checkpoint_child_files(
+        root,
+        DURABLE_FORK_DISKS_DIR,
+        true,
+    )?);
+    // Receipt creation is deliberately bounded: a coordinated world cut must
+    // not turn every RAM/disk clone into a host-wide BLAKE3 workload. The
+    // clonefiles are already immutable checkpoint-owned files; only small VMM
+    // control files use a content hash in the transition path.
+    let mut files = paths
+        .iter()
+        .map(|relative| durable_fork_file(root, relative))
+        .collect::<Result<Vec<_>>>()?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn durable_checkpoint_child_files(
+    root: &Path,
+    child: &str,
+    required: bool,
+) -> Result<Vec<PathBuf>> {
+    let directory = root.join(child);
+    let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+        Error::agent(
+            "durable checkpoint",
+            format!(
+                "inspect checkpoint directory {}: {error}",
+                directory.display()
+            ),
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!(
+                "checkpoint path is not a real directory: {}",
+                directory.display()
+            ),
+        ));
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&directory).map_err(|error| {
+        Error::agent(
+            "durable checkpoint",
+            format!("list {}: {error}", directory.display()),
+        )
+    })? {
+        let entry = entry.map_err(|error| Error::agent("durable checkpoint", error.to_string()))?;
+        let metadata = entry
+            .file_type()
+            .map_err(|error| Error::agent("durable checkpoint", error.to_string()))?;
+        if !metadata.is_file() {
+            return Err(Error::agent(
+                "durable checkpoint",
+                format!(
+                    "checkpoint contains a non-regular file: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            Error::agent(
+                "durable checkpoint",
+                format!(
+                    "checkpoint filename is not UTF-8: {}",
+                    entry.path().display()
+                ),
+            )
+        })?;
+        files.push(PathBuf::from(child).join(name));
+    }
+    if required && files.is_empty() {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!("checkpoint directory is empty: {}", directory.display()),
+        ));
+    }
+    Ok(files)
+}
+
+fn durable_fork_file(root: &Path, relative: &Path) -> Result<DurableForkFile> {
+    let path = safe_durable_relative_path(relative)?;
+    let absolute = root.join(relative);
+    let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+        Error::agent(
+            "durable checkpoint",
+            format!("inspect checkpoint file {}: {error}", absolute.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!("checkpoint file is not regular: {}", absolute.display()),
+        ));
+    }
+    let integrity = if matches!(
+        relative.to_str(),
+        Some(DURABLE_FORK_CHECKPOINT_FILE | DURABLE_FORK_MANIFEST_FILE)
+    ) {
+        DurableForkFileIntegrity::Blake3 {
+            digest: blake3_file(&absolute)?,
+        }
+    } else {
+        DurableForkFileIntegrity::FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+        }
+    };
+    Ok(DurableForkFile {
+        path,
+        bytes: metadata.len(),
+        integrity,
+    })
+}
+
+fn write_durable_checkpoint_receipt(root: &Path, receipt: &DurableForkCheckpoint) -> Result<()> {
+    let encoded = serde_json::to_vec_pretty(receipt).map_err(|error| {
+        Error::agent(
+            "durable checkpoint",
+            format!("encode checkpoint receipt: {error}"),
+        )
+    })?;
+    write_durable_file(&root.join(DURABLE_FORK_RECEIPT_NAME), &encoded)
+}
+
+fn write_durable_file(path: &Path, contents: &[u8]) -> Result<()> {
+    let temporary =
+        path.with_extension(format!("{}.{}.tmp", std::process::id(), host_random_hex(8)));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| {
+            Error::agent(
+                "durable checkpoint",
+                format!("create {}: {error}", temporary.display()),
+            )
+        })?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error| {
+        Error::agent(
+            "durable checkpoint",
+            format!("write {}: {error}", path.display()),
+        )
+    })
+}
+
+fn sync_directory(directory: &Path) -> Result<()> {
+    File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            Error::agent(
+                "durable checkpoint",
+                format!("sync {}: {error}", directory.display()),
+            )
+        })
+}
+
+fn blake3_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path).map_err(|error| {
+        Error::agent(
+            "durable checkpoint",
+            format!("open {}: {error}", path.display()),
+        )
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            Error::agent(
+                "durable checkpoint",
+                format!("read {}: {error}", path.display()),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn validate_durable_checkpoint_root(root: &Path) -> Result<()> {
+    if !root.is_absolute() {
+        return Err(Error::config(
+            "checkpoint",
+            "--checkpoint must be an absolute directory",
+        ));
+    }
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        Error::agent(
+            "durable restore",
+            format!("inspect checkpoint {}: {error}", root.display()),
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(Error::agent(
+            "durable restore",
+            format!("checkpoint is not a real directory: {}", root.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn read_durable_checkpoint_receipt(root: &Path) -> Result<DurableForkCheckpoint> {
+    let path = root.join(DURABLE_FORK_RECEIPT_NAME);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        Error::agent(
+            "durable restore",
+            format!("inspect checkpoint receipt {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::agent(
+            "durable restore",
+            format!(
+                "checkpoint receipt is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        Error::agent(
+            "durable restore",
+            format!("read {}: {error}", path.display()),
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        Error::agent(
+            "durable restore",
+            format!("decode checkpoint receipt: {error}"),
+        )
+    })
+}
+
+fn validate_durable_checkpoint_receipt(root: &Path, receipt: &DurableForkCheckpoint) -> Result<()> {
+    if receipt.schema_version != DURABLE_FORK_SCHEMA_VERSION {
+        return Err(Error::agent(
+            "durable restore",
+            format!(
+                "unsupported checkpoint schema {}; expected {}",
+                receipt.schema_version, DURABLE_FORK_SCHEMA_VERSION
+            ),
+        ));
+    }
+    if receipt.materializer_abi != DURABLE_FORK_MATERIALIZER_ABI {
+        return Err(Error::agent(
+            "durable restore",
+            format!(
+                "checkpoint ABI '{}' is incompatible with this runtime ('{}')",
+                receipt.materializer_abi, DURABLE_FORK_MATERIALIZER_ABI
+            ),
+        ));
+    }
+    if receipt.files.is_empty() {
+        return Err(Error::agent(
+            "durable restore",
+            "checkpoint receipt contains no files",
+        ));
+    }
+    let mut seen = HashSet::new();
+    for file in &receipt.files {
+        if !seen.insert(file.path.clone()) {
+            return Err(Error::agent(
+                "durable restore",
+                format!("checkpoint receipt repeats file path '{}'", file.path),
+            ));
+        }
+        let relative = Path::new(&file.path);
+        safe_durable_relative_path(relative)?;
+        let absolute = root.join(relative);
+        let metadata = fs::symlink_metadata(&absolute).map_err(|error| {
+            Error::agent(
+                "durable restore",
+                format!("inspect checkpoint file {}: {error}", absolute.display()),
+            )
+        })?;
+        if !metadata.file_type().is_file() || metadata.len() != file.bytes {
+            return Err(Error::agent(
+                "durable restore",
+                format!(
+                    "checkpoint file changed or is not regular: {}",
+                    absolute.display()
+                ),
+            ));
+        }
+        match &file.integrity {
+            DurableForkFileIntegrity::Blake3 { digest } => {
+                if blake3_file(&absolute)? != *digest {
+                    return Err(Error::agent(
+                        "durable restore",
+                        format!(
+                            "checkpoint control-file digest mismatch: {}",
+                            absolute.display()
+                        ),
+                    ));
+                }
+            }
+            DurableForkFileIntegrity::FileIdentity {
+                device,
+                inode,
+                modified_seconds,
+                modified_nanoseconds,
+            } => {
+                if metadata.dev() != *device
+                    || metadata.ino() != *inode
+                    || metadata.mtime() != *modified_seconds
+                    || metadata.mtime_nsec() != *modified_nanoseconds
+                {
+                    return Err(Error::agent(
+                        "durable restore",
+                        format!(
+                            "checkpoint clonefile identity changed: {}",
+                            absolute.display()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    for required in [DURABLE_FORK_CHECKPOINT_FILE, DURABLE_FORK_MANIFEST_FILE] {
+        if !seen.contains(required) {
+            return Err(Error::agent(
+                "durable restore",
+                format!("checkpoint receipt omits required file {required}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn safe_durable_relative_path(path: &Path) -> Result<String> {
+    use std::path::Component;
+
+    if path.is_absolute()
+        || path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!("unsafe checkpoint-relative path: {}", path.display()),
+        ));
+    }
+    path.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+        Error::agent(
+            "durable checkpoint",
+            format!("checkpoint-relative path is not UTF-8: {}", path.display()),
+        )
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn restore_durable_fork_disks(
+    checkpoint: &Path,
+    receipt: &DurableForkCheckpoint,
+    machine_dir: &Path,
+) -> Result<()> {
+    let disk_files = durable_fork_disk_files(receipt)?;
+    let marker = durable_restore_incomplete_marker(&receipt.source_name);
+    let marker_created =
+        ensure_durable_restore_marker(&marker, &receipt.source_config_fingerprint)?;
+    sync_directory(machine_dir)?;
+
+    let mut staged = Vec::with_capacity(disk_files.len());
+    let staging_result = (|| -> Result<()> {
+        for relative in &disk_files {
+            let filename = relative.file_name().ok_or_else(|| {
+                Error::agent("durable restore", "checkpoint disk path has no filename")
+            })?;
+            let source = checkpoint.join(relative);
+            let destination = machine_dir.join(filename);
+            let temporary = machine_dir.join(format!(
+                ".{}.durable-restore-{}",
+                filename.to_string_lossy(),
+                host_random_hex(12)
+            ));
+            clone_regular_file_apfs(&source, &temporary)?;
+            staged.push((temporary, destination));
+        }
+        Ok(())
+    })();
+    if let Err(error) = staging_result {
+        for (temporary, _) in &staged {
+            let _ = fs::remove_file(temporary);
+        }
+        if marker_created {
+            let _ = fs::remove_file(&marker);
+            let _ = sync_directory(machine_dir);
+        }
+        return Err(error);
+    }
+
+    for (temporary, destination) in &staged {
+        fs::rename(temporary, destination).map_err(|error| {
+            Error::agent(
+                "durable restore",
+                format!(
+                    "replace {} from checkpoint: {error}; machine remains blocked by {}",
+                    destination.display(),
+                    marker.display()
+                ),
+            )
+        })?;
+    }
+    sync_directory(machine_dir)?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn ensure_durable_restore_marker(marker: &Path, fingerprint: &str) -> Result<bool> {
+    match fs::symlink_metadata(marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_durable_file(marker, fingerprint.as_bytes())?;
+            Ok(true)
+        }
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let existing = fs::read_to_string(marker).map_err(|error| {
+                Error::agent(
+                    "durable restore",
+                    format!("read restore marker {}: {error}", marker.display()),
+                )
+            })?;
+            if existing == fingerprint {
+                Ok(false)
+            } else {
+                Err(Error::agent(
+                    "durable restore",
+                    format!(
+                        "restore marker {} belongs to a different checkpoint; do not mix checkpoint artifacts",
+                        marker.display()
+                    ),
+                ))
+            }
+        }
+        Ok(_) => Err(Error::agent(
+            "durable restore",
+            format!("restore marker is not a regular file: {}", marker.display()),
+        )),
+        Err(error) => Err(Error::agent(
+            "durable restore",
+            format!("inspect restore marker {}: {error}", marker.display()),
+        )),
+    }
+}
+
+fn durable_fork_disk_files(receipt: &DurableForkCheckpoint) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut storage = 0_usize;
+    let mut overlay = 0_usize;
+    for file in &receipt.files {
+        let relative = Path::new(&file.path);
+        let components = relative.components().collect::<Vec<_>>();
+        let [std::path::Component::Normal(directory), std::path::Component::Normal(filename)] =
+            components.as_slice()
+        else {
+            continue;
+        };
+        if *directory != std::ffi::OsStr::new(DURABLE_FORK_DISKS_DIR) {
+            continue;
+        }
+        let filename = filename.to_str().ok_or_else(|| {
+            Error::agent("durable restore", "checkpoint disk filename is not UTF-8")
+        })?;
+        match filename {
+            "storage.raw" | "storage.qcow2" => storage += 1,
+            "overlay.raw" | "overlay.qcow2" => overlay += 1,
+            "storage.formatted" | "overlay.formatted" => {}
+            _ => {
+                return Err(Error::agent(
+                    "durable restore",
+                    format!("unsupported checkpoint disk file {filename}"),
+                ));
+            }
+        }
+        files.push(relative.to_path_buf());
+    }
+    if storage != 1 || overlay != 1 {
+        return Err(Error::agent(
+            "durable restore",
+            "checkpoint must contain exactly one storage disk and one overlay disk",
+        ));
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Remove every retained RAM checkpoint for a golden whose VMM is confirmed
@@ -1046,6 +2145,7 @@ fn build_rejuvenation_script(clone: &str, seed: &str, record: &VmRecord) -> Stri
 /// (no `RNDADDENTROPY`/VMGENID yet) and does not re-address the network
 /// (MAC/IP; safe under the default TSI backend) — both are follow-ups.
 pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
+    let started = std::time::Instant::now();
     let sock = vm_data_dir(clone).join("agent.sock");
     let seed = host_random_hex(64);
     let script = build_rejuvenation_script(clone, &seed, record);
@@ -1053,7 +2153,14 @@ pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
     let mut last_err = String::from("unknown error");
     for attempt in 1..=REJUVENATE_ATTEMPTS {
         match rejuvenate_once(&sock, &script) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                tracing::info!(
+                    clone,
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "fork: clone identity rejuvenated"
+                );
+                return Ok(());
+            }
             Err(e) => {
                 tracing::warn!(
                     clone,
@@ -2065,5 +3172,97 @@ mod tests {
             !torn_down.get(),
             "a successful rejuvenation must not tear the clone down"
         );
+    }
+
+    fn durable_checkpoint_record() -> VmRecord {
+        let mut record = VmRecord::new("sentry-backend".to_string(), 2, 2048, vec![], vec![], true);
+        record.forkable = true;
+        record.init_completed = true;
+        record.external_network = Some(crate::network::ExternalNetworkConfig {
+            unixstream_path: PathBuf::from("/private/tmp/external-net/sentry.sock"),
+            guest_ip: std::net::Ipv4Addr::new(10, 89, 0, 2),
+            prefix_len: 24,
+            gateway: std::net::Ipv4Addr::new(10, 89, 0, 1),
+            dns_server: std::net::Ipv4Addr::new(10, 89, 0, 1),
+            guest_mac: [0x02, 0, 0, 0, 0, 2],
+            egress: false,
+        });
+        record
+    }
+
+    #[test]
+    fn durable_checkpoint_fingerprint_ignores_runtime_state_but_not_launch_config() {
+        let mut record = durable_checkpoint_record();
+        let fingerprint = durable_fork_config_fingerprint(&record).unwrap();
+        record.state = RecordState::Running;
+        record.pid = Some(1234);
+        record.pid_start_time = Some(5678);
+        record.last_exit_code = Some(99);
+        assert_eq!(
+            durable_fork_config_fingerprint(&record).unwrap(),
+            fingerprint
+        );
+
+        record.mem += 1;
+        assert_ne!(
+            durable_fork_config_fingerprint(&record).unwrap(),
+            fingerprint
+        );
+    }
+
+    #[test]
+    fn durable_checkpoint_rejects_mutable_host_attachments() {
+        let mut record = durable_checkpoint_record();
+        validate_durable_fork_record(&record).unwrap();
+        record
+            .mounts
+            .push(("/host".to_string(), "/guest".to_string(), false));
+        let error = validate_durable_fork_record(&record).unwrap_err();
+        assert!(error.to_string().contains("host mounts"));
+    }
+
+    #[test]
+    fn durable_checkpoint_rejects_relative_and_traversal_receipt_paths() {
+        assert!(safe_durable_relative_path(Path::new("ram/0000.ram")).is_ok());
+        assert!(safe_durable_relative_path(Path::new("../manifest.bin")).is_err());
+        assert!(safe_durable_relative_path(Path::new("/tmp/manifest.bin")).is_err());
+    }
+
+    #[test]
+    fn durable_receipt_hashes_only_small_control_files() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "smolvm-durable-receipt-{}-{serial}",
+            std::process::id()
+        ));
+        let result = (|| -> Result<()> {
+            fs::create_dir(&root).map_err(|error| Error::agent("test", error.to_string()))?;
+            fs::create_dir(root.join(DURABLE_FORK_RAM_DIR))
+                .map_err(|error| Error::agent("test", error.to_string()))?;
+            fs::write(root.join(DURABLE_FORK_CHECKPOINT_FILE), b"small control")
+                .map_err(|error| Error::agent("test", error.to_string()))?;
+            fs::write(
+                root.join(DURABLE_FORK_RAM_DIR).join("0000.ram"),
+                b"ram clone",
+            )
+            .map_err(|error| Error::agent("test", error.to_string()))?;
+
+            let control = durable_fork_file(&root, Path::new(DURABLE_FORK_CHECKPOINT_FILE))?;
+            assert!(matches!(
+                control.integrity,
+                DurableForkFileIntegrity::Blake3 { .. }
+            ));
+            let ram = durable_fork_file(&root, Path::new("ram/0000.ram"))?;
+            assert!(matches!(
+                ram.integrity,
+                DurableForkFileIntegrity::FileIdentity { .. }
+            ));
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(root);
+        result.unwrap();
     }
 }
