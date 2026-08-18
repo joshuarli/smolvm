@@ -2399,10 +2399,6 @@ impl AgentClient {
     /// On macOS, vsock sockets can spuriously return WouldBlock even in
     /// blocking mode, so we must handle it without corrupting the stream.
     ///
-    /// If `propagate_initial_wouldblock` is true and WouldBlock occurs before
-    /// any bytes are read, the error is propagated (preserves read timeout
-    /// behavior). Once any bytes are consumed, EAGAIN is retried.
-    ///
     /// # Stall protection
     ///
     /// When the socket has a read timeout configured, the retry loop is bounded
@@ -2417,11 +2413,7 @@ impl AgentClient {
     /// When no read timeout is configured (interactive sessions), WouldBlock is
     /// treated as the spurious macOS vsock EAGAIN it is meant to be, and the loop
     /// retries indefinitely as before — there is no deadline to enforce.
-    fn read_exact_retry(
-        &mut self,
-        buf: &mut [u8],
-        propagate_initial_wouldblock: bool,
-    ) -> std::io::Result<()> {
+    fn read_exact_retry(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         // Idle window: how long we tolerate zero progress before declaring a
         // stall. Derived from the socket's configured read timeout so it tracks
         // the caller's intent; `None` means blocking mode (no deadline).
@@ -2445,18 +2437,18 @@ impl AgentClient {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if pos == 0 && propagate_initial_wouldblock {
-                        // No data consumed yet and caller wants timeout errors — propagate
-                        return Err(e);
-                    }
-                    // Mid-read (or caller wants full retry). Retry, but bail out
-                    // if the idle deadline has passed so a stalled mid-frame body
-                    // can't busy-spin forever.
+                    // macOS/HVF vsock can return EAGAIN before it has produced
+                    // *any* response bytes, even while the socket is configured
+                    // as blocking. Do not mistake that transport quirk for the
+                    // socket deadline: retry it, while enforcing the same idle
+                    // deadline for an empty response and a partial frame alike.
+                    // That preserves a bounded wait for an unresponsive guest
+                    // without tearing down a slow-but-progressing image start.
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::TimedOut,
-                                "timed out reading frame body: peer stalled mid-frame",
+                                "timed out waiting for agent response progress",
                             ));
                         }
                     }
@@ -2472,13 +2464,8 @@ impl AgentClient {
 
     /// Low-level receive a single response.
     fn receive(&mut self) -> Result<AgentResponse> {
-        // Check if a read timeout is set — if so, WouldBlock before any data
-        // means a real timeout and should be propagated. If no timeout (interactive
-        // sessions), WouldBlock is always a spurious macOS vsock EAGAIN.
-        let has_timeout = self.stream.read_timeout().ok().flatten().is_some();
-
         let mut header = [0u8; 4];
-        self.read_exact_retry(&mut header, has_timeout)?;
+        self.read_exact_retry(&mut header)?;
         let len = u32::from_be_bytes(header) as usize;
 
         // Validate frame size to prevent OOM from malicious/buggy responses
@@ -2497,9 +2484,9 @@ impl AgentClient {
         }
 
         let mut buf = vec![0u8; len];
-        // Always retry body reads — header is already consumed so we can't
-        // propagate an error without corrupting the stream.
-        if let Err(e) = self.read_exact_retry(&mut buf, false) {
+        // The header is already consumed, so preserve frame alignment by
+        // retrying every transient EAGAIN while retaining the idle deadline.
+        if let Err(e) = self.read_exact_retry(&mut buf) {
             // Body read failed — stream is desynchronized. Shut down the
             // read half so future reads fail cleanly.
             let _ = self.stream.shutdown(std::net::Shutdown::Read);
@@ -3439,8 +3426,8 @@ mod stalled_body_tests {
 
     #[test]
     fn read_exact_retry_bounds_stalled_read_without_eof() {
-        // Drive read_exact_retry directly: header-style non-propagating read of a
-        // buffer larger than what the peer sends, with the peer stalling.
+        // Drive read_exact_retry directly with a buffer larger than what the
+        // peer sends, then keep the peer open to simulate a stalled frame.
         let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
         client_stream
             .set_read_timeout(Some(Duration::from_millis(100)))
@@ -3460,7 +3447,7 @@ mod stalled_body_tests {
         // retry path (the same path receive() uses for the body).
         let mut buf = [0u8; 8];
         let err = client
-            .read_exact_retry(&mut buf, false)
+            .read_exact_retry(&mut buf)
             .expect_err("stalled read must return a bounded error");
         let elapsed = start.elapsed();
 
@@ -3474,6 +3461,41 @@ mod stalled_body_tests {
             "read_exact_retry must not busy-spin until EOF (got {elapsed:?})"
         );
 
+        server.join().expect("server thread joined");
+    }
+
+    #[test]
+    fn receive_retries_initial_would_block_until_response_arrives() {
+        // libkrun's macOS/HVF vsock bridge can report EAGAIN before the first
+        // byte of a valid response. A configured timeout must remain an idle
+        // deadline, rather than turning that transient condition into an
+        // immediate failed workload start.
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("set client read timeout");
+        client_stream
+            .as_socket()
+            .set_nonblocking(true)
+            .expect("force initial WouldBlock");
+
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            let response = AgentResponse::Completed {
+                exit_code: 0,
+                stdout: b"container-123".to_vec(),
+                stderr: Vec::new(),
+            };
+            server_stream
+                .write_all(&encode_message(&response).expect("encode response"))
+                .expect("write delayed response");
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        assert!(matches!(
+            client.receive().expect("retry initial WouldBlock"),
+            AgentResponse::Completed { exit_code: 0, .. }
+        ));
         server.join().expect("server thread joined");
     }
 }
