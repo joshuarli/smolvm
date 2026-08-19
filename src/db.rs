@@ -426,7 +426,15 @@ impl SmolvmDb {
         let stale_before = now.saturating_sub(CREATE_RESERVATION_TTL_SECS);
 
         self.with_conn(|conn| {
-            let tx = conn.transaction().db_err("begin create reservation")?;
+            // A reservation reads the prior owner before it writes. With a
+            // deferred WAL transaction, two CLI processes can both read, one
+            // commit, and the other then fail its write upgrade with
+            // SQLITE_BUSY_SNAPSHOT without consulting busy_timeout. Reserve
+            // the single writer before reading so independent creates wait in
+            // order instead of losing a valid distinct-name request.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin create reservation")?;
 
             if let Some((existing_pid, created_at)) = tx
                 .query_row(
@@ -488,7 +496,11 @@ impl SmolvmDb {
     ) -> Result<bool> {
         let json = serde_json::to_vec(record).db_err("serialize vm record")?;
         self.with_conn(|conn| {
-            let tx = conn.transaction().db_err("begin reserved vm commit")?;
+            // See reserve_vm_create: this validates ownership before writing,
+            // so it must also reserve the WAL writer before its read.
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin reserved vm commit")?;
 
             let owns_reservation: bool = tx
                 .query_row(
@@ -2359,6 +2371,34 @@ mod tests {
             db.reserve_vm_create("contested", &second).unwrap(),
             "released reservation should make the name available"
         );
+    }
+
+    #[test]
+    fn independent_writers_reserve_distinct_names_without_busy_snapshots() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        // Initialize WAL/schema before the simultaneous writers begin. Each
+        // worker still owns a separate connection, matching concurrent CLI
+        // processes rather than the in-process writer mutex.
+        SmolvmDb::open_at(&path).unwrap();
+        let writers = 12;
+        let start = std::sync::Arc::new(std::sync::Barrier::new(writers));
+        let handles: Vec<_> = (0..writers)
+            .map(|index| {
+                let path = path.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let db = SmolvmDb::open_at(&path).unwrap();
+                    let token = SmolvmDb::create_reservation_token();
+                    start.wait();
+                    db.reserve_vm_create(&format!("concurrent-{index}"), &token)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert!(handle.join().unwrap().unwrap());
+        }
     }
 
     #[test]
