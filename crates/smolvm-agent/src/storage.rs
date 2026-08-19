@@ -17,7 +17,7 @@ use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
 };
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -855,16 +855,17 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
 // Local image archives (`docker save` / `podman save`)
 // =============================================================================
 //
-// smolvm delegates turning a saved-image archive into a rootfs to the bundled
-// `crane` (and `gunzip`/`tar`) rather than parsing OCI layers itself. The host
-// stages `archive.tar` into a content-addressed dir mounted via virtiofs as the
-// packed-layers dir; here we flatten it once into a rootfs on the writable
-// storage disk, recover the image config, and present it as a single packed
-// layer that the existing overlay path consumes.
+// The host stages `archive.tar` into a content-addressed dir mounted via
+// virtiofs as the packed-layers dir. Most saved images expose `manifest.json`,
+// so the agent can stream each OCI layer directly into its own lowerdir. That
+// avoids `crane export` creating a second, flattened tar only for `tar` to
+// immediately unpack it again. Archives outside that conventional layout keep
+// the established `crane export` fallback below.
 
 /// Filename the host stages the saved-image archive under.
 const ARCHIVE_FILE_NAME: &str = "archive.tar";
-/// Subdir the flattened rootfs is written to (a single packed "layer").
+/// Subdir the `crane export` fallback writes its flattened rootfs to (a single
+/// packed "layer").
 const ARCHIVE_ROOTFS_DIR: &str = "0000_rootfs";
 /// Recovered image config (`crane config` output) beside the rootfs.
 const ARCHIVE_CONFIG_FILE: &str = "config.json";
@@ -904,9 +905,11 @@ fn archive_scratch_dir() -> PathBuf {
 }
 
 /// If `packed_dir` is a staged local image archive (it contains `archive.tar`),
-/// flatten it once into a rootfs on the storage disk and return that directory
-/// (holding `0000_rootfs/` + `config.json`). Returns `None` for an ordinary
-/// packed-layers dir (a `.smolmachine`'s pre-extracted layers).
+/// materialize its OCI layers once on the storage disk and return that
+/// directory. Conventional `docker save` / `podman save` archives keep their
+/// layers separate; uncommon layouts fall back to a flattened `0000_rootfs/`.
+/// Returns `None` for an ordinary packed-layers dir (a `.smolmachine`'s
+/// pre-extracted layers).
 ///
 /// The output is keyed by the virtiofs mount-point name (constant per VM, since
 /// `/storage` is per-machine), and the completion marker stores the archive's
@@ -938,18 +941,211 @@ where
 
     // First flatten, or the archive changed under a reused disk: rebuild.
     let _ = std::fs::remove_dir_all(&out_base);
-    let rootfs = out_base.join(ARCHIVE_ROOTFS_DIR);
-    std::fs::create_dir_all(&rootfs)?;
-    info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
-    progress("flattening local image archive", 0);
-    flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
-    // Recover the image config before writing the marker, so a later reuse can
-    // rely on config.json being present. A docker/podman `save` always carries
-    // one.
-    progress("recovering image configuration", 0);
-    recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
+    if !import_local_archive_layers_with_progress(&archive, &out_base, &mut progress)? {
+        let rootfs = out_base.join(ARCHIVE_ROOTFS_DIR);
+        std::fs::create_dir_all(&rootfs)?;
+        info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
+        progress("flattening local image archive", 0);
+        flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
+        // Recover the image config before writing the marker, so a later reuse
+        // can rely on config.json being present. A docker/podman `save` always
+        // carries one.
+        progress("recovering image configuration", 0);
+        recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
+    }
     std::fs::write(&marker, signature)?;
     Ok(Some(out_base))
+}
+
+/// The one-image `manifest.json` layout emitted by `docker save` and
+/// `podman save`. Its members name the config blob and each compressed OCI
+/// layer inside the outer archive.
+struct LocalArchiveManifest {
+    config_path: String,
+    layer_paths: Vec<String>,
+}
+
+fn validate_archive_member_path(value: &str, field: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.components().any(|component| {
+            !matches!(component, std::path::Component::Normal(_))
+        })
+    {
+        return Err(StorageError::new(format!(
+            "archive manifest has unsafe {field} path '{value}'"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_local_archive_manifest(bytes: &[u8]) -> Result<Option<LocalArchiveManifest>> {
+    let manifest: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| StorageError::new(format!("parse archive manifest.json: {e}")))?;
+    let Some(entries) = manifest.as_array() else {
+        return Ok(None);
+    };
+    // `crane export - -` is the compatibility path for multi-image archives:
+    // without an explicit image selector there is no unambiguous layer set to
+    // materialize here.
+    if entries.len() != 1 {
+        return Ok(None);
+    }
+    let entry = &entries[0];
+    let config_path = entry["Config"]
+        .as_str()
+        .ok_or_else(|| StorageError::new("archive manifest.json has no Config entry"))?
+        .to_string();
+    validate_archive_member_path(&config_path, "Config")?;
+    let layers = entry["Layers"]
+        .as_array()
+        .ok_or_else(|| StorageError::new("archive manifest.json has no Layers array"))?;
+    if layers.is_empty() {
+        return Err(StorageError::new(
+            "archive manifest.json has an empty Layers array".to_string(),
+        ));
+    }
+    let mut layer_paths = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let layer = layer
+            .as_str()
+            .ok_or_else(|| StorageError::new("archive manifest Layers must contain strings"))?;
+        validate_archive_member_path(layer, "Layers")?;
+        layer_paths.push(layer.to_string());
+    }
+    if layer_paths.iter().any(|layer| layer == &config_path) {
+        return Err(StorageError::new(
+            "archive manifest uses the config member as an OCI layer".to_string(),
+        ));
+    }
+    Ok(Some(LocalArchiveManifest {
+        config_path,
+        layer_paths,
+    }))
+}
+
+fn local_archive_manifest_from_file(file: &mut std::fs::File) -> Result<Option<LocalArchiveManifest>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut archive = tar::Archive::new(file);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        if entry.path()? == Path::new("manifest.json") {
+            let mut manifest = Vec::new();
+            entry.read_to_end(&mut manifest)?;
+            return parse_local_archive_manifest(&manifest);
+        }
+    }
+    // An OCI-layout archive may only carry index.json. Let `crane export` keep
+    // handling that format until it has an explicit source-image selection.
+    Ok(None)
+}
+
+/// Materialize a conventional local archive into overlay-ready OCI lowerdirs.
+///
+/// Returns `false` without writing `output` when the archive has no single
+/// `manifest.json` image. The caller then uses the compatibility flattening
+/// path. A malformed manifest or a missing named member is an input error, not
+/// a reason to silently substitute a different image interpretation.
+fn import_local_archive_layers_with_progress<F>(
+    archive_path: &Path,
+    output: &Path,
+    progress: &mut F,
+) -> Result<bool>
+where
+    F: FnMut(&str, u64),
+{
+    let (mut input, _temporary_input) = prepare_archive_input_with_progress(archive_path, progress)?;
+    let Some(manifest) = local_archive_manifest_from_file(&mut input)? else {
+        return Ok(false);
+    };
+
+    let mut member_indices: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, member) in manifest.layer_paths.iter().enumerate() {
+        member_indices.entry(member.clone()).or_default().push(index);
+    }
+    let layer_names: Vec<String> = (0..manifest.layer_paths.len())
+        .map(|index| format!("{index:04}"))
+        .collect();
+    let mut found_layers = vec![false; layer_names.len()];
+    let mut found_config = false;
+
+    std::fs::create_dir_all(output)?;
+    input.seek(SeekFrom::Start(0))?;
+    let mut archive = tar::Archive::new(&mut input);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if path == Path::new(&manifest.config_path) {
+            if found_config {
+                return Err(StorageError::new(
+                    "archive contains duplicate config members".to_string(),
+                ));
+            }
+            let mut config = std::fs::File::create(output.join(ARCHIVE_CONFIG_FILE))?;
+            std::io::copy(&mut entry, &mut config)?;
+            found_config = true;
+            continue;
+        }
+        let Some(indices) = member_indices.get(path.to_string_lossy().as_ref()) else {
+            continue;
+        };
+
+        // A regular archive has one member per layer. Preserve the unusual but
+        // valid repeated-layer case by buffering that one member only when the
+        // manifest intentionally refers to it more than once.
+        if indices.len() == 1 {
+            let index = indices[0];
+            if found_layers[index] {
+                return Err(StorageError::new(
+                    "archive contains duplicate layer members".to_string(),
+                ));
+            }
+            let layer_dir = output.join(&layer_names[index]);
+            std::fs::create_dir_all(&layer_dir)?;
+            progress("extracting local image layers", index as u64);
+            extract_oci_layer(&mut entry, &layer_dir).map_err(|e| {
+                StorageError::new(format!(
+                    "extract local archive layer {}: {e}",
+                    manifest.layer_paths[index]
+                ))
+            })?;
+            found_layers[index] = true;
+        } else {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            for &index in indices {
+                let layer_dir = output.join(&layer_names[index]);
+                std::fs::create_dir_all(&layer_dir)?;
+                progress("extracting local image layers", index as u64);
+                extract_oci_layer(&bytes[..], &layer_dir).map_err(|e| {
+                    StorageError::new(format!(
+                        "extract local archive layer {}: {e}",
+                        manifest.layer_paths[index]
+                    ))
+                })?;
+                found_layers[index] = true;
+            }
+        }
+    }
+
+    if !found_config {
+        return Err(StorageError::new(format!(
+            "archive is missing config member '{}'",
+            manifest.config_path
+        )));
+    }
+    if let Some((index, _)) = found_layers.iter().enumerate().find(|(_, found)| !**found) {
+        return Err(StorageError::new(format!(
+            "archive is missing layer member '{}'",
+            manifest.layer_paths[index]
+        )));
+    }
+    std::fs::write(
+        output.join(LAYER_ORDER_FILE),
+        layer_names.join("\n") + "\n",
+    )?;
+    Ok(true)
 }
 
 /// A cheap content signature for a staged archive (size + mtime), used to
@@ -4773,6 +4969,81 @@ mod tests {
         assert!(
             reports.iter().any(|(_, bytes)| *bytes >= 16 * 1024 * 1024),
             "large archive inputs must report before completion"
+        );
+    }
+
+    #[test]
+    fn local_archive_import_keeps_oci_layers_and_config_without_crane_export() {
+        fn layer(path: &str, contents: &[u8]) -> Vec<u8> {
+            let uid = unsafe { libc::getuid() } as u64;
+            let gid = unsafe { libc::getgid() } as u64;
+            let mut bytes = Vec::new();
+            let mut builder = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_uid(uid);
+            header.set_gid(gid);
+            header.set_cksum();
+            builder.append(&header, contents).unwrap();
+            builder.finish().unwrap();
+            drop(builder);
+            bytes
+        }
+
+        fn append_file(builder: &mut tar::Builder<std::fs::File>, path: &str, contents: &[u8]) {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, contents).unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("image.tar");
+        let base_layer = layer("etc/base", b"base");
+        let app_layer = layer("usr/bin/app", b"app");
+        let manifest = br#"[{"Config":"config.json","Layers":["layers/base.tar","layers/app.tar"]}]"#;
+        let config = br#"{"config":{"Entrypoint":["/usr/bin/app"],"Cmd":["serve"]}}"#;
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut builder = tar::Builder::new(file);
+            append_file(&mut builder, "manifest.json", manifest);
+            append_file(&mut builder, "config.json", config);
+            append_file(&mut builder, "layers/base.tar", &base_layer);
+            append_file(&mut builder, "layers/app.tar", &app_layer);
+            builder.finish().unwrap();
+        }
+
+        let imported = dir.path().join("imported");
+        let mut progress = Vec::new();
+        assert!(
+            import_local_archive_layers_with_progress(&archive_path, &imported, &mut |phase, _| {
+                progress.push(phase.to_string())
+            })
+            .unwrap()
+        );
+
+        assert_eq!(std::fs::read(imported.join(ARCHIVE_CONFIG_FILE)).unwrap(), config);
+        assert_eq!(
+            std::fs::read_to_string(imported.join(LAYER_ORDER_FILE)).unwrap(),
+            "0000\n0001\n"
+        );
+        assert_eq!(
+            std::fs::read(imported.join("0000/etc/base")).unwrap(),
+            b"base"
+        );
+        assert_eq!(
+            std::fs::read(imported.join("0001/usr/bin/app")).unwrap(),
+            b"app"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|phase| phase == "extracting local image layers"),
+            "layer import reports its materialization phase"
         );
     }
 
