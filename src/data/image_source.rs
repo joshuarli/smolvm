@@ -328,6 +328,15 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
     if meta.len() > max_archive_bytes() {
         return Err(too_large(meta.len()));
     }
+    // A persisted local image reference resolves to this exact cache layout on
+    // every later start. Letting a caller re-enter the canonical cache path
+    // avoid reading the whole archive merely to rediscover the digest already
+    // encoded in its parent directory. This is deliberately limited to the
+    // cache's own canonical `/<blake3>/archive.tar` layout: arbitrary archive
+    // paths still receive a full content hash before they enter the cache.
+    if let Some(hash) = cached_archive_hash(&archive_source, cache_base)? {
+        return Ok(hash);
+    }
     let hash = hash_file(&archive_source)?;
     let archive_path = cache_base.join(&hash).join(ARCHIVE_FILE);
     if !archive_path.exists() {
@@ -335,6 +344,45 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
         link_or_copy(&archive_source, &archive_path)?;
     }
     Ok(hash)
+}
+
+/// Return the content address encoded by one canonical archive-cache path.
+///
+/// The cache is a trusted local acceleration store. Existing persisted
+/// `local:<hash>` machine records already re-enter it without re-hashing on
+/// `machine start`; this recognizes the same layout when a Smolfile or CLI
+/// supplies the cache file again to `machine create`.
+fn cached_archive_hash(path: &Path, cache_base: &Path) -> Result<Option<String>> {
+    let canonical_base = cache_base.canonicalize().map_err(|e| {
+        Error::storage(
+            "resolve image archive cache",
+            format!("cannot resolve {}: {e}", cache_base.display()),
+        )
+    })?;
+    let Ok(relative) = path.strip_prefix(&canonical_base) else {
+        return Ok(None);
+    };
+    let mut components = relative.components();
+    let Some(std::path::Component::Normal(hash)) = components.next() else {
+        return Ok(None);
+    };
+    let Some(std::path::Component::Normal(filename)) = components.next() else {
+        return Ok(None);
+    };
+    if components.next().is_some() || filename != std::ffi::OsStr::new(ARCHIVE_FILE) {
+        return Ok(None);
+    }
+    let Some(hash) = hash.to_str() else {
+        return Ok(None);
+    };
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(None);
+    }
+    Ok(Some(hash.to_string()))
 }
 
 /// Stream stdin to a temp file (hashing as we go), then place it at
@@ -554,6 +602,41 @@ mod tests {
         assert_eq!(inspected.blake3_digest, None);
         assert!(inspected.path.is_absolute());
         assert_eq!(std::fs::read(rootfs.join("marker")).unwrap(), b"rootfs");
+    }
+
+    #[test]
+    fn canonical_archive_cache_path_reenters_without_rehashing() {
+        let cache = tempfile::tempdir().unwrap();
+        let address = "a".repeat(64);
+        let archive_dir = cache.path().join(&address);
+        std::fs::create_dir(&archive_dir).unwrap();
+        let archive = archive_dir.join(ARCHIVE_FILE);
+        // The intentionally non-matching content proves this path returns the
+        // address encoded by the cache layout rather than calculating a fresh
+        // digest. Normal source files never take this fast path.
+        std::fs::write(&archive, b"cache re-entry does not rehash").unwrap();
+
+        assert_eq!(
+            stage_from_file(&archive, cache.path()).unwrap(),
+            address,
+        );
+    }
+
+    #[test]
+    fn cache_reentry_requires_the_exact_content_addressed_layout() {
+        let cache = tempfile::tempdir().unwrap();
+        let address = "a".repeat(64);
+        let archive_dir = cache.path().join(&address);
+        std::fs::create_dir(&archive_dir).unwrap();
+        let archive = archive_dir.join("other.tar");
+        std::fs::write(&archive, b"not a cache archive").unwrap();
+
+        assert_eq!(cached_archive_hash(&archive, cache.path()).unwrap(), None);
+        assert_eq!(
+            cached_archive_hash(&cache.path().join("not-a-digest").join(ARCHIVE_FILE), cache.path())
+                .unwrap(),
+            None,
+        );
     }
 
     #[test]
