@@ -24,6 +24,8 @@
 //! LIBKRUN_BUNDLE=$PWD/lib cargo build --release
 //! ```
 //! The binary will use @rpath to find libraries in ./lib or ../lib.
+//! A prepared `lib/` directory in a source checkout is discovered
+//! automatically on macOS.
 //!
 //! ## Build from Submodule (Experimental)
 //! Build libkrun from the vendored submodule:
@@ -62,6 +64,25 @@ fn has_library(name: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn has_bundled_libkrun(path: &std::path::Path) -> bool {
     path.join("libkrun.dylib").exists()
+}
+
+#[cfg(target_os = "macos")]
+fn link_bundled_libkrun(bundle_path: &std::path::Path) {
+    println!("cargo:rustc-link-search=native={}", bundle_path.display());
+    link_krun();
+    println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/lib");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../lib");
+
+    // The libkrun build uses a versioned install name. Make a copied bundle
+    // relocatable so the rpaths above can satisfy the weak link at runtime.
+    let lib_path = bundle_path.join("libkrun.dylib");
+    let _ = Command::new("install_name_tool")
+        .args(["-id", "@rpath/libkrun.dylib", lib_path.to_str().unwrap()])
+        .status();
+    // macOS invalidates the signature after changing the install name.
+    let _ = Command::new("codesign")
+        .args(["--force", "--sign", "-", lib_path.to_str().unwrap()])
+        .status();
 }
 
 fn main() {
@@ -146,29 +167,14 @@ fn link_libkrun() {
             }
         }
 
-        println!("cargo:rustc-link-search=native={}", bundle_path);
-        link_krun();
-
-        // Set rpath to find libraries relative to executable
         #[cfg(target_os = "macos")]
         {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/lib");
-            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../lib");
-
-            // Change the library's install_name to use @rpath and re-sign
-            let lib_path = std::path::Path::new(&bundle_path).join("libkrun.dylib");
-            if lib_path.exists() {
-                let _ = Command::new("install_name_tool")
-                    .args(["-id", "@rpath/libkrun.dylib", lib_path.to_str().unwrap()])
-                    .status();
-                // Re-sign after modification (macOS requires valid signature)
-                let _ = Command::new("codesign")
-                    .args(["--force", "--sign", "-", lib_path.to_str().unwrap()])
-                    .status();
-            }
+            link_bundled_libkrun(std::path::Path::new(&bundle_path));
         }
         #[cfg(target_os = "linux")]
         {
+            println!("cargo:rustc-link-search=native={}", bundle_path);
+            link_krun();
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
         }
@@ -215,7 +221,24 @@ fn link_libkrun() {
         return;
     }
 
-    // Option 4: Bundled libraries in lib/linux-{arch}/ (for distribution builds)
+    // Option 4: A prepared source-checkout bundle. `make setup` writes the
+    // macOS library here, so a plain Cargo build has the same discovery as a
+    // distribution build without requiring an environment variable.
+    #[cfg(target_os = "macos")]
+    {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let lib_dir = std::path::Path::new(&manifest_dir).join("lib");
+        if has_bundled_libkrun(&lib_dir) {
+            println!(
+                "cargo:warning=Using bundled macOS libraries from {}",
+                lib_dir.display()
+            );
+            link_bundled_libkrun(&lib_dir);
+            return;
+        }
+    }
+
+    // Option 5: Bundled libraries in lib/linux-{arch}/ (for distribution builds)
     #[cfg(target_os = "linux")]
     {
         let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -242,7 +265,7 @@ fn link_libkrun() {
         }
     }
 
-    // Option 5: System installation via pkg-config
+    // Option 6: System installation via pkg-config
     if pkg_config::Config::new()
         .atleast_version("1.0")
         .probe("libkrun")
@@ -251,7 +274,7 @@ fn link_libkrun() {
         return;
     }
 
-    // Option 6: Common installation paths
+    // Option 7: Common installation paths
     #[cfg(target_os = "macos")]
     {
         let paths = [
