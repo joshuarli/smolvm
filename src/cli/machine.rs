@@ -2633,6 +2633,28 @@ mod tests {
             restore.checkpoint,
             PathBuf::from("/private/tmp/checkpoints/w1")
         );
+        assert!(!restore.forkable);
+        assert_eq!(restore.net_unixstream, None);
+
+        let rehydratable_restore = TestMachineCli::parse_from([
+            "machine",
+            "restore",
+            "--name",
+            "sentry-backend",
+            "--checkpoint",
+            "/private/tmp/checkpoints/w1",
+            "--forkable",
+            "--net-unixstream",
+            "/private/tmp/switch/runner.sock",
+        ]);
+        let MachineCmd::Restore(rehydratable_restore) = rehydratable_restore.command else {
+            panic!("expected machine restore command");
+        };
+        assert!(rehydratable_restore.forkable);
+        assert_eq!(
+            rehydratable_restore.net_unixstream,
+            Some(PathBuf::from("/private/tmp/switch/runner.sock"))
+        );
 
         assert!(TestMachineCli::try_parse_from([
             "machine",
@@ -4002,11 +4024,27 @@ pub struct RestoreCmd {
     /// Absolute checkpoint directory produced by `machine checkpoint`.
     #[arg(long, value_name = "DIR")]
     pub checkpoint: PathBuf,
+
+    /// Rehydrate restored memory as a new forkable base so a later checkpoint
+    /// can capture this continuation without retaining its predecessor.
+    #[arg(long)]
+    pub forkable: bool,
+
+    /// Fresh absolute Unix-stream endpoint for an existing external virtio-net
+    /// attachment. A durable restore keeps the guest network identity but
+    /// must connect it to the newly created local switch listener.
+    #[arg(long, value_name = "PATH")]
+    pub net_unixstream: Option<PathBuf>,
 }
 
 impl RestoreCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        vm_common::restore_vm_named_from_checkpoint(&self.name, &self.checkpoint)
+        vm_common::restore_vm_named_from_checkpoint(
+            &self.name,
+            &self.checkpoint,
+            self.forkable,
+            self.net_unixstream.as_deref(),
+        )
     }
 }
 

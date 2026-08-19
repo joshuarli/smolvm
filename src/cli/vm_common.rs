@@ -755,10 +755,9 @@ pub(crate) fn print_create_success(params: &CreateVmParams) {
 pub struct ForkLaunch {
     /// Start as a fork base: memfd-back guest RAM and expose `control_socket`.
     pub forkable: bool,
-    /// Ignore the record's ordinary fork-base default. A durable restore uses a
-    /// snapshot produced by a forkable source, but its fresh VMM must restore
-    /// that source's state rather than allocate another fork-base RAM/control
-    /// configuration around it.
+    /// Ignore the record's ordinary fork-base default. A durable restore must
+    /// explicitly select an ordinary leaf or a rehydrated forkable base; it
+    /// must not inherit that choice from a mutable machine record.
     pub suppress_record_forkable: bool,
     /// Boot as a fork clone, restoring from the golden's snapshot at this dir.
     pub snapshot_dir: Option<std::path::PathBuf>,
@@ -942,15 +941,25 @@ pub fn checkpoint_vm_named(name: &str, output: &Path) -> smolvm::Result<()> {
     Ok(())
 }
 
-/// Restore a checkpointed machine under its original identity.
+/// Restore a checkpointed machine under its original identity. A forkable
+/// restore copies the sealed checkpoint image into fresh file-backed guest RAM
+/// before it starts, so the continuation can itself be checkpointed.
 ///
 /// Disk files are validated and staged before launch. The snapshot launch uses
 /// new vsock and external-NIC host handles, while the stable guest MAC/IP come
 /// from the unchanged machine record. Ordinary cold start stays blocked until
 /// this snapshot-backed boot completes.
-pub fn restore_vm_named_from_checkpoint(name: &str, checkpoint: &Path) -> smolvm::Result<()> {
-    let receipt = smolvm::agent::fork::restore_durable_fork_files(name, checkpoint)?;
+pub fn restore_vm_named_from_checkpoint(
+    name: &str,
+    checkpoint: &Path,
+    forkable: bool,
+    net_unixstream: Option<&Path>,
+) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
+    if let Some(net_unixstream) = net_unixstream {
+        rebind_restore_external_network(&db, name, net_unixstream)?;
+    }
+    let receipt = smolvm::agent::fork::restore_durable_fork_files(name, checkpoint)?;
     start_vm_named_with_db(
         &db,
         name,
@@ -958,6 +967,7 @@ pub fn restore_vm_named_from_checkpoint(name: &str, checkpoint: &Path) -> smolvm
         None,
         true,
         ForkLaunch {
+            forkable,
             snapshot_dir: Some(smolvm::agent::fork::durable_fork_snapshot_dir(checkpoint)),
             suppress_record_forkable: true,
             ..Default::default()
@@ -970,6 +980,39 @@ pub fn restore_vm_named_from_checkpoint(name: &str, checkpoint: &Path) -> smolvm
         receipt.files.len()
     );
     Ok(())
+}
+
+/// Rebind exactly the transient host endpoint of a durable external network.
+/// The stored guest address, MAC, gateway, and DNS remain the checkpoint's
+/// stable world identity. The listener need not exist yet: Smolworld creates
+/// it concurrently with the restore barrier immediately before VM launch.
+fn rebind_restore_external_network(
+    db: &SmolvmDb,
+    name: &str,
+    net_unixstream: &Path,
+) -> smolvm::Result<()> {
+    if !net_unixstream.is_absolute() {
+        return Err(smolvm::Error::config(
+            "--net-unixstream",
+            "external virtio-net Unix-stream path must be absolute",
+        ));
+    }
+    let endpoint = net_unixstream.to_owned();
+    let updated = db.update_vm(name, |record| {
+        if let Some(external_network) = record.external_network.as_mut() {
+            external_network.unixstream_path = endpoint.clone();
+        }
+    })?;
+    let record = updated.ok_or_else(|| smolvm::Error::vm_not_found(name))?;
+    let Some(external_network) = record.external_network else {
+        return Err(smolvm::Error::config(
+            "--net-unixstream",
+            format!("machine '{name}' has no external virtio-net attachment"),
+        ));
+    };
+    external_network
+        .validate()
+        .map_err(|error| smolvm::Error::config("--net-unixstream", error))
 }
 
 /// Fork several indexed clones from one snapshot and boot them with bounded

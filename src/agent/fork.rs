@@ -37,9 +37,11 @@ pub struct DurableForkCheckpoint {
     /// Machine name whose state was captured. Restore is same-lineage only in
     /// this first vertical slice, so it must match the target machine exactly.
     pub source_name: String,
-    /// Fingerprint of the source's non-runtime configuration. It prevents a
-    /// stale checkpoint from being restored with changed CPU, device, network,
-    /// image, or mount settings.
+    /// Fingerprint of the source's stable launch configuration. It prevents a
+    /// stale checkpoint from being restored with changed CPU, device, guest
+    /// network identity, image, or mount settings. The external Unix-stream
+    /// listener pathname is deliberately excluded because restore creates a
+    /// new host endpoint for the same guest NIC.
     pub source_config_fingerprint: String,
     /// Receipt of the original machine record for inspection and future world
     /// composition. Secret references are identifiers, never secret plaintext.
@@ -89,8 +91,8 @@ pub enum DurableForkFileIntegrity {
     },
 }
 
-const DURABLE_FORK_SCHEMA_VERSION: u32 = 2;
-const DURABLE_FORK_MATERIALIZER_ABI: &str = "smolvm-durable-fork-macos-v2";
+const DURABLE_FORK_SCHEMA_VERSION: u32 = 3;
+const DURABLE_FORK_MATERIALIZER_ABI: &str = "smolvm-durable-fork-macos-v3";
 const DURABLE_FORK_RECEIPT_NAME: &str = "smolvm-checkpoint.json";
 const DURABLE_FORK_CHECKPOINT_FILE: &str = "checkpoint.bin";
 const DURABLE_FORK_MANIFEST_FILE: &str = "manifest.bin";
@@ -617,6 +619,12 @@ fn durable_fork_config_fingerprint(record: &VmRecord) -> Result<String> {
     stable.pid = None;
     stable.pid_start_time = None;
     stable.last_exit_code = None;
+    if let Some(external_network) = stable.external_network.as_mut() {
+        // A checkpoint preserves the guest NIC address, MAC, gateway, DNS,
+        // and egress policy. Its Unix-stream path is the local switch's
+        // ephemeral listener, so a restored world must be able to rebind it.
+        external_network.unixstream_path = PathBuf::from("/smolvm/durable-external-net");
+    }
     let encoded = serde_json::to_vec(&stable).map_err(|error| {
         Error::agent(
             "durable checkpoint",
@@ -3207,6 +3215,24 @@ mod tests {
         assert_ne!(
             durable_fork_config_fingerprint(&record).unwrap(),
             fingerprint
+        );
+
+        record.mem -= 1;
+        record
+            .external_network
+            .as_mut()
+            .unwrap()
+            .unixstream_path = PathBuf::from("/private/tmp/external-net/rebound.sock");
+        assert_eq!(
+            durable_fork_config_fingerprint(&record).unwrap(),
+            fingerprint,
+            "the fresh host listener is not part of guest network identity"
+        );
+        record.external_network.as_mut().unwrap().guest_mac = [0x02, 0, 0, 0, 0, 9];
+        assert_ne!(
+            durable_fork_config_fingerprint(&record).unwrap(),
+            fingerprint,
+            "guest network identity remains receipt-bound"
         );
     }
 
