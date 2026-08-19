@@ -71,6 +71,15 @@ echo "  Alpine: ${ALPINE_VERSION} (${ALPINE_ARCH})"
 echo "  Crane: ${CRANE_VERSION}"
 echo "  Output: ${OUTPUT_DIR}"
 
+# The macOS package-install path runs `smolvm machine run` below. Check this
+# before replacing an existing rootfs: otherwise a plain source checkout can
+# lose its working output and only then learn that `smolvm` was not on PATH.
+if [[ "$(uname -s)" == "Darwin" ]] && ! command -v smolvm &> /dev/null; then
+    echo "Error: smolvm is required to build the agent rootfs on macOS"
+    echo "Add a runnable smolvm binary to PATH, then rerun this command."
+    exit 1
+fi
+
 # Create output directory
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
@@ -242,15 +251,19 @@ normalize_owner_only_modes() {
         fi
     done
 
-    # Then verify the whole tree, and fail the build on anything still owner-only.
-    #
-    # Deliberately not a blanket `chmod -R a+rX`: this script also runs against
-    # user-supplied trees, and SMOLVM_AGENT_ROOTFS can boot one. The rootfs is
-    # shared into every VM, so a recursive widen would quietly expose a custom
-    # tree's 0600 registry token or signing key to every workload. Naming the
-    # known paths and hard-failing on the rest means a later Alpine bump that adds
-    # a fifth one stops the build here — instead of shipping a rootfs that cannot
-    # be packed, or widening something nobody looked at.
+    # macOS installs APK payloads through a guest-mounted output tree. The
+    # virtiofs server currently materializes regular package files as 0600,
+    # including shared libraries and package metadata; a later pack cannot read
+    # them. This script always recreated `rootfs_dir` above from public Alpine
+    # packages and checked-in/generated executables, rather than accepting a
+    # user-supplied tree, so widening read/traverse bits preserves every write
+    # bit while making the generated artifact portable and packable.
+    find "$rootfs_dir" -type d -exec chmod a+rx {} +
+    find "$rootfs_dir" -type f -exec chmod a+r {} +
+
+    # Then verify the whole generated tree. Keep this hard failure: a future
+    # build step that creates an unreadable path should not ship a rootfs that
+    # only fails later during pack/create.
     local owner_only
     owner_only="$(find "$rootfs_dir" \
         \( -type f ! -perm -o=r \) -o \( -type d ! -perm -o=rx \) 2>/dev/null || true)"
