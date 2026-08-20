@@ -7,7 +7,10 @@
 //! # Storage Locations
 //!
 //! - Default VM: `~/Library/Application Support/smolvm/storage.raw` (macOS)
-//! - Named VMs: `~/Library/Caches/smolvm/vms/{name}/storage.raw` (macOS)
+//! - Named VMs: `~/Library/Caches/smolvm/vms/<hash16>/storage.raw` (macOS)
+//! - `SMOLVM_DATA_DIR=/absolute/root` keeps named VMs under
+//!   `/absolute/root/vms/<hash16>/` and relocates other platform data beneath
+//!   that caller-owned root.
 //!
 //! # Architecture
 //!

@@ -68,6 +68,25 @@ The agent rootfs resolution order is:
 2. `./target/agent-rootfs` (local development)
 3. Platform data directory (`~/.local/share/smolvm/` on Linux, `~/Library/Application Support/smolvm/` on macOS)
 
+## Caller-owned local state
+
+`SMOLVM_DATA_DIR` selects one absolute, caller-owned root for all SmolVM
+state before any command resolves a path. On macOS and Linux this includes
+the compact named-VM layout `vms/<hash16>/`, machine database, image archive
+cache, default rootfs, and storage templates. It is useful for a higher-level
+local orchestrator that must retain and clean only its own VM state:
+
+```bash
+SMOLVM_DATA_DIR="$HOME/.cache/niceforge/sentry-backend" \
+  smolvm machine create --name example
+```
+
+The root must be absolute. A selected root is an ownership boundary: if its
+full per-VM Unix socket path is too long, SmolVM fails before creating the
+machine rather than moving that VM to `/tmp`. The default, unconfigured CLI
+layout retains its short per-user `/tmp/smolvm-<uid>` fallback for legacy
+platform cache paths that cannot host Unix sockets.
+
 ```bash
 # Build agent for Linux (size-optimized)
 cargo make build-agent

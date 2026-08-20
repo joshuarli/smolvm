@@ -269,10 +269,15 @@ fn bounded_vm_cache_root() -> PathBuf {
     vm_cache_root()
 }
 
-fn vm_data_dir_for_roots(cache_root: &Path, fallback_root: &Path, name: &str) -> PathBuf {
+fn vm_data_dir_for_roots(
+    cache_root: &Path,
+    fallback_root: &Path,
+    name: &str,
+    allow_fallback: bool,
+) -> PathBuf {
     let hash = vm_dir_hash(name);
     let normal = cache_root.join(&hash);
-    if vm_runtime_path_fits(&normal) {
+    if !allow_fallback || vm_runtime_path_fits(&normal) {
         normal
     } else {
         // Keep the hash and therefore the VM identity exactly the same when a
@@ -288,11 +293,22 @@ fn vm_data_dir_for_roots(cache_root: &Path, fallback_root: &Path, name: &str) ->
 /// prefix is too long for any per-VM Unix socket endpoint, the same hash is
 /// placed under the short per-user fallback `/tmp/smolvm-<uid>/vms/`.
 ///
+/// An explicit `SMOLVM_DATA_DIR` is different: its selected root is an exact
+/// caller ownership boundary, so this function never redirects one of its VMs
+/// to `/tmp`. [`ensure_vm_dir`] rejects a selected root whose socket paths do
+/// not fit before it creates any machine state.
+///
 /// A plaintext `name` file inside the directory records the original name.
 /// This is load-bearing: [`ensure_vm_dir`] reads it to detect hash collisions.
 /// No name truncation or legacy-path migration is performed.
 pub fn vm_data_dir(name: &str) -> PathBuf {
-    vm_data_dir_for_roots(&vm_cache_root(), &bounded_vm_cache_root(), name)
+    let explicit_data_root = std::env::var_os(crate::process::DATA_ROOT_ENV).is_some();
+    vm_data_dir_for_roots(
+        &vm_cache_root(),
+        &bounded_vm_cache_root(),
+        name,
+        !explicit_data_root,
+    )
 }
 
 /// Reclaim CUDA transport state after a named VM process is confirmed dead.
@@ -560,8 +576,15 @@ pub fn read_egress_telemetry(name: &str) -> Option<u64> {
         .ok()
 }
 
-/// Cache root: `<cache_dir>/smolvm/vms/`.
+/// Cache root for named VM state.
+///
+/// An explicit `SMOLVM_DATA_DIR` keeps the machine-facing layout compact as
+/// `<data-root>/vms/`, with `net`, `uids`, and shared pack state as siblings.
+/// The ordinary user installation retains `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
+    if let Some(data_root) = std::env::var_os(crate::process::DATA_ROOT_ENV) {
+        return PathBuf::from(data_root).join("vms");
+    }
     dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -631,8 +654,10 @@ pub fn vm_dir_hash(name: &str) -> String {
 pub fn prune_orphaned_ready_markers() {
     if let Ok(rootfs) = AgentManager::default_rootfs_path() {
         let cache_root = vm_cache_root();
-        let fallback_root = bounded_vm_cache_root();
-        let alternate = (fallback_root != cache_root).then_some(fallback_root.as_path());
+        let alternate_root = (!std::env::var_os(crate::process::DATA_ROOT_ENV).is_some())
+            .then(bounded_vm_cache_root)
+            .filter(|fallback_root| fallback_root != &cache_root);
+        let alternate = alternate_root.as_deref();
         prune_orphaned_ready_markers_in(&rootfs, &cache_root, alternate);
     }
 }
@@ -726,8 +751,19 @@ fn prune_orphaned_ready_markers_in(
 /// once and verified on subsequent calls.
 pub fn ensure_vm_dir(name: &str) -> std::io::Result<PathBuf> {
     let dir = vm_data_dir(name);
+    let explicit_data_root = std::env::var_os(crate::process::DATA_ROOT_ENV).is_some();
+    if explicit_data_root && !vm_runtime_path_fits(&dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} selected a VM root whose socket paths are too long: {}",
+                crate::process::DATA_ROOT_ENV,
+                dir.display()
+            ),
+        ));
+    }
     let fallback_root = bounded_vm_cache_root();
-    if dir.parent() == Some(fallback_root.as_path()) {
+    if !explicit_data_root && dir.parent() == Some(fallback_root.as_path()) {
         ensure_bounded_vm_cache_root(&fallback_root)?;
     }
     ensure_vm_dir_at(&dir, name)
@@ -821,8 +857,10 @@ pub fn ensure_vm_dir_at(dir: &std::path::Path, name: &str) -> std::io::Result<Pa
 /// and command execution.
 ///
 /// Each VM gets its own agent with isolated paths under the hashed cache
-/// directory (socket, PID file, storage, overlay). Long cache prefixes use the
-/// bounded per-user fallback selected by [`vm_data_dir`].
+/// directory (socket, PID file, storage, overlay). Long ordinary cache
+/// prefixes use the bounded per-user fallback selected by [`vm_data_dir`]; an
+/// explicit `SMOLVM_DATA_DIR` instead fails closed before it can escape the
+/// caller-owned data root.
 pub struct AgentManager {
     /// VM name (None only for low-level `new()` callers; CLI always sets a name).
     name: Option<String>,
@@ -3638,7 +3676,7 @@ mod tests {
     fn vm_data_dir_preserves_normal_cache_layout_when_it_fits() {
         let cache = PathBuf::from("/Users/test/Library/Caches/smolvm/vms");
         let fallback = PathBuf::from("/tmp/smolvm-test/vms");
-        let dir = vm_data_dir_for_roots(&cache, &fallback, "ordinary-vm");
+        let dir = vm_data_dir_for_roots(&cache, &fallback, "ordinary-vm", true);
 
         assert_eq!(dir, cache.join(vm_dir_hash("ordinary-vm")));
     }
@@ -3647,7 +3685,7 @@ mod tests {
     fn vm_data_dir_uses_bounded_root_for_long_cache_and_all_socket_endpoints_fit() {
         let cache = PathBuf::from("/").join("long-cache-root-".repeat(20));
         let fallback = PathBuf::from("/tmp/smolvm-test/vms");
-        let dir = vm_data_dir_for_roots(&cache, &fallback, "long-root-vm");
+        let dir = vm_data_dir_for_roots(&cache, &fallback, "long-root-vm", true);
 
         assert_eq!(dir, fallback.join(vm_dir_hash("long-root-vm")));
         assert!(vm_runtime_path_fits(&dir));
@@ -3661,11 +3699,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_data_root_never_uses_the_tmp_socket_fallback() {
+        let cache = PathBuf::from("/").join("long-explicit-data-root-".repeat(20));
+        let fallback = PathBuf::from("/tmp/smolvm-test/vms");
+        let dir = vm_data_dir_for_roots(&cache, &fallback, "caller-owned-vm", false);
+
+        assert_eq!(dir, cache.join(vm_dir_hash("caller-owned-vm")));
+        assert!(
+            !vm_runtime_path_fits(&dir),
+            "the test root must require a fallback in ordinary-cache mode"
+        );
+        assert_ne!(dir.parent(), Some(fallback.as_path()));
+    }
+
+    #[test]
     fn fallback_layout_keeps_identity_and_collision_safety() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = PathBuf::from("/").join("long-cache-root-".repeat(20));
         let fallback = tmp.path().join("vms");
-        let dir = vm_data_dir_for_roots(&cache, &fallback, "first-vm");
+        let dir = vm_data_dir_for_roots(&cache, &fallback, "first-vm", true);
 
         assert_eq!(
             dir.file_name().unwrap().to_string_lossy(),

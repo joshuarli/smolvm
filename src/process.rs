@@ -907,60 +907,113 @@ pub fn vm_uid_drop_active() -> bool {
     false
 }
 
-/// Relocate all smolvm state under a single system data root by pointing `HOME`
-/// at it before any path is computed — every `dirs::`-derived path (VM dirs,
-/// agent rootfs, templates, server DB) follows. This is what lets per-VM uid
-/// isolation's dropped uids traverse to their data (an XDG-under-a-700-home
-/// layout can't). `SMOLVM_DATA_DIR` is honored for **every** command (so the CLI
-/// and serve agree); `allow_auto` additionally defaults to `/var/lib/smolvm` when
-/// privileged with the uid drop active and no XDG override (serve only — a
-/// one-off root CLI invocation shouldn't silently switch roots). Must be called
-/// single-threaded, before the tokio runtime, so `set_var` is safe.
-#[cfg(target_os = "linux")]
-pub fn apply_system_data_root(allow_auto: bool) {
-    let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
-        std::path::PathBuf::from(explicit)
-    } else if allow_auto
-        && vm_uid_drop_active()
-        && std::env::var_os("XDG_CACHE_HOME").is_none()
-        && std::env::var_os("XDG_DATA_HOME").is_none()
-    {
-        std::path::PathBuf::from("/var/lib/smolvm")
-    } else {
-        return;
-    };
-    match std::fs::create_dir_all(&root) {
-        Ok(()) => {
-            use std::os::unix::fs::PermissionsExt;
-            // 0755 so dropped VMM uids can traverse to their data.
-            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755));
-        }
-        Err(e) => {
-            tracing::warn!(root = %root.display(), error = %e, "failed to create smolvm data root")
-        }
-    }
-    // Registry auth (crane/docker) falls back to `$HOME/.docker`, which we're about
-    // to move off the operator's real home — pin DOCKER_CONFIG to the ORIGINAL
-    // `~/.docker` (if it exists and the operator hasn't set DOCKER_CONFIG) so
-    // private image pulls keep finding their credentials after the relocation.
-    if std::env::var_os("DOCKER_CONFIG").is_none() {
-        if let Some(dir) = dirs::home_dir()
-            .map(|h| h.join(".docker"))
-            .filter(|d| d.is_dir())
+/// Name of the explicit caller-owned SmolVM data root.
+///
+/// The root is applied before any `dirs` lookup, so it controls the VM cache,
+/// machine database, image archive cache, templates, and default rootfs
+/// location as one coherent local namespace. Named VMs use the compact
+/// `<root>/vms/` layout rather than adding platform-specific cache components.
+pub const DATA_ROOT_ENV: &str = "SMOLVM_DATA_DIR";
+
+/// Relocate all smolvm state under one caller-owned data root by pointing
+/// `HOME` at it before any path is computed. Every `dirs::`-derived path (agent
+/// rootfs, templates, server DB, and image archive cache) then remains below
+/// that root; named VMs use `<root>/vms/`. `SMOLVM_DATA_DIR` is honored for **every** command
+/// on macOS and Linux so a caller can keep all of the SmolVM state it uses in
+/// one exact namespace.
+///
+/// On Linux only, `allow_auto` additionally selects `/var/lib/smolvm` for a
+/// privileged uid-dropped server with no explicit XDG/data-root override. A
+/// one-off root CLI invocation never receives that automatic root. The
+/// explicit root must be absolute and usable; it is never a hint that permits
+/// a later fallback to a different filesystem. This must run single-threaded,
+/// before the application runtime, because it updates process environment.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn apply_system_data_root(allow_auto: bool) -> Result<()> {
+    let explicit = std::env::var_os(DATA_ROOT_ENV).map(std::path::PathBuf::from);
+    let root = explicit.or_else(|| {
+        #[cfg(target_os = "linux")]
         {
-            std::env::set_var("DOCKER_CONFIG", dir);
+            if allow_auto
+                && vm_uid_drop_active()
+                && std::env::var_os("XDG_CACHE_HOME").is_none()
+                && std::env::var_os("XDG_DATA_HOME").is_none()
+            {
+                return Some(std::path::PathBuf::from("/var/lib/smolvm"));
+            }
+        }
+        let _ = allow_auto;
+        None
+    });
+    let Some(root) = root else {
+        return Ok(());
+    };
+    if !root.is_absolute() {
+        return Err(Error::config(
+            DATA_ROOT_ENV,
+            format!("must be an absolute directory: {}", root.display()),
+        ));
+    }
+    std::fs::create_dir_all(&root).map_err(|error| {
+        Error::config(
+            DATA_ROOT_ENV,
+            format!("create {}: {error}", root.display()),
+        )
+    })?;
+    let metadata = std::fs::symlink_metadata(&root).map_err(|error| {
+        Error::config(
+            DATA_ROOT_ENV,
+            format!("inspect {}: {error}", root.display()),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::config(
+            DATA_ROOT_ENV,
+            format!("must be a regular directory: {}", root.display()),
+        ));
+    }
+    let root = std::fs::canonicalize(&root).map_err(|error| {
+        Error::config(
+            DATA_ROOT_ENV,
+            format!("canonicalize {}: {error}", root.display()),
+        )
+    })?;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 0755 lets dropped VMM uids traverse to their data. macOS has no
+        // uid-drop runtime and preserves the caller-selected directory mode.
+        let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // Registry auth (crane/docker) falls back to `$HOME/.docker`, which we're
+    // about to move off the operator's real home. Pin DOCKER_CONFIG to the
+    // original location when available so a local storage choice does not
+    // silently discard the caller's registry credentials.
+    if std::env::var_os("DOCKER_CONFIG").is_none() {
+        if let Some(directory) = dirs::home_dir()
+            .map(|home| home.join(".docker"))
+            .filter(|directory| directory.is_dir())
+        {
+            std::env::set_var("DOCKER_CONFIG", directory);
         }
     }
+    std::env::set_var(DATA_ROOT_ENV, &root);
     std::env::set_var("HOME", &root);
     std::env::remove_var("XDG_CACHE_HOME");
     std::env::remove_var("XDG_DATA_HOME");
     std::env::remove_var("XDG_CONFIG_HOME");
-    tracing::info!(data_root = %root.display(), "smolvm state rooted at a system data dir");
+    tracing::info!(data_root = %root.display(), "smolvm state rooted at a caller-selected data dir");
+    Ok(())
 }
 
-/// No-op where the data root isn't applicable (macOS dev).
-#[cfg(not(target_os = "linux"))]
-pub fn apply_system_data_root(_allow_auto: bool) {}
+/// Platforms without the macOS/Linux local-path layout ignore the optional
+/// data-root relocation while retaining the same call surface for the CLI.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn apply_system_data_root(_allow_auto: bool) -> Result<()> {
+    Ok(())
+}
 
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
 /// (others-execute) by the drop uid, or the dropped VMM can't reach its own

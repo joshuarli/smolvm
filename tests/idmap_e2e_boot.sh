@@ -62,8 +62,8 @@ create() {
 echo "[*] creating e2e-a"
 [ "$(create e2e-a)" = "200" ] && ok "create e2e-a 200" || bad "create e2e-a !=200"
 
-# Layout: SMOLVM_DATA_DIR becomes $HOME, so the store is $HOME/.cache/smolvm/vms.
-VMS_ROOT="$(find "$DATA_DIR" -type d -path '*/smolvm/vms' | head -1)"
+# An explicit data root keeps named machines in its compact `vms/` child.
+VMS_ROOT="$DATA_DIR/vms"
 SHARED_ROOT="$VMS_ROOT/_shared"
 [ -d "$SHARED_ROOT" ] && ok "shared root exists: $SHARED_ROOT" || bad "no shared root (vms=$VMS_ROOT)"
 CKDIR="$(find "$SHARED_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)"

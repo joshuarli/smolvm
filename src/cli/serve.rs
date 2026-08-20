@@ -102,7 +102,7 @@ impl ServeStartCmd {
         // (allow_auto = true). An explicit SMOLVM_DATA_DIR was already applied for
         // every command in main(); calling again is idempotent. Single-threaded
         // before the application runtime, so set_var is safe.
-        smolvm::process::apply_system_data_root(/* allow_auto */ true);
+        smolvm::process::apply_system_data_root(/* allow_auto */ true)?;
 
         // Lock the state dirs holding machine records / credentials / config down
         // to 0700 so a Landlock-exempt fork clone (which runs as its golden's uid)
@@ -692,7 +692,9 @@ impl ListenTarget {
 fn default_listen_value() -> String {
     #[cfg(unix)]
     {
-        let path = dirs::runtime_dir()
+        let path = std::env::var_os(smolvm::process::DATA_ROOT_ENV)
+            .map(PathBuf::from)
+            .or_else(dirs::runtime_dir)
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("smolvm.sock")
             .display()
