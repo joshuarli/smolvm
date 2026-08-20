@@ -37,6 +37,8 @@ const MAX_ERROR_BYTES: usize = 64 * 1024;
 pub(crate) const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound TCP/DNS/TLS connection establishment.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound registry/CDN hops when a blob is served from a redirecting backend.
+const MAX_BLOB_REDIRECTS: usize = 5;
 
 type HttpResponse = Response<Incoming>;
 type BlobStream = std::pin::Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
@@ -290,13 +292,10 @@ impl RegistryClient {
     pub async fn pull_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
         validate_digest(digest)?;
         let response = self
-            .send_replayable(
-                self.template(
-                    Method::GET,
-                    &format!("{}/v2/{repo}/blobs/{digest}", self.base_url),
-                )?,
-                || empty_body(),
-            )
+            .send_blob_get(self.template(
+                Method::GET,
+                &format!("{}/v2/{repo}/blobs/{digest}", self.base_url),
+            )?)
             .await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Err(RegistryError::BlobNotFound(digest.to_string()));
@@ -435,9 +434,14 @@ impl RegistryClient {
         offset: u64,
     ) -> Result<(BlobStream, u64)> {
         validate_digest(digest)?;
-        let mut request = self.template(Method::GET, &format!("{}/v2/{repo}/blobs/{digest}", self.base_url))?;
-        if offset > 0 { set_header(&mut request, RANGE, &format!("bytes={offset}-"))?; }
-        let response = self.send_replayable(request, || empty_body()).await?;
+        let mut request = self.template(
+            Method::GET,
+            &format!("{}/v2/{repo}/blobs/{digest}", self.base_url),
+        )?;
+        if offset > 0 {
+            set_header(&mut request, RANGE, &format!("bytes={offset}-"))?;
+        }
+        let response = self.send_blob_get(request).await?;
         if response.status() == StatusCode::NOT_FOUND {
             return Err(RegistryError::BlobNotFound(digest.to_string()));
         }
@@ -691,6 +695,61 @@ impl RegistryClient {
                 body: "upload step accepted but missing Location header".into(),
             })?;
         self.resolve_location(location)
+    }
+
+    /// Pulls may be redirected from a registry API host to a signed CDN URL
+    /// (Docker Hub commonly returns 307 for blobs). Redirects are followed
+    /// without forwarding the registry's bearer token to the new origin.
+    async fn send_blob_get(&self, template: Request<()>) -> Result<HttpResponse> {
+        let mut current = template.uri().to_string();
+        let range = template.headers().get(RANGE).cloned();
+        let mut response = self.send_replayable(template, || empty_body()).await?;
+        for _ in 0..MAX_BLOB_REDIRECTS {
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                return Ok(response);
+            };
+            let next = self.resolve_blob_location(&current, location)?;
+            drop(response);
+            let mut request = self.template(Method::GET, &next)?;
+            if let Some(range) = &range {
+                request.headers_mut().insert(RANGE, range.clone());
+            }
+            response = self
+                .dispatch_raw(request, empty_body()?)
+                .await?;
+            current = next;
+        }
+        Err(RegistryError::ApiError {
+            status: 310,
+            body: format!("blob redirect limit exceeded after {MAX_BLOB_REDIRECTS} hops"),
+        })
+    }
+
+    fn resolve_blob_location(&self, current: &str, location: &str) -> Result<String> {
+        let base = Url::parse(current).map_err(|error| RegistryError::ApiError {
+            status: 307,
+            body: format!("current blob URL is not valid: {error}"),
+        })?;
+        let resolved = base.join(location).map_err(|error| RegistryError::ApiError {
+            status: 307,
+            body: format!("blob redirect Location is not a valid URL '{location}': {error}"),
+        })?;
+        if resolved.scheme() != "https"
+            && !crate::is_local_registry(resolved.host_str().unwrap_or_default())
+        {
+            return Err(RegistryError::ApiError {
+                status: 307,
+                body: format!("blob redirect must use HTTPS: {resolved}"),
+            });
+        }
+        Ok(resolved.to_string())
     }
 
     async fn dispatch(&self, mut request: Request<()>, body: BoxBody) -> Result<HttpResponse> {
@@ -1281,6 +1340,39 @@ mod tests {
         let error = futures_lite::future::block_on(client.get_manifest("repo", "latest"))
             .unwrap_err();
         assert!(matches!(error, RegistryError::ResponseTooLarge { .. }));
+    }
+
+    #[test]
+    fn migrated_client_follows_blob_redirect_without_registry_origin_requirement() {
+        let payload = b"redirected blob".to_vec();
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&payload)));
+        let target = TestServer::start({
+            let payload = payload.clone();
+            move |_uri| {
+                move |method: &str, path: &str| {
+                    if method == "GET" && path == "/signed/blob" {
+                        return TestResponse::new(200, payload.clone());
+                    }
+                    TestResponse::new(404, Vec::new())
+                }
+            }
+        });
+        let redirect = TestServer::start({
+            let target = target.uri();
+            let digest = digest.clone();
+            move |_uri| {
+                move |method: &str, path: &str| {
+                    if method == "GET" && path == format!("/v2/repo/blobs/{digest}") {
+                        return TestResponse::new(307, Vec::new())
+                            .header("Location", format!("{target}/signed/blob"));
+                    }
+                    TestResponse::new(404, Vec::new())
+                }
+            }
+        });
+        let client = RegistryClient::new_for_tests(redirect.uri());
+        let result = futures_lite::future::block_on(client.pull_blob("repo", &digest)).unwrap();
+        assert_eq!(result, payload);
     }
 
     #[test]
