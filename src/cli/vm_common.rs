@@ -929,8 +929,15 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
 /// checkpoint-owned RAM and writable-disk clonefiles durable. This command is
 /// intentionally same-machine/same-lineage; coordinated multi-machine
 /// checkpointing belongs to the caller that composes these receipts.
-pub fn checkpoint_vm_named(name: &str, output: &Path) -> smolvm::Result<()> {
-    let checkpoint = smolvm::agent::fork::capture_durable_fork(name, output)?;
+pub fn checkpoint_vm_named(
+    name: &str,
+    output: &Path,
+    parent: Option<&Path>,
+) -> smolvm::Result<()> {
+    let checkpoint = match parent {
+        Some(parent) => smolvm::agent::fork::capture_durable_fork_delta(name, output, parent)?,
+        None => smolvm::agent::fork::capture_durable_fork(name, output)?,
+    };
     println!(
         "Checkpointed machine '{}' at {} ({} verified files, ABI {}).",
         name,
@@ -959,7 +966,7 @@ pub fn restore_vm_named_from_checkpoint(
     if let Some(net_unixstream) = net_unixstream {
         rebind_restore_external_network(&db, name, net_unixstream)?;
     }
-    let receipt = smolvm::agent::fork::restore_durable_fork_files(name, checkpoint)?;
+    let restored = smolvm::agent::fork::restore_durable_fork_files(name, checkpoint)?;
     start_vm_named_with_db(
         &db,
         name,
@@ -968,7 +975,7 @@ pub fn restore_vm_named_from_checkpoint(
         true,
         ForkLaunch {
             forkable,
-            snapshot_dir: Some(smolvm::agent::fork::durable_fork_snapshot_dir(checkpoint)),
+            snapshot_dir: Some(restored.snapshot_dir),
             suppress_record_forkable: true,
             ..Default::default()
         },
@@ -977,7 +984,7 @@ pub fn restore_vm_named_from_checkpoint(
         "Restored machine '{}' from {} ({} verified files).",
         name,
         checkpoint.display(),
-        receipt.files.len()
+        restored.checkpoint.files.len()
     );
     Ok(())
 }

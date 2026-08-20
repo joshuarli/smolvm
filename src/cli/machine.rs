@@ -4009,11 +4009,17 @@ pub struct CheckpointCmd {
     /// Absolute, not-yet-existing output directory for the checkpoint artifact.
     #[arg(long, value_name = "DIR")]
     pub output: PathBuf,
+
+    /// Exact retained checkpoint to use as this artifact's immutable base.
+    /// The resulting checkpoint stores only changed RAM/disk blocks and fails
+    /// closed if that parent receipt is missing or changes.
+    #[arg(long, value_name = "DIR")]
+    pub parent: Option<PathBuf>,
 }
 
 impl CheckpointCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        vm_common::checkpoint_vm_named(&self.name, &self.output)
+        vm_common::checkpoint_vm_named(&self.name, &self.output, self.parent.as_deref())
     }
 }
 

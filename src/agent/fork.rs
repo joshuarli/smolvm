@@ -14,9 +14,9 @@ use crate::config::{RecordState, VmRecord};
 use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
 use crate::{Error, Result};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -48,6 +48,71 @@ pub struct DurableForkCheckpoint {
     pub source_record: VmRecord,
     /// Every checkpoint-owned regular file except this receipt itself.
     pub files: Vec<DurableForkFile>,
+}
+
+/// Immutable parent reference for a checkpoint whose large RAM and writable
+/// disk files are stored as changed blocks instead of another complete copy.
+///
+/// The parent path is deliberately an exact, canonical local artifact path:
+/// durable checkpoint bytes are a same-host capability, and the receipt binds
+/// the small parent receipt before any block is replayed.  A caller that moves
+/// an artifact must move its lineage together or recapture it; restore never
+/// searches by name for a plausible base.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct IncrementalForkParent {
+    pub checkpoint_root: PathBuf,
+    pub receipt_digest: String,
+}
+
+/// A durable, incrementally restorable machine checkpoint.  Control/device
+/// files are complete replacements; RAM and writable disks are 4 KiB changed
+/// block streams against the exact parent receipt.  The format is intentionally
+/// owned here rather than in Smolworld: only SmolVM can decide which files are
+/// VM state and can materialize a valid libkrun snapshot for restore.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct IncrementalForkCheckpoint {
+    pub schema_version: u32,
+    pub materializer_abi: String,
+    pub source_name: String,
+    pub source_config_fingerprint: String,
+    pub source_record: VmRecord,
+    pub parent: IncrementalForkParent,
+    pub chain_depth: u32,
+    pub files: Vec<IncrementalForkFile>,
+}
+
+/// One file in an [`IncrementalForkCheckpoint`].
+#[allow(missing_docs)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IncrementalForkFile {
+    /// Complete replacement for bounded VMM/device control state.
+    Replacement {
+        path: String,
+        bytes: u64,
+        payload: String,
+        digest: String,
+    },
+    /// Changed 4 KiB blocks against the file at the same path in the parent.
+    Blocks {
+        path: String,
+        bytes: u64,
+        payload: String,
+        digest: String,
+        changed_blocks: u64,
+    },
+}
+
+/// A materialized full checkpoint prepared privately for a chain-aware
+/// restore.  `snapshot_dir` is safe to hand to libkrun; it is never promoted
+/// as another retained checkpoint artifact.
+#[allow(missing_docs)]
+#[derive(Clone, Debug)]
+pub struct DurableForkRestore {
+    pub checkpoint: DurableForkCheckpoint,
+    pub snapshot_dir: PathBuf,
 }
 
 /// One bounded receipt for a file in a [`DurableForkCheckpoint`].
@@ -98,6 +163,12 @@ const DURABLE_FORK_CHECKPOINT_FILE: &str = "checkpoint.bin";
 const DURABLE_FORK_MANIFEST_FILE: &str = "manifest.bin";
 const DURABLE_FORK_RAM_DIR: &str = "ram";
 const DURABLE_FORK_DISKS_DIR: &str = "disks";
+const INCREMENTAL_FORK_SCHEMA_VERSION: u32 = 1;
+const INCREMENTAL_FORK_MATERIALIZER_ABI: &str = "smolvm-incremental-fork-macos-v1";
+const INCREMENTAL_FORK_RECEIPT_NAME: &str = "smolvm-delta.json";
+const INCREMENTAL_FORK_BLOCK_BYTES: usize = 4096;
+const INCREMENTAL_FORK_MAX_CHAIN_DEPTH: u32 = 16;
+const INCREMENTAL_FORK_PATCH_MAGIC: [u8; 8] = *b"SMVDLT01";
 
 /// Path to a forkable machine's control socket (pause/resume/checkpoint/FORK).
 pub fn control_socket_path(name: &str) -> PathBuf {
@@ -320,9 +391,30 @@ pub fn resume_golden(golden: &str, snapshot_dir: &Path) -> Result<()> {
 /// golden back to its running device state and removes only this call's
 /// staging directory.
 pub fn capture_durable_fork(name: &str, output: &Path) -> Result<DurableForkCheckpoint> {
+    capture_durable_fork_with_parent(name, output, None)
+}
+
+/// Capture one running machine as a durable changed-block checkpoint against
+/// `parent`.  The capture itself still uses libkrun's coherent full-machine
+/// cut; this function converts that unpublished cut into a verified delta
+/// before publication, so no later retained artifact contains a second full
+/// RAM or writable-disk file.
+pub fn capture_durable_fork_delta(
+    name: &str,
+    output: &Path,
+    parent: &Path,
+) -> Result<DurableForkCheckpoint> {
+    capture_durable_fork_with_parent(name, output, Some(parent))
+}
+
+fn capture_durable_fork_with_parent(
+    name: &str,
+    output: &Path,
+    parent_checkpoint: Option<&Path>,
+) -> Result<DurableForkCheckpoint> {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
-        let _ = (name, output);
+        let _ = (name, output, parent_checkpoint);
         return Err(Error::agent(
             "durable checkpoint",
             "durable fork checkpoints currently require macOS on Apple Silicon",
@@ -332,10 +424,16 @@ pub fn capture_durable_fork(name: &str, output: &Path) -> Result<DurableForkChec
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         validate_vm_name(name, "machine name").map_err(|e| Error::config("checkpoint", e))?;
-        let parent = durable_checkpoint_output_parent(output)?;
-        let staging = create_durable_checkpoint_staging(&parent, output)?;
+        let output_parent = durable_checkpoint_output_parent(output)?;
+        let staging = create_durable_checkpoint_staging(&output_parent, output)?;
         let mut progress = DurableCaptureProgress::default();
-        let result = capture_durable_fork_into(name, &staging, &mut progress);
+        let result = (|| {
+            let receipt = capture_durable_fork_into(name, &staging, &mut progress)?;
+            if let Some(parent_checkpoint) = parent_checkpoint {
+                convert_full_checkpoint_to_delta(&staging, &receipt, parent_checkpoint)?;
+            }
+            Ok(receipt)
+        })();
 
         match result {
             Ok(receipt) => {
@@ -348,7 +446,7 @@ pub fn capture_durable_fork(name: &str, output: &Path) -> Result<DurableForkChec
                         ),
                     ));
                 }
-                if let Err(error) = File::open(&parent).and_then(|directory| directory.sync_all()) {
+                if let Err(error) = File::open(&output_parent).and_then(|directory| directory.sync_all()) {
                     return Err(Error::agent(
                         "publish durable checkpoint",
                         format!(
@@ -401,7 +499,7 @@ pub fn capture_durable_fork(name: &str, output: &Path) -> Result<DurableForkChec
 /// restore. The caller then starts the VM from `checkpoint.bin`/`manifest.bin`
 /// with fresh host handles. A restore-incomplete marker denies ordinary starts
 /// if a later filesystem error interrupts the disk replacement sequence.
-pub fn restore_durable_fork_files(name: &str, checkpoint: &Path) -> Result<DurableForkCheckpoint> {
+pub fn restore_durable_fork_files(name: &str, checkpoint: &Path) -> Result<DurableForkRestore> {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
         let _ = (name, checkpoint);
@@ -415,8 +513,15 @@ pub fn restore_durable_fork_files(name: &str, checkpoint: &Path) -> Result<Durab
     {
         validate_vm_name(name, "machine name").map_err(|e| Error::config("restore", e))?;
         validate_durable_checkpoint_root(checkpoint)?;
-        let receipt = read_durable_checkpoint_receipt(checkpoint)?;
-        validate_durable_checkpoint_receipt(checkpoint, &receipt)?;
+        let is_delta = checkpoint.join(INCREMENTAL_FORK_RECEIPT_NAME).exists();
+        let machine_dir = vm_data_dir(name);
+        let materialized = if is_delta {
+            materialize_incremental_restore_checkpoint(checkpoint, &machine_dir)?
+        } else {
+            checkpoint.to_path_buf()
+        };
+        let receipt = read_durable_checkpoint_receipt(&materialized)?;
+        validate_durable_checkpoint_receipt(&materialized, &receipt)?;
         if receipt.source_name != name {
             return Err(Error::agent(
                 "durable restore",
@@ -447,7 +552,6 @@ pub fn restore_durable_fork_files(name: &str, checkpoint: &Path) -> Result<Durab
             ));
         }
 
-        let machine_dir = vm_data_dir(name);
         let metadata = fs::symlink_metadata(&machine_dir).map_err(|error| {
             Error::agent(
                 "durable restore",
@@ -467,8 +571,11 @@ pub fn restore_durable_fork_files(name: &str, checkpoint: &Path) -> Result<Durab
             ));
         }
 
-        restore_durable_fork_disks(checkpoint, &receipt, &machine_dir)?;
-        Ok(receipt)
+        restore_durable_fork_disks(&materialized, &receipt, &machine_dir)?;
+        Ok(DurableForkRestore {
+            checkpoint: receipt,
+            snapshot_dir: materialized,
+        })
     }
 }
 
@@ -615,6 +722,11 @@ fn validate_durable_fork_record(record: &VmRecord) -> Result<()> {
 
 fn durable_fork_config_fingerprint(record: &VmRecord) -> Result<String> {
     let mut stable = record.clone();
+    // Creation time identifies a local registry row, not the machine launch
+    // contract.  A base and a restored child can legitimately carry records
+    // written in different seconds, so including it would make same-lineage
+    // incremental captures fail nondeterministically under load.
+    stable.created_at = 0;
     stable.state = RecordState::Created;
     stable.pid = None;
     stable.pid_start_time = None;
@@ -976,6 +1088,513 @@ fn write_durable_file(path: &Path, contents: &[u8]) -> Result<()> {
             format!("write {}: {error}", path.display()),
         )
     })
+}
+
+fn convert_full_checkpoint_to_delta(
+    full_checkpoint: &Path,
+    child: &DurableForkCheckpoint,
+    parent_checkpoint: &Path,
+) -> Result<()> {
+    let parent_checkpoint = canonical_checkpoint_root(parent_checkpoint)?;
+    let parent_depth = checkpoint_chain_depth(&parent_checkpoint, 0)?;
+    if parent_depth >= INCREMENTAL_FORK_MAX_CHAIN_DEPTH {
+        return Err(Error::agent(
+            "durable checkpoint",
+            format!(
+                "parent checkpoint chain depth {parent_depth} reaches the supported limit {INCREMENTAL_FORK_MAX_CHAIN_DEPTH}"
+            ),
+        ));
+    }
+    let parent_materialized = full_checkpoint.join(".parent-materialized");
+    let parent = materialize_checkpoint_chain(&parent_checkpoint, &parent_materialized, 0)?;
+    if parent.source_name != child.source_name
+        || parent.source_config_fingerprint != child.source_config_fingerprint
+    {
+        return Err(Error::agent(
+            "durable checkpoint",
+            "parent checkpoint does not have the same machine lineage and configuration",
+        ));
+    }
+
+    let result = (|| {
+        let payload_root = full_checkpoint.join("delta-payload");
+        let replacements = payload_root.join("replacements");
+        let patches = payload_root.join("patches");
+        fs::create_dir(&payload_root)
+            .and_then(|()| fs::create_dir(&replacements))
+            .and_then(|()| fs::create_dir(&patches))
+            .map_err(|error| Error::agent("durable checkpoint", format!("create delta payload: {error}")))?;
+
+        let parent_files: BTreeMap<_, _> = parent
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file))
+            .collect();
+        let mut files = Vec::with_capacity(child.files.len());
+        for (index, file) in child.files.iter().enumerate() {
+            let parent_file = parent_files.get(file.path.as_str()).ok_or_else(|| {
+                Error::agent(
+                    "durable checkpoint",
+                    format!("parent checkpoint omits file {}", file.path),
+                )
+            })?;
+            let source = full_checkpoint.join(&file.path);
+            let parent_source = parent_materialized.join(&file.path);
+            let payload_name = format!("{index:04}.bin");
+            match file.integrity {
+                DurableForkFileIntegrity::Blake3 { .. } => {
+                    let payload = replacements.join(&payload_name);
+                    copy_checkpoint_file(&source, &payload)?;
+                    files.push(IncrementalForkFile::Replacement {
+                        path: file.path.clone(),
+                        bytes: file.bytes,
+                        payload: format!("delta-payload/replacements/{payload_name}"),
+                        digest: blake3_file(&payload)?,
+                    });
+                }
+                DurableForkFileIntegrity::FileIdentity { .. } => {
+                    if parent_file.bytes != file.bytes {
+                        return Err(Error::agent(
+                            "durable checkpoint",
+                            format!(
+                                "parent checkpoint file {} has a different logical size; recapture a new base",
+                                file.path
+                            ),
+                        ));
+                    }
+                    let payload = patches.join(&payload_name);
+                    let changed_blocks = write_block_delta(&parent_source, &source, &payload)?;
+                    files.push(IncrementalForkFile::Blocks {
+                        path: file.path.clone(),
+                        bytes: file.bytes,
+                        payload: format!("delta-payload/patches/{payload_name}"),
+                        digest: blake3_file(&payload)?,
+                        changed_blocks,
+                    });
+                }
+            }
+        }
+        files.sort_by(|left, right| incremental_file_path(left).cmp(incremental_file_path(right)));
+
+        let parent_receipt_digest = checkpoint_receipt_digest(&parent_checkpoint)?;
+        let receipt = IncrementalForkCheckpoint {
+            schema_version: INCREMENTAL_FORK_SCHEMA_VERSION,
+            materializer_abi: INCREMENTAL_FORK_MATERIALIZER_ABI.to_string(),
+            source_name: child.source_name.clone(),
+            source_config_fingerprint: child.source_config_fingerprint.clone(),
+            source_record: child.source_record.clone(),
+            parent: IncrementalForkParent {
+                checkpoint_root: parent_checkpoint,
+                receipt_digest: parent_receipt_digest,
+            },
+            chain_depth: parent_depth + 1,
+            files,
+        };
+        validate_incremental_fork_checkpoint(full_checkpoint, &receipt)?;
+
+        // Remove the full unpublished copy only after every patch is sealed.
+        // The parent materialization is private staging and never becomes part
+        // of the published delta artifact.
+        for file in &child.files {
+            fs::remove_file(full_checkpoint.join(&file.path)).map_err(|error| {
+                Error::agent(
+                    "durable checkpoint",
+                    format!("remove superseded full checkpoint file {}: {error}", file.path),
+                )
+            })?;
+        }
+        for directory in [DURABLE_FORK_RAM_DIR, DURABLE_FORK_DISKS_DIR] {
+            let directory = full_checkpoint.join(directory);
+            if directory.exists() {
+                fs::remove_dir(&directory).map_err(|error| {
+                    Error::agent(
+                        "durable checkpoint",
+                        format!("remove superseded checkpoint directory {}: {error}", directory.display()),
+                    )
+                })?;
+            }
+        }
+        fs::remove_file(full_checkpoint.join(DURABLE_FORK_RECEIPT_NAME)).map_err(|error| {
+            Error::agent(
+                "durable checkpoint",
+                format!("remove superseded full checkpoint receipt: {error}"),
+            )
+        })?;
+        write_incremental_fork_receipt(full_checkpoint, &receipt)?;
+        sync_directory(full_checkpoint)?;
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&parent_materialized);
+    result
+}
+
+fn materialize_incremental_restore_checkpoint(
+    checkpoint: &Path,
+    machine_dir: &Path,
+) -> Result<PathBuf> {
+    let checkpoint = canonical_checkpoint_root(checkpoint)?;
+    let destination = machine_dir.join(format!(
+        ".durable-delta-restore-{}-{}",
+        std::process::id(),
+        host_random_hex(12)
+    ));
+    fs::create_dir(&destination).map_err(|error| {
+        Error::agent(
+            "durable restore",
+            format!("create private delta materialization {}: {error}", destination.display()),
+        )
+    })?;
+    match materialize_checkpoint_chain(&checkpoint, &destination, 0) {
+        Ok(_) => Ok(destination),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&destination);
+            Err(error)
+        }
+    }
+}
+
+fn materialize_checkpoint_chain(
+    checkpoint: &Path,
+    destination: &Path,
+    recursion_depth: u32,
+) -> Result<DurableForkCheckpoint> {
+    if recursion_depth > INCREMENTAL_FORK_MAX_CHAIN_DEPTH {
+        return Err(Error::agent(
+            "durable restore",
+            format!("checkpoint chain exceeds supported depth {INCREMENTAL_FORK_MAX_CHAIN_DEPTH}"),
+        ));
+    }
+    let checkpoint = canonical_checkpoint_root(checkpoint)?;
+    if checkpoint.join(INCREMENTAL_FORK_RECEIPT_NAME).exists() {
+        let delta = read_incremental_fork_checkpoint(&checkpoint)?;
+        validate_incremental_fork_checkpoint(&checkpoint, &delta)?;
+        let parent_root = canonical_checkpoint_root(&delta.parent.checkpoint_root)?;
+        if checkpoint_receipt_digest(&parent_root)? != delta.parent.receipt_digest {
+            return Err(Error::agent(
+                "durable restore",
+                "checkpoint delta parent receipt digest changed",
+            ));
+        }
+        if delta.chain_depth != checkpoint_chain_depth(&parent_root, 0)? + 1 {
+            return Err(Error::agent(
+                "durable restore",
+                "checkpoint delta receipt has an invalid chain depth",
+            ));
+        }
+        let parent = materialize_checkpoint_chain(&parent_root, destination, recursion_depth + 1)?;
+        if parent.source_name != delta.source_name
+            || parent.source_config_fingerprint != delta.source_config_fingerprint
+        {
+            return Err(Error::agent(
+                "durable restore",
+                "checkpoint delta parent does not match machine lineage",
+            ));
+        }
+        let parent_paths: BTreeSet<_> = parent.files.iter().map(|file| file.path.as_str()).collect();
+        let delta_paths: BTreeSet<_> = delta.files.iter().map(incremental_file_path).collect();
+        if parent_paths != delta_paths {
+            return Err(Error::agent(
+                "durable restore",
+                "checkpoint delta file set does not exactly match its parent",
+            ));
+        }
+        for file in &delta.files {
+            let target = destination.join(incremental_file_path(file));
+            match file {
+                IncrementalForkFile::Replacement {
+                    bytes,
+                    payload,
+                    digest,
+                    ..
+                } => {
+                    let payload = checkpoint_payload_path(&checkpoint, payload)?;
+                    if blake3_file(&payload)? != *digest {
+                        return Err(Error::agent("durable restore", "checkpoint replacement payload digest changed"));
+                    }
+                    let metadata = fs::metadata(&payload).map_err(|error| Error::agent("durable restore", error.to_string()))?;
+                    if metadata.len() != *bytes {
+                        return Err(Error::agent("durable restore", "checkpoint replacement payload length changed"));
+                    }
+                    fs::remove_file(&target).map_err(|error| Error::agent("durable restore", error.to_string()))?;
+                    copy_checkpoint_file(&payload, &target)?;
+                }
+                IncrementalForkFile::Blocks {
+                    bytes,
+                    payload,
+                    digest,
+                    changed_blocks,
+                    ..
+                } => {
+                    let payload = checkpoint_payload_path(&checkpoint, payload)?;
+                    if blake3_file(&payload)? != *digest {
+                        return Err(Error::agent("durable restore", "checkpoint block payload digest changed"));
+                    }
+                    apply_block_delta(&target, &payload, *bytes, *changed_blocks)?;
+                }
+            }
+        }
+        let receipt = DurableForkCheckpoint {
+            schema_version: DURABLE_FORK_SCHEMA_VERSION,
+            materializer_abi: DURABLE_FORK_MATERIALIZER_ABI.to_string(),
+            source_name: delta.source_name,
+            source_config_fingerprint: delta.source_config_fingerprint,
+            source_record: delta.source_record,
+            files: durable_checkpoint_files(destination)?,
+        };
+        write_durable_checkpoint_receipt(destination, &receipt)?;
+        sync_directory(destination)?;
+        Ok(receipt)
+    } else {
+        let receipt = read_durable_checkpoint_receipt(&checkpoint)?;
+        validate_durable_checkpoint_receipt(&checkpoint, &receipt)?;
+        for file in &receipt.files {
+            let source = checkpoint.join(&file.path);
+            let target = destination.join(&file.path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|error| Error::agent("durable restore", error.to_string()))?;
+            }
+            copy_checkpoint_file(&source, &target)?;
+        }
+        let materialized = DurableForkCheckpoint {
+            schema_version: receipt.schema_version,
+            materializer_abi: receipt.materializer_abi,
+            source_name: receipt.source_name,
+            source_config_fingerprint: receipt.source_config_fingerprint,
+            source_record: receipt.source_record,
+            files: durable_checkpoint_files(destination)?,
+        };
+        write_durable_checkpoint_receipt(destination, &materialized)?;
+        sync_directory(destination)?;
+        Ok(materialized)
+    }
+}
+
+fn checkpoint_chain_depth(checkpoint: &Path, recursion_depth: u32) -> Result<u32> {
+    if recursion_depth > INCREMENTAL_FORK_MAX_CHAIN_DEPTH {
+        return Err(Error::agent("durable checkpoint", "checkpoint parent chain exceeds the supported depth"));
+    }
+    let checkpoint = canonical_checkpoint_root(checkpoint)?;
+    if checkpoint.join(INCREMENTAL_FORK_RECEIPT_NAME).exists() {
+        let delta = read_incremental_fork_checkpoint(&checkpoint)?;
+        validate_incremental_fork_checkpoint(&checkpoint, &delta)?;
+        let parent = canonical_checkpoint_root(&delta.parent.checkpoint_root)?;
+        if checkpoint_receipt_digest(&parent)? != delta.parent.receipt_digest {
+            return Err(Error::agent("durable checkpoint", "checkpoint parent receipt digest changed"));
+        }
+        let depth = checkpoint_chain_depth(&parent, recursion_depth + 1)? + 1;
+        if delta.chain_depth != depth {
+            return Err(Error::agent("durable checkpoint", "checkpoint parent chain depth is invalid"));
+        }
+        Ok(depth)
+    } else {
+        let receipt = read_durable_checkpoint_receipt(&checkpoint)?;
+        validate_durable_checkpoint_receipt(&checkpoint, &receipt)?;
+        Ok(0)
+    }
+}
+
+fn incremental_file_path(file: &IncrementalForkFile) -> &str {
+    match file {
+        IncrementalForkFile::Replacement { path, .. } | IncrementalForkFile::Blocks { path, .. } => path,
+    }
+}
+
+fn checkpoint_payload_path(checkpoint: &Path, payload: &str) -> Result<PathBuf> {
+    let relative = Path::new(payload);
+    safe_durable_relative_path(relative)?;
+    let path = checkpoint.join(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| Error::agent("durable restore", format!("inspect checkpoint payload {}: {error}", path.display())))?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::agent("durable restore", format!("checkpoint payload is not a regular file: {}", path.display())));
+    }
+    Ok(path)
+}
+
+fn canonical_checkpoint_root(root: &Path) -> Result<PathBuf> {
+    validate_durable_checkpoint_root(root)?;
+    fs::canonicalize(root).map_err(|error| Error::agent("durable checkpoint", format!("canonicalize checkpoint {}: {error}", root.display())))
+}
+
+fn checkpoint_receipt_digest(root: &Path) -> Result<String> {
+    let root = canonical_checkpoint_root(root)?;
+    let normal = root.join(DURABLE_FORK_RECEIPT_NAME);
+    let delta = root.join(INCREMENTAL_FORK_RECEIPT_NAME);
+    let receipt = if normal.exists() { normal } else { delta };
+    let metadata = fs::symlink_metadata(&receipt)
+        .map_err(|error| Error::agent("durable checkpoint", format!("inspect checkpoint receipt {}: {error}", receipt.display())))?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::agent("durable checkpoint", "checkpoint receipt is not a regular file"));
+    }
+    blake3_file(&receipt)
+}
+
+fn read_incremental_fork_checkpoint(root: &Path) -> Result<IncrementalForkCheckpoint> {
+    let path = root.join(INCREMENTAL_FORK_RECEIPT_NAME);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| Error::agent("durable restore", format!("inspect delta receipt {}: {error}", path.display())))?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::agent("durable restore", format!("delta receipt is not a regular file: {}", path.display())));
+    }
+    let bytes = fs::read(&path)
+        .map_err(|error| Error::agent("durable restore", format!("read delta receipt {}: {error}", path.display())))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| Error::agent("durable restore", format!("decode delta receipt: {error}")))
+}
+
+fn write_incremental_fork_receipt(root: &Path, receipt: &IncrementalForkCheckpoint) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(receipt)
+        .map_err(|error| Error::agent("durable checkpoint", format!("encode delta receipt: {error}")))?;
+    write_durable_file(&root.join(INCREMENTAL_FORK_RECEIPT_NAME), &bytes)
+}
+
+fn validate_incremental_fork_checkpoint(root: &Path, receipt: &IncrementalForkCheckpoint) -> Result<()> {
+    if receipt.schema_version != INCREMENTAL_FORK_SCHEMA_VERSION
+        || receipt.materializer_abi != INCREMENTAL_FORK_MATERIALIZER_ABI
+    {
+        return Err(Error::agent("durable restore", "checkpoint delta ABI is unsupported"));
+    }
+    if receipt.chain_depth == 0 || receipt.chain_depth > INCREMENTAL_FORK_MAX_CHAIN_DEPTH {
+        return Err(Error::agent("durable restore", "checkpoint delta has an unsupported chain depth"));
+    }
+    if receipt.parent.checkpoint_root == root || !receipt.parent.checkpoint_root.is_absolute() {
+        return Err(Error::agent("durable restore", "checkpoint delta parent path is unsafe"));
+    }
+    if receipt.parent.receipt_digest.len() != 64
+        || !receipt.parent.receipt_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::agent("durable restore", "checkpoint delta parent digest is invalid"));
+    }
+    let mut paths = BTreeSet::new();
+    let mut payloads = BTreeSet::new();
+    for file in &receipt.files {
+        let path = incremental_file_path(file);
+        safe_durable_relative_path(Path::new(path))?;
+        if !paths.insert(path) {
+            return Err(Error::agent("durable restore", "checkpoint delta repeats a file path"));
+        }
+        let (bytes, payload, digest) = match file {
+            IncrementalForkFile::Replacement { bytes, payload, digest, .. }
+            | IncrementalForkFile::Blocks { bytes, payload, digest, .. } => (bytes, payload, digest),
+        };
+        if *bytes == 0 || digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::agent("durable restore", "checkpoint delta has an invalid file receipt"));
+        }
+        safe_durable_relative_path(Path::new(payload))?;
+        if !payloads.insert(payload) {
+            return Err(Error::agent("durable restore", "checkpoint delta repeats a payload path"));
+        }
+    }
+    if receipt.files.is_empty() {
+        return Err(Error::agent("durable restore", "checkpoint delta contains no files"));
+    }
+    Ok(())
+}
+
+fn copy_checkpoint_file(source: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        return Err(Error::agent("durable restore", format!("checkpoint materialization destination exists: {}", destination.display())));
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        clone_regular_file_apfs(source, destination)
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        fs::copy(source, destination)
+            .map_err(|error| Error::agent("durable restore", format!("copy checkpoint file {}: {error}", source.display())))?;
+        Ok(())
+    }
+}
+
+fn write_block_delta(parent: &Path, child: &Path, output: &Path) -> Result<u64> {
+    let parent_metadata = fs::metadata(parent).map_err(|error| Error::agent("durable checkpoint", error.to_string()))?;
+    let child_metadata = fs::metadata(child).map_err(|error| Error::agent("durable checkpoint", error.to_string()))?;
+    if parent_metadata.len() != child_metadata.len() {
+        return Err(Error::agent("durable checkpoint", "checkpoint block delta requires equal parent and child file lengths"));
+    }
+    let mut parent = File::open(parent).map_err(|error| Error::agent("durable checkpoint", error.to_string()))?;
+    let mut child = File::open(child).map_err(|error| Error::agent("durable checkpoint", error.to_string()))?;
+    let mut output = OpenOptions::new().write(true).create_new(true).open(output)
+        .map_err(|error| Error::agent("durable checkpoint", error.to_string()))?;
+    output.write_all(&INCREMENTAL_FORK_PATCH_MAGIC).and_then(|()| output.write_all(&1_u32.to_le_bytes()))
+        .and_then(|()| output.write_all(&child_metadata.len().to_le_bytes()))
+        .and_then(|()| output.write_all(&(INCREMENTAL_FORK_BLOCK_BYTES as u32).to_le_bytes()))
+        .and_then(|()| output.write_all(&0_u64.to_le_bytes()))
+        .map_err(|error| Error::agent("durable checkpoint", format!("write delta header: {error}")))?;
+    let mut parent_buffer = [0_u8; INCREMENTAL_FORK_BLOCK_BYTES];
+    let mut child_buffer = [0_u8; INCREMENTAL_FORK_BLOCK_BYTES];
+    let mut remaining = child_metadata.len();
+    let mut block = 0_u64;
+    let mut changed = 0_u64;
+    while remaining > 0 {
+        let length = remaining.min(INCREMENTAL_FORK_BLOCK_BYTES as u64) as usize;
+        parent.read_exact(&mut parent_buffer[..length]).map_err(|error| Error::agent("durable checkpoint", error.to_string()))?;
+        child.read_exact(&mut child_buffer[..length]).map_err(|error| Error::agent("durable checkpoint", error.to_string()))?;
+        if parent_buffer[..length] != child_buffer[..length] {
+            output.write_all(&block.to_le_bytes()).and_then(|()| output.write_all(&child_buffer[..length]))
+                .map_err(|error| Error::agent("durable checkpoint", format!("write delta block: {error}")))?;
+            changed += 1;
+        }
+        remaining -= length as u64;
+        block += 1;
+    }
+    output.seek(SeekFrom::Start(24)).and_then(|_| output.write_all(&changed.to_le_bytes())).and_then(|()| output.sync_all())
+        .map_err(|error| Error::agent("durable checkpoint", format!("seal delta blocks: {error}")))?;
+    Ok(changed)
+}
+
+fn apply_block_delta(target: &Path, payload: &Path, expected_bytes: u64, expected_changed: u64) -> Result<()> {
+    let mut payload = File::open(payload).map_err(|error| Error::agent("durable restore", error.to_string()))?;
+    let mut magic = [0_u8; 8];
+    payload.read_exact(&mut magic).map_err(|error| Error::agent("durable restore", error.to_string()))?;
+    let version = read_u32(&mut payload)?;
+    let bytes = read_u64(&mut payload)?;
+    let block_bytes = read_u32(&mut payload)?;
+    let changed = read_u64(&mut payload)?;
+    if magic != INCREMENTAL_FORK_PATCH_MAGIC || version != 1 || bytes != expected_bytes
+        || block_bytes != INCREMENTAL_FORK_BLOCK_BYTES as u32 || changed != expected_changed
+    {
+        return Err(Error::agent("durable restore", "checkpoint block payload header is invalid"));
+    }
+    let metadata = fs::metadata(target).map_err(|error| Error::agent("durable restore", error.to_string()))?;
+    if metadata.len() != expected_bytes {
+        return Err(Error::agent("durable restore", "checkpoint delta parent file length is invalid"));
+    }
+    let mut target = OpenOptions::new().write(true).open(target)
+        .map_err(|error| Error::agent("durable restore", error.to_string()))?;
+    let mut previous = None;
+    let blocks = (expected_bytes + INCREMENTAL_FORK_BLOCK_BYTES as u64 - 1) / INCREMENTAL_FORK_BLOCK_BYTES as u64;
+    for _ in 0..changed {
+        let block = read_u64(&mut payload)?;
+        if block >= blocks || previous.is_some_and(|previous| block <= previous) {
+            return Err(Error::agent("durable restore", "checkpoint block payload order is invalid"));
+        }
+        previous = Some(block);
+        let length = (expected_bytes - block * INCREMENTAL_FORK_BLOCK_BYTES as u64)
+            .min(INCREMENTAL_FORK_BLOCK_BYTES as u64) as usize;
+        let mut bytes = vec![0_u8; length];
+        payload.read_exact(&mut bytes).map_err(|error| Error::agent("durable restore", error.to_string()))?;
+        target.seek(SeekFrom::Start(block * INCREMENTAL_FORK_BLOCK_BYTES as u64))
+            .and_then(|_| target.write_all(&bytes))
+            .map_err(|error| Error::agent("durable restore", format!("apply checkpoint delta block: {error}")))?;
+    }
+    if payload.read(&mut [0_u8; 1]).map_err(|error| Error::agent("durable restore", error.to_string()))? != 0 {
+        return Err(Error::agent("durable restore", "checkpoint block payload has trailing bytes"));
+    }
+    target.sync_all().map_err(|error| Error::agent("durable restore", error.to_string()))
+}
+
+fn read_u32(file: &mut File) -> Result<u32> {
+    let mut bytes = [0_u8; 4];
+    file.read_exact(&mut bytes).map_err(|error| Error::agent("durable restore", error.to_string()))?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(file: &mut File) -> Result<u64> {
+    let mut bytes = [0_u8; 8];
+    file.read_exact(&mut bytes).map_err(|error| Error::agent("durable restore", error.to_string()))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn sync_directory(directory: &Path) -> Result<()> {
@@ -3286,6 +3905,186 @@ mod tests {
                 ram.integrity,
                 DurableForkFileIntegrity::FileIdentity { .. }
             ));
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(root);
+        result.unwrap();
+    }
+
+    fn write_test_full_checkpoint(root: &Path, ram: &[u8], storage: &[u8]) -> DurableForkCheckpoint {
+        fs::create_dir(root).expect("create checkpoint root");
+        fs::create_dir(root.join(DURABLE_FORK_RAM_DIR)).expect("create RAM root");
+        fs::create_dir(root.join(DURABLE_FORK_DISKS_DIR)).expect("create disk root");
+        fs::write(root.join(DURABLE_FORK_CHECKPOINT_FILE), b"device-state-v1")
+            .expect("write control checkpoint");
+        fs::write(root.join(DURABLE_FORK_MANIFEST_FILE), b"ram-manifest-v1")
+            .expect("write control manifest");
+        fs::write(root.join(DURABLE_FORK_RAM_DIR).join("0000.ram"), ram)
+            .expect("write RAM");
+        fs::write(root.join(DURABLE_FORK_DISKS_DIR).join("storage.raw"), storage)
+            .expect("write storage");
+        fs::write(root.join(DURABLE_FORK_DISKS_DIR).join("overlay.raw"), storage)
+            .expect("write overlay");
+        let record = durable_checkpoint_record();
+        let receipt = DurableForkCheckpoint {
+            schema_version: DURABLE_FORK_SCHEMA_VERSION,
+            materializer_abi: DURABLE_FORK_MATERIALIZER_ABI.to_string(),
+            source_name: record.name.clone(),
+            source_config_fingerprint: durable_fork_config_fingerprint(&record)
+                .expect("fingerprint"),
+            source_record: record,
+            files: durable_checkpoint_files(root).expect("checkpoint files"),
+        };
+        write_durable_checkpoint_receipt(root, &receipt).expect("write checkpoint receipt");
+        receipt
+    }
+
+    #[test]
+    fn incremental_checkpoint_keeps_only_changed_blocks_and_materializes_exact_state() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "smolvm-incremental-checkpoint-{}-{serial}",
+            std::process::id()
+        ));
+        let result = (|| -> Result<()> {
+            fs::create_dir(&root).map_err(|error| Error::agent("test", error.to_string()))?;
+            let base_ram = vec![0_u8; INCREMENTAL_FORK_BLOCK_BYTES * 3];
+            let base_storage = vec![3_u8; INCREMENTAL_FORK_BLOCK_BYTES * 3];
+            let base = root.join("base");
+            write_test_full_checkpoint(&base, &base_ram, &base_storage);
+
+            let mut child_ram = base_ram.clone();
+            child_ram[INCREMENTAL_FORK_BLOCK_BYTES + 19] = 9;
+            let child = root.join("child");
+            let child_receipt = write_test_full_checkpoint(&child, &child_ram, &base_storage);
+            convert_full_checkpoint_to_delta(&child, &child_receipt, &base)?;
+
+            assert!(child.join(INCREMENTAL_FORK_RECEIPT_NAME).is_file());
+            assert!(!child.join(DURABLE_FORK_RAM_DIR).exists());
+            assert!(!child.join(DURABLE_FORK_DISKS_DIR).exists());
+            assert_eq!(checkpoint_chain_depth(&child, 0)?, 1);
+            let child_delta = read_incremental_fork_checkpoint(&child)?;
+            assert_eq!(
+                child_delta
+                    .files
+                    .iter()
+                    .map(|file| match file {
+                        IncrementalForkFile::Blocks { changed_blocks, .. } => *changed_blocks,
+                        IncrementalForkFile::Replacement { .. } => 0,
+                    })
+                    .sum::<u64>(),
+                1,
+                "one tiny write changes one 4 KiB replay block"
+            );
+
+            let materialized = root.join("materialized");
+            let restored = materialize_checkpoint_chain(&child, &materialized, 0)?;
+            assert_eq!(restored.source_name, "sentry-backend");
+            assert_eq!(
+                fs::read(materialized.join(DURABLE_FORK_RAM_DIR).join("0000.ram"))
+                    .expect("read materialized RAM"),
+                child_ram
+            );
+            assert_eq!(
+                fs::read(materialized.join(DURABLE_FORK_DISKS_DIR).join("storage.raw"))
+                    .expect("read materialized storage"),
+                base_storage
+            );
+
+            // A checkpoint taken after restoring this intermediate state has
+            // only bounded control replacements and empty block streams. It
+            // cannot accidentally republish a logical RAM/disk copy.
+            let no_op = root.join("no-op-after-restore");
+            let no_op_receipt = write_test_full_checkpoint(&no_op, &child_ram, &base_storage);
+            convert_full_checkpoint_to_delta(&no_op, &no_op_receipt, &child)?;
+            let no_op_delta = read_incremental_fork_checkpoint(&no_op)?;
+            assert_eq!(checkpoint_chain_depth(&no_op, 0)?, 2);
+            assert!(no_op_delta.files.iter().all(|file| {
+                !matches!(file, IncrementalForkFile::Blocks { changed_blocks, .. } if *changed_blocks != 0)
+            }));
+            assert!(!no_op.join(DURABLE_FORK_RAM_DIR).exists());
+            assert!(!no_op.join(DURABLE_FORK_DISKS_DIR).exists());
+            let restored_no_op = root.join("materialized-no-op");
+            materialize_checkpoint_chain(&no_op, &restored_no_op, 0)?;
+            assert_eq!(
+                fs::read(restored_no_op.join(DURABLE_FORK_RAM_DIR).join("0000.ram"))
+                    .expect("read no-op materialized RAM"),
+                child_ram
+            );
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn incremental_checkpoint_rejects_a_tampered_parent_receipt() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "smolvm-incremental-parent-tamper-{}-{serial}",
+            std::process::id()
+        ));
+        let result = (|| -> Result<()> {
+            fs::create_dir(&root).map_err(|error| Error::agent("test", error.to_string()))?;
+            let bytes = vec![0_u8; INCREMENTAL_FORK_BLOCK_BYTES];
+            let base = root.join("base");
+            write_test_full_checkpoint(&base, &bytes, &bytes);
+            let child = root.join("child");
+            let child_receipt = write_test_full_checkpoint(&child, &bytes, &bytes);
+            convert_full_checkpoint_to_delta(&child, &child_receipt, &base)?;
+            fs::write(base.join(DURABLE_FORK_RECEIPT_NAME), b"tampered")
+                .map_err(|error| Error::agent("test", error.to_string()))?;
+            assert!(materialize_checkpoint_chain(&child, &root.join("materialized"), 0).is_err());
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(root);
+        result.unwrap();
+    }
+
+    #[test]
+    fn incremental_checkpoint_rejects_missing_wrong_and_unsupported_parent_chains() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SERIAL: AtomicU64 = AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "smolvm-incremental-chain-rejection-{}-{serial}",
+            std::process::id()
+        ));
+        let result = (|| -> Result<()> {
+            fs::create_dir(&root).map_err(|error| Error::agent("test", error.to_string()))?;
+            let bytes = vec![0_u8; INCREMENTAL_FORK_BLOCK_BYTES];
+            let base = root.join("base");
+            write_test_full_checkpoint(&base, &bytes, &bytes);
+
+            let wrong_parent = root.join("wrong-parent");
+            let mut wrong_receipt = write_test_full_checkpoint(&wrong_parent, &bytes, &bytes);
+            wrong_receipt.source_config_fingerprint = "wrong-lineage".into();
+            write_durable_checkpoint_receipt(&wrong_parent, &wrong_receipt)?;
+            let rejected = root.join("rejected-at-capture");
+            let rejected_receipt = write_test_full_checkpoint(&rejected, &bytes, &bytes);
+            assert!(convert_full_checkpoint_to_delta(&rejected, &rejected_receipt, &wrong_parent).is_err());
+
+            let child = root.join("child");
+            let child_receipt = write_test_full_checkpoint(&child, &bytes, &bytes);
+            convert_full_checkpoint_to_delta(&child, &child_receipt, &base)?;
+            let mut delta = read_incremental_fork_checkpoint(&child)?;
+            delta.parent.checkpoint_root = root.join("missing-parent");
+            write_incremental_fork_receipt(&child, &delta)?;
+            assert!(materialize_checkpoint_chain(&child, &root.join("missing-materialized"), 0).is_err());
+
+            delta.parent.checkpoint_root = fs::canonicalize(&base)
+                .map_err(|error| Error::agent("test", error.to_string()))?;
+            delta.parent.receipt_digest = checkpoint_receipt_digest(&base)?;
+            delta.chain_depth = INCREMENTAL_FORK_MAX_CHAIN_DEPTH + 1;
+            write_incremental_fork_receipt(&child, &delta)?;
+            assert!(materialize_checkpoint_chain(&child, &root.join("deep-materialized"), 0).is_err());
             Ok(())
         })();
         let _ = fs::remove_dir_all(root);
