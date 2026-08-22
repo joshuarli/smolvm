@@ -14,6 +14,7 @@ use crate::blocking_io::BlockingFile;
 use crate::{OciManifest, RegistryError, Result, LAYER_MEDIA_TYPE};
 use futures_util::StreamExt;
 use futures_lite::io::AsyncWriteExt;
+use hyper::rt::Timer;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -210,7 +211,7 @@ async fn download_with_resume(
                     error = %e,
                     "blob download failed; resuming after backoff"
                 );
-                async_io::Timer::after(backoff).await;
+                h12tiny::runtime::AsyncIoTimer.sleep(backoff).await;
             }
             Err(e) => return Err(e),
         }
@@ -242,7 +243,7 @@ async fn fetch_into_partial(
     let mut written = resumed_at;
     let mut stream = std::pin::pin!(stream);
     while let Some(chunk_result) = stream.next().await {
-        let chunk: bytes::Bytes = chunk_result.map_err(RegistryError::Http)?;
+        let chunk = chunk_result?;
         std::io::Write::write_all(&mut file, &chunk)?;
         written += chunk.len() as u64;
     }
