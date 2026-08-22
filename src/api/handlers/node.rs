@@ -111,8 +111,8 @@ mod tests {
         assert!(cap.get("cuda_devices").is_none());
     }
 
-    #[tokio::test]
-    async fn capacity_reports_fresh_cuda_inventory() {
+    #[test]
+    fn capacity_reports_fresh_cuda_inventory() {
         let dir = tempfile::tempdir().unwrap();
         let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
         let state = Arc::new(ApiState::with_db(db));
@@ -126,9 +126,13 @@ mod tests {
             total_memory_mib: 80_000,
         }]));
 
-        let resp = capacity(State(state)).await;
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let resp = runtime.block_on(capacity(State(state)));
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = runtime
+            .block_on(resp.into_body().collect())
+            .unwrap()
+            .to_bytes();
         let cap: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(cap["cuda_devices"][0]["ordinal"], 0);
         assert_eq!(cap["cuda_devices"][0]["uuid"], "GPU-test");
