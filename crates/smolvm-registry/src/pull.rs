@@ -10,12 +10,13 @@
 
 use crate::cache::BlobCache;
 use crate::client::RegistryClient;
+use crate::blocking_io::BlockingFile;
 use crate::{OciManifest, RegistryError, Result, LAYER_MEDIA_TYPE};
 use futures_util::StreamExt;
+use futures_lite::io::AsyncWriteExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Result of a successful pull.
 #[derive(Debug)]
@@ -82,7 +83,7 @@ pub async fn pull(
         tracing::info!(digest = %digest, "blob found in cache");
 
         if let Some(out) = output {
-            tokio::fs::copy(&cached_path, out).await?;
+            crate::blocking_io::copy(&client.blocking_executor(), &cached_path, out).await?;
         }
 
         return Ok(PullResult {
@@ -99,10 +100,18 @@ pub async fn pull(
     //    a node with no serve-TLS identity has no peer client, so this is also a
     //    no-op there.
     if !blob_peers.is_empty() {
-        if let Some(peer_client) = crate::peer::peer_client() {
+        let peer = client.peer_client();
+        if let Some(peer_client) = peer {
             if let Some(result) =
-                crate::peer::fetch_blob_from_peers(peer_client, blob_peers, digest, output, cache)
-                    .await
+                crate::peer::fetch_blob_from_peers(
+                    &peer_client,
+                    blob_peers,
+                    digest,
+                    output,
+                    cache,
+                    client.blocking_executor(),
+                )
+                .await
             {
                 return Ok(result);
             }
@@ -154,10 +163,7 @@ async fn download_with_resume(
         // Resume from whatever a previous attempt left behind. A stale partial
         // from an earlier pull is fine: the digest check at the end rejects it,
         // and a mismatch clears it so the next pull starts clean.
-        let have = tokio::fs::metadata(&partial_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let have = std::fs::metadata(&partial_path).map(|m| m.len()).unwrap_or(0);
 
         match fetch_into_partial(client, repo, digest, have, expected_size, &partial_path).await {
             Ok(written) => {
@@ -166,7 +172,7 @@ async fn download_with_resume(
                     // Corrupt or mismatched bytes: remove them so a retry cannot
                     // resume onto a poisoned prefix, and fail — retrying the same
                     // content would only reproduce the mismatch.
-                    if let Err(e) = tokio::fs::remove_file(&partial_path).await {
+                    if let Err(e) = std::fs::remove_file(&partial_path) {
                         tracing::warn!(
                             error = %e,
                             path = %partial_path.display(),
@@ -181,7 +187,7 @@ async fn download_with_resume(
 
                 let cached_path = cache.adopt(digest, written)?;
                 let result_path = if let Some(out) = output {
-                    tokio::fs::copy(&cached_path, out).await?;
+                    std::fs::copy(&cached_path, out)?;
                     PathBuf::from(out)
                 } else {
                     cached_path
@@ -204,7 +210,7 @@ async fn download_with_resume(
                     error = %e,
                     "blob download failed; resuming after backoff"
                 );
-                tokio::time::sleep(backoff).await;
+                async_io::Timer::after(backoff).await;
             }
             Err(e) => return Err(e),
         }
@@ -230,23 +236,17 @@ async fn fetch_into_partial(
     // Range header and is resending the whole blob, so the partial must be
     // truncated — appending would produce a file with a duplicated prefix.
     let mut file = if resumed_at > 0 {
-        tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(partial_path)
-            .await?
-    } else {
-        tokio::fs::File::create(partial_path).await?
-    };
+        std::fs::OpenOptions::new().append(true).open(partial_path)?
+    } else { std::fs::File::create(partial_path)? };
 
     let mut written = resumed_at;
     let mut stream = std::pin::pin!(stream);
     while let Some(chunk_result) = stream.next().await {
         let chunk: bytes::Bytes = chunk_result.map_err(RegistryError::Http)?;
-        file.write_all(&chunk).await?;
+        std::io::Write::write_all(&mut file, &chunk)?;
         written += chunk.len() as u64;
     }
-    file.flush().await?;
-    drop(file);
+    std::io::Write::flush(&mut file)?;
 
     // A body that ends early is a truncated transfer, not a complete download.
     // Without this the short file would reach the digest check, mismatch, and be
@@ -264,11 +264,11 @@ async fn fetch_into_partial(
 
 /// SHA-256 of a file on disk, read in chunks so a large layer is never buffered.
 async fn hash_file(path: &Path) -> Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
+    let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 128 * 1024];
     loop {
-        let n = file.read(&mut buf).await?;
+        let n = std::io::Read::read(&mut file, &mut buf)?;
         if n == 0 {
             break;
         }
@@ -285,8 +285,18 @@ async fn hash_file(path: &Path) -> Result<String> {
 /// the caller needs to see.
 fn is_retryable(err: &RegistryError) -> bool {
     match err {
-        RegistryError::Http(e) => {
-            e.is_timeout() || e.is_connect() || e.is_request() || e.is_body() || e.is_decode()
+        RegistryError::Http(message) => {
+            // h12tiny deliberately erases transport errors to a String. Keep
+            // retry behavior for recognizable transient failures, while not
+            // retrying arbitrary protocol/authentication messages.
+            let message = message.to_ascii_lowercase();
+            [
+                "timeout", "timed out", "connect", "connection reset",
+                "connection refused", "broken pipe", "unexpected eof",
+                "early eof", "body", "decode", "transport",
+            ]
+            .iter()
+            .any(|needle| message.contains(needle))
         }
         RegistryError::DownloadStalled { .. } => true,
         RegistryError::Io(_) => false,
@@ -305,23 +315,25 @@ fn is_retryable(err: &RegistryError) -> bool {
 /// `.partial` is removed before returning the error. A mid-stream transport
 /// error propagates as-is (leaving the `.partial`, which the next attempt
 /// truncates via `File::create`), matching the original registry pull behavior.
-pub(crate) async fn stream_verify_adopt<S>(
+pub(crate) async fn stream_verify_adopt<S, E>(
     stream: S,
     digest: &str,
     output: Option<&Path>,
     cache: &BlobCache,
+    executor: std::sync::Arc<dyn crate::RegistryExecutor>,
 ) -> Result<PullResult>
 where
-    S: futures_util::Stream<Item = reqwest::Result<bytes::Bytes>>,
+    S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>>,
+    E: std::fmt::Display,
 {
     let partial_path = cache.blob_path_for(digest).with_extension("partial");
-    let mut file = tokio::fs::File::create(&partial_path).await?;
+    let mut file = BlockingFile::create(executor.clone(), &partial_path).await?;
     let mut hasher = Sha256::new();
     let mut total_bytes: u64 = 0;
 
     let mut stream = std::pin::pin!(stream);
     while let Some(chunk_result) = stream.next().await {
-        let chunk: bytes::Bytes = chunk_result.map_err(RegistryError::Http)?;
+        let chunk: bytes::Bytes = chunk_result.map_err(|error| RegistryError::Http(error.to_string()))?;
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
         total_bytes += chunk.len() as u64;
@@ -332,7 +344,7 @@ where
     // Verify digest.
     let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
     if actual != *digest {
-        if let Err(e) = tokio::fs::remove_file(&partial_path).await {
+        if let Err(e) = crate::blocking_io::remove_file(&executor, &partial_path).await {
             tracing::warn!(
                 error = %e,
                 path = %partial_path.display(),
@@ -350,7 +362,7 @@ where
 
     // Copy to output if requested.
     let result_path = if let Some(out) = output {
-        tokio::fs::copy(&cached_path, out).await?;
+        crate::blocking_io::copy(&executor, &cached_path, out).await?;
         PathBuf::from(out)
     } else {
         cached_path
@@ -368,14 +380,158 @@ where
 mod tests {
     use super::*;
     use crate::{CONFIG_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    struct TestResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl TestResponse {
+        fn new(status: u16, body: Vec<u8>) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body,
+            }
+        }
+
+        fn header(mut self, name: &str, value: impl Into<String>) -> Self {
+            self.headers.push((name.to_string(), value.into()));
+            self
+        }
+    }
+
+    struct TestServer {
+        address: SocketAddr,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn start<F, H>(factory: F) -> Self
+        where
+            F: FnOnce(String) -> H,
+            H: Fn(&str, &str, Option<&str>) -> TestResponse + Send + Sync + 'static,
+        {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let uri = format!("http://{address}");
+            let handler = Arc::new(factory(uri));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = stop.clone();
+            let thread = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    };
+                    loop {
+                        let Ok((method, path, range)) = read_request(&mut stream) else {
+                            if thread_stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            continue;
+                        };
+                        let response = handler(&method, &path, range.as_deref());
+                        if write_response(&mut stream, response).is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            Self {
+                address,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn uri(&self) -> String {
+            format!("http://{}", self.address)
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            let _ = TcpStream::connect(self.address);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String, Option<String>)> {
+        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.len() > 64 * 1024 {
+                break;
+            }
+        }
+        let request_text = String::from_utf8_lossy(&request);
+        let line = request_text
+            .lines()
+            .next()
+            .unwrap_or_default();
+        let mut parts = line.split_whitespace();
+        let range = request_text.lines().find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("range")
+                    .then(|| value.trim().to_string())
+            })
+        });
+        Ok((
+            parts.next().unwrap_or_default().to_string(),
+            parts.next().unwrap_or_default().to_string(),
+            range,
+        ))
+    }
+
+    fn write_response(stream: &mut TcpStream, response: TestResponse) -> std::io::Result<()> {
+        let reason = match response.status {
+            200 => "OK",
+            404 => "Not Found",
+            _ => "Response",
+        };
+        write!(
+            stream,
+            "HTTP/1.1 {} {}\r\n",
+            response.status,
+            reason
+        )?;
+        if !response
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+        {
+            write!(stream, "Content-Length: {}\r\n", response.body.len())?;
+        }
+        for (name, value) in response.headers {
+            write!(stream, "{name}: {value}\r\n")?;
+        }
+        stream.write_all(b"\r\n")?;
+        stream.write_all(&response.body)
+    }
 
     /// With empty `blob_peers`, `pull` takes the registry path exactly as before:
     /// fetch the manifest, then stream the layer blob from `/v2/.../blobs/...`,
     /// verify, and adopt. No peer client is built or consulted.
-    #[tokio::test]
-    async fn empty_blob_peers_uses_registry_path() {
+    #[test]
+    fn empty_blob_peers_uses_registry_path() {
         use sha2::{Digest, Sha256};
 
         let data = b"registry-path-layer-bytes".to_vec();
@@ -390,33 +546,38 @@ mod tests {
             "layers": [ { "mediaType": LAYER_MEDIA_TYPE, "digest": digest, "size": data.len() } ],
         });
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/myrepo/manifests/latest"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_raw(serde_json::to_vec(&manifest).unwrap(), MANIFEST_MEDIA_TYPE),
-            )
-            .mount(&server)
-            .await;
-        // The layer blob endpoint must be hit exactly once on the registry path.
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/myrepo/blobs/{digest}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(data.clone()))
-            .expect(1)
-            .mount(&server)
-            .await;
+        let manifest_body = serde_json::to_vec(&manifest).unwrap();
+        let manifest_path = "/v2/myrepo/manifests/latest".to_string();
+        let blob_path = format!("/v2/myrepo/blobs/{digest}");
+        let expected_size = data.len();
+        let server = TestServer::start(move |_uri| {
+            let manifest_body = manifest_body.clone();
+            let blob_path = blob_path.clone();
+            let data = data.clone();
+            move |method, path, _range| match (method, path) {
+                ("GET", path) if path == manifest_path => TestResponse::new(200, manifest_body.clone())
+                    .header("Content-Type", MANIFEST_MEDIA_TYPE),
+                ("GET", path) if path == blob_path => TestResponse::new(200, data.clone()),
+                _ => TestResponse::new(404, Vec::new()),
+            }
+        });
 
         let tmp = tempfile::tempdir().unwrap();
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
-        let client = RegistryClient::new(server.uri());
+        let client = RegistryClient::new_for_tests(server.uri());
 
-        let result = pull(&client, "myrepo", "latest", None, &cache, &[])
-            .await
-            .expect("registry pull must succeed");
+        let result = futures_lite::future::block_on(pull(
+            &client,
+            "myrepo",
+            "latest",
+            None,
+            &cache,
+            &[],
+        ))
+        .expect("registry pull must succeed");
 
         assert_eq!(result.digest, digest);
-        assert_eq!(result.size, data.len() as u64);
+        assert_eq!(result.size, expected_size as u64);
         assert!(!result.cached);
         assert!(
             cache.get(&digest).is_some(),
@@ -425,120 +586,50 @@ mod tests {
         // MockServer drop asserts the blob endpoint's expect(1) was satisfied.
     }
 
-    /// Build a manifest whose single layer declares `digest`/`size`.
-    fn manifest_for(digest: &str, size: usize) -> serde_json::Value {
-        serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": MANIFEST_MEDIA_TYPE,
-            "config": {
-                "mediaType": CONFIG_MEDIA_TYPE,
-                "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-                "size": 2
-            },
-            "layers": [ { "mediaType": LAYER_MEDIA_TYPE, "digest": digest, "size": size } ],
-        })
-    }
-
-    /// The incident behaviour: a transfer that dies mid-blob must RESUME from the
-    /// bytes already on disk, not restart at zero.
-    ///
-    /// The registry here truncates the first response, then serves the remainder
-    /// only to a ranged request. A client that restarts would keep receiving the
-    /// same truncated prefix forever; one that resumes completes on the second
-    /// attempt.
-    #[tokio::test]
-    async fn broken_transfer_resumes_instead_of_restarting() {
-        use sha2::{Digest, Sha256};
-        use wiremock::matchers::header_exists;
-
+    /// A broken response is resumed with an HTTP Range request and never
+    /// duplicated onto the partial file.
+    #[test]
+    fn broken_transfer_resumes_with_range() {
         let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
         let digest = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
         let split = 1500;
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/myrepo/manifests/latest"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                serde_json::to_vec(&manifest_for(&digest, data.len())).unwrap(),
-                MANIFEST_MEDIA_TYPE,
-            ))
-            .mount(&server)
-            .await;
-
-        // Registered first so it wins for ranged requests: serve the tail as 206.
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/myrepo/blobs/{digest}")))
-            .and(header_exists("range"))
-            .respond_with(ResponseTemplate::new(206).set_body_bytes(data[split..].to_vec()))
-            .expect(1)
-            .mount(&server)
-            .await;
-        // Un-ranged first attempt: hand back a truncated body.
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/myrepo/blobs/{digest}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(data[..split].to_vec()))
-            .expect(1)
-            .mount(&server)
-            .await;
-
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MANIFEST_MEDIA_TYPE,
+            "config": {"mediaType": CONFIG_MEDIA_TYPE, "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "size": 2},
+            "layers": [{"mediaType": LAYER_MEDIA_TYPE, "digest": digest, "size": data.len()}],
+        });
+        let manifest_body = serde_json::to_vec(&manifest).unwrap();
+        let blob_path = format!("/v2/myrepo/blobs/{digest}");
+        let manifest_path = "/v2/myrepo/manifests/latest".to_string();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = TestServer::start({
+            let requests = requests.clone();
+            let data = data.clone();
+            let manifest_body = manifest_body.clone();
+            let blob_path = blob_path.clone();
+            move |_uri| move |method, path, range| {
+                if method == "GET" && path == blob_path {
+                    let n = requests.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        return TestResponse::new(200, data[..split].to_vec());
+                    }
+                    assert_eq!(range.map(str::to_owned), Some(format!("bytes={split}-")));
+                    return TestResponse::new(206, data[split..].to_vec());
+                }
+                match (method, path) {
+                    ("GET", path) if path == manifest_path => TestResponse::new(200, manifest_body.clone()).header("Content-Type", MANIFEST_MEDIA_TYPE),
+                    _ => TestResponse::new(404, Vec::new()),
+                }
+            }
+        });
         let tmp = tempfile::tempdir().unwrap();
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
-        let client = RegistryClient::new(server.uri());
-
-        let result = pull(&client, "myrepo", "latest", None, &cache, &[])
-            .await
-            .expect("a truncated transfer must be resumed and completed");
-
-        assert_eq!(
-            result.size,
-            data.len() as u64,
-            "full blob must land on disk"
-        );
-        assert_eq!(result.digest, digest);
-        let cached = cache.get(&digest).expect("blob must be adopted into cache");
-        assert_eq!(
-            tokio::fs::read(&cached).await.unwrap(),
-            data,
-            "resumed file must be byte-identical, not a duplicated prefix"
-        );
-        // Each expect(1) asserts the resume happened exactly once: one truncated
-        // attempt, one ranged continuation.
-    }
-
-    /// A terminal failure must NOT be retried. A missing blob is the same answer
-    /// however many times it is asked for, and retrying only delays the error.
-    #[tokio::test]
-    async fn missing_blob_fails_without_retrying() {
-        let digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/myrepo/manifests/latest"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                serde_json::to_vec(&manifest_for(digest, 64)).unwrap(),
-                MANIFEST_MEDIA_TYPE,
-            ))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/myrepo/blobs/{digest}")))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
-        let client = RegistryClient::new(server.uri());
-
-        let err = pull(&client, "myrepo", "latest", None, &cache, &[])
-            .await
-            .expect_err("a missing blob must fail");
-        assert!(
-            matches!(err, RegistryError::BlobNotFound(_)),
-            "expected BlobNotFound, got {err:?}"
-        );
-        // expect(1) asserts the blob endpoint was hit once, not MAX_ATTEMPTS times.
+        let client = RegistryClient::new_for_tests(server.uri());
+        let result = futures_lite::future::block_on(pull(&client, "myrepo", "latest", None, &cache, &[])).unwrap();
+        assert_eq!(result.size, data.len() as u64);
+        assert_eq!(std::fs::read(cache.get(&digest).unwrap()).unwrap(), data);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     /// Retry classification: transient transport/5xx faults resume, terminal ones

@@ -1,10 +1,7 @@
 //! API error types with HTTP status mapping.
 
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
-};
+use h12tiny::web::{IntoResponse, Response, StatusCode};
+use crate::api::Json;
 use serde::Serialize;
 use std::fmt::Display;
 
@@ -48,6 +45,29 @@ impl ApiError {
         Self::Internal(format!("database error: {}", err))
     }
 }
+
+/// Preserve the public diagnostic message when an API error crosses an
+/// application-runtime boundary. Runtime task adapters require a displayable
+/// error, and formatting the domain error directly must not erase a useful
+/// client-safe cause behind a debug-only enum representation.
+impl Display for ApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unauthorized(message)
+            | Self::Forbidden(message)
+            | Self::NotFound(message)
+            | Self::Conflict(message)
+            | Self::PortConflict(message)
+            | Self::CloneIdentityRejuvenationFailed(message)
+            | Self::BadRequest(message)
+            | Self::Unavailable(message)
+            | Self::Internal(message) => formatter.write_str(message),
+            Self::Timeout => formatter.write_str("request timed out"),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 /// JSON error response body.
 #[derive(Serialize)]
@@ -124,16 +144,11 @@ pub fn classify_ensure_running_error(err: crate::Error) -> ApiError {
     }
 }
 
-impl From<tokio::task::JoinError> for ApiError {
-    fn from(err: tokio::task::JoinError) -> Self {
-        ApiError::Internal(format!("task failed: {}", err))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::StatusCode;
+    use h12tiny::util::BodyExt;
+    use h12tiny::web::StatusCode;
 
     #[test]
     fn test_api_error_status_codes() {
@@ -162,13 +177,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn clone_rejuvenation_failure_has_a_stable_public_code() {
+    #[test]
+    fn display_preserves_client_safe_message() {
+        assert_eq!(ApiError::Conflict("already exists".into()).to_string(), "already exists");
+        assert_eq!(ApiError::Timeout.to_string(), "request timed out");
+    }
+
+    #[test]
+    fn clone_rejuvenation_failure_has_a_stable_public_code() {
         let response = ApiError::CloneIdentityRejuvenationFailed("identity reset failed".into())
             .into_response();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = futures_lite::future::block_on(response.into_body().collect())
+            .unwrap()
+            .to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert_eq!(body["code"], "CLONE_IDENTITY_REJUVENATION_FAILED");

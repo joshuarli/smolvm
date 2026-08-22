@@ -1,10 +1,7 @@
 //! File I/O handlers — upload and download files to/from a running machine.
 
-use axum::{
-    body::Bytes,
-    extract::{Path, State},
-    Json,
-};
+use h12tiny::web::{Bytes, Extension, Path, State};
+use crate::api::Json;
 use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -44,7 +41,7 @@ pub struct FileUploadResponse {
 pub async fn upload_file(
     State(state): State<Arc<ApiState>>,
     Path((id, file_path)): Path<(String, String)>,
-    trace_id: Option<axum::Extension<TraceId>>,
+    trace_id: Option<Extension<TraceId>>,
     body: Bytes,
 ) -> Result<Json<FileUploadResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
@@ -60,7 +57,7 @@ pub async fn upload_file(
     let size = body.len() as u64;
 
     let overlay_id = id.clone();
-    with_machine_client_traced(&entry, tid, move |c| {
+    with_machine_client_traced(state.runtime()?, &entry, tid, move |c| {
         // For image machines, mount the per-machine persistent container overlay
         // (same id exec uses) so the file lands INSIDE the container, not the
         // read-only agent base. Pull the image first if it isn't present yet.
@@ -107,7 +104,7 @@ pub async fn upload_file(
 pub async fn download_file(
     State(state): State<Arc<ApiState>>,
     Path((id, file_path)): Path<(String, String)>,
-    trace_id: Option<axum::Extension<TraceId>>,
+    trace_id: Option<Extension<TraceId>>,
 ) -> Result<Bytes, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
     let entry = state.get_machine(&id)?;
@@ -121,7 +118,7 @@ pub async fn download_file(
     let guest_path = format!("/{}", file_path);
 
     let overlay_id = id.clone();
-    let data = with_machine_client_traced(&entry, tid, move |c| {
+    let data = with_machine_client_traced(state.runtime()?, &entry, tid, move |c| {
         // Read from inside the container overlay for image machines (matching
         // upload + exec), not the agent base.
         if let Some(ref image) = machine_image {

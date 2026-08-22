@@ -1,9 +1,11 @@
 //! Background reconciliation for automatic held-fork worker pools.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::sync::watch;
+use futures_lite::future;
+use futures_util::FutureExt;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::api::handlers::machines::{delete_one, fork_held_machines_inner, ForkHeldBatch};
 use crate::api::state::ApiState;
@@ -46,18 +48,18 @@ type RetainedSnapshotMap = Arc<
 /// Maintains each pool's clean-worker target and reaps finished leases.
 pub struct ForkPoolController {
     state: Arc<ApiState>,
-    shutdown_rx: watch::Receiver<bool>,
-    fills: tokio::task::JoinSet<String>,
+    shutdown: crate::runtime::Shutdown,
+    fills: FuturesUnordered<crate::runtime::RuntimeTask<Result<String, ()>>>,
     filling: std::collections::HashSet<String>,
     nvml: Option<crate::api::admission::NvmlSampler>,
     host_cpu: crate::api::admission::HostCpuSampler,
     retained_snapshots: RetainedSnapshotMap,
-    boot_slots: Arc<tokio::sync::Semaphore>,
+    boot_slots: Arc<crate::runtime::Semaphore>,
 }
 
 impl ForkPoolController {
     /// Create a controller sharing the API's durable state and shutdown signal.
-    pub fn new(state: Arc<ApiState>, shutdown_rx: watch::Receiver<bool>) -> Self {
+    pub fn new(state: Arc<ApiState>, shutdown: crate::runtime::Shutdown) -> Self {
         let nvml = match crate::api::admission::NvmlSampler::new() {
             Ok(nvml) => Some(nvml),
             Err(error) => {
@@ -82,14 +84,25 @@ impl ForkPoolController {
         };
         Self {
             state,
-            shutdown_rx,
-            fills: tokio::task::JoinSet::new(),
+            shutdown,
+            fills: FuturesUnordered::new(),
             filling: std::collections::HashSet::new(),
             nvml,
             host_cpu: crate::api::admission::HostCpuSampler::default(),
             retained_snapshots: Arc::new(parking_lot::Mutex::new(retained_snapshots)),
-            boot_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_POOL_BOOTS)),
+            boot_slots: Arc::new(crate::runtime::Semaphore::new(MAX_CONCURRENT_POOL_BOOTS)),
         }
+    }
+
+    async fn blocking<T, F>(state: &ApiState, function: F) -> Result<T, String>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        state
+            .blocking(function)
+            .await
+            .map_err(|error| format!("{error:?}"))
     }
 
     /// Reconcile until server shutdown.
@@ -101,48 +114,82 @@ impl ForkPoolController {
             tracing::warn!(%error, "failed to recover interrupted fork-pool provisioning");
         }
 
-        let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let reconcile_notify = self.state.pool_reconcile_notify();
         tracing::info!("fork pool controller started");
+        // The previous interval ticked immediately on its first poll. Preserve
+        // that startup behavior while keeping subsequent cadence owned by the
+        // app runtime's timer boundary.
+        if let Err(error) = self.reconcile_once(true).await {
+            tracing::warn!(%error, "fork pool reconciliation failed");
+        }
+        let mut next_tick = Instant::now() + RECONCILE_INTERVAL;
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    self.reap_fill_tasks();
+            enum Event {
+                Tick,
+                Notify,
+                Fill(Option<Result<String, ()>>),
+                Shutdown,
+            }
+            let tick = async {
+                crate::runtime::sleep_until(next_tick).await;
+                Event::Tick
+            };
+            let notify = async {
+                reconcile_notify.notified().await;
+                Event::Notify
+            };
+            let fill = async {
+                if self.fills.is_empty() {
+                    future::pending::<Event>().await
+                } else {
+                    Event::Fill(self.fills.next().await)
+                }
+            };
+            let shutdown = async {
+                self.shutdown.wait().await;
+                Event::Shutdown
+            };
+            let event = future::race(
+                future::race(tick, notify),
+                future::race(fill, shutdown),
+            )
+            .await;
+            match event {
+                Event::Tick => {
+                    // Advance from the instant this tick was observed. If a
+                    // reconciliation ran long, the next pass is one interval
+                    // away rather than replaying every missed tick.
+                    next_tick = Instant::now() + RECONCILE_INTERVAL;
                     if let Err(error) = self.reconcile_once(true).await {
                         tracing::warn!(%error, "fork pool reconciliation failed");
                     }
                 }
-                _ = reconcile_notify.notified() => {
-                    self.reap_fill_tasks();
+                Event::Notify => {
                     if let Err(error) = self.reconcile_once(false).await {
                         tracing::warn!(%error, "fork pool reconciliation failed");
                     }
                 }
-                result = self.fills.join_next(), if !self.fills.is_empty() => {
+                Event::Fill(result) => {
                     self.handle_fill_task(result);
                     if let Err(error) = self.reconcile_once(false).await {
                         tracing::warn!(%error, "fork pool reconciliation failed");
                     }
                 }
-                changed = self.shutdown_rx.changed() => {
-                    if changed.is_err() || *self.shutdown_rx.borrow() {
-                        self.fills.abort_all();
-                        tracing::info!("fork pool controller shutting down");
-                        break;
-                    }
+                Event::Shutdown => {
+                    tracing::info!("fork pool controller shutting down");
+                    break;
                 }
             }
         }
     }
 
-    fn handle_fill_task(&mut self, result: Option<Result<String, tokio::task::JoinError>>) {
+    fn handle_fill_task(&mut self, result: Option<Result<String, ()>>) {
         match result {
             Some(Ok(pool_name)) => {
                 self.filling.remove(&pool_name);
             }
-            Some(Err(error)) => {
-                tracing::warn!(%error, "fork pool fill task failed");
+            Some(Err(())) => {
+                tracing::warn!("fork pool fill task failed");
                 // A panic loses the task's return value, so conservatively
                 // allow every pool to be scheduled again. Slot reservations
                 // still prevent overfill if another task is winding down.
@@ -152,24 +199,16 @@ impl ForkPoolController {
         }
     }
 
-    fn reap_fill_tasks(&mut self) {
-        while let Some(result) = self.fills.try_join_next() {
-            self.handle_fill_task(Some(result));
-        }
-    }
-
     async fn recover_interrupted_provisioning(&self) -> Result<(), String> {
         let db = self.state.db().clone();
-        let pools = tokio::task::spawn_blocking(move || db.list_fork_pools())
-            .await
-            .map_err(|e| e.to_string())?
+        let pools = Self::blocking(&self.state, move || db.list_fork_pools())
+            .await?
             .map_err(|e| e.to_string())?;
         for pool in pools {
             let db = self.state.db().clone();
             let pool_name = pool.name.clone();
-            let slots = tokio::task::spawn_blocking(move || db.list_fork_pool_slots(&pool_name))
-                .await
-                .map_err(|e| e.to_string())?
+            let slots = Self::blocking(&self.state, move || db.list_fork_pool_slots(&pool_name))
+                .await?
                 .map_err(|e| e.to_string())?;
             for slot in slots
                 .into_iter()
@@ -177,9 +216,8 @@ impl ForkPoolController {
             {
                 let db = self.state.db().clone();
                 let machine = slot.machine_name.clone();
-                let vm = tokio::task::spawn_blocking(move || db.get_vm(&machine))
-                    .await
-                    .map_err(|e| e.to_string())?
+                let vm = Self::blocking(&self.state, move || db.get_vm(&machine))
+                    .await?
                     .map_err(|e| e.to_string())?;
                 let recoverable = vm
                     .as_ref()
@@ -191,7 +229,7 @@ impl ForkPoolController {
                     .unwrap_or(false);
                 let db = self.state.db().clone();
                 let machine = slot.machine_name;
-                tokio::task::spawn_blocking(move || {
+                Self::blocking(&self.state, move || {
                     if recoverable {
                         db.mark_fork_pool_slot_ready(&machine, crate::util::current_timestamp())
                     } else {
@@ -202,8 +240,7 @@ impl ForkPoolController {
                         )
                     }
                 })
-                .await
-                .map_err(|e| e.to_string())?
+                .await?
                 .map_err(|e| e.to_string())?;
             }
         }
@@ -213,9 +250,8 @@ impl ForkPoolController {
     async fn reconcile_once(&mut self, sample_admission: bool) -> Result<(), String> {
         let now = crate::util::current_timestamp();
         let db = self.state.db().clone();
-        let expired = tokio::task::spawn_blocking(move || db.expire_fork_leases(now))
-            .await
-            .map_err(|e| e.to_string())?
+        let expired = Self::blocking(&self.state, move || db.expire_fork_leases(now))
+            .await?
             .map_err(|e| e.to_string())?;
         for lease in expired {
             tracing::info!(
@@ -231,15 +267,13 @@ impl ForkPoolController {
         self.delete_retired_workers().await?;
 
         let db = self.state.db().clone();
-        tokio::task::spawn_blocking(move || db.finalize_deleted_fork_pools())
-            .await
-            .map_err(|e| e.to_string())?
+        Self::blocking(&self.state, move || db.finalize_deleted_fork_pools())
+            .await?
             .map_err(|e| e.to_string())?;
 
         let db = self.state.db().clone();
-        let pools = tokio::task::spawn_blocking(move || db.list_fork_pools())
-            .await
-            .map_err(|e| e.to_string())?
+        let pools = Self::blocking(&self.state, move || db.list_fork_pools())
+            .await?
             .map_err(|e| e.to_string())?;
         let active_goldens = pools
             .iter()
@@ -258,7 +292,7 @@ impl ForkPoolController {
         };
         if !stale_snapshots.is_empty() {
             let db = self.state.db().clone();
-            match tokio::task::spawn_blocking(move || {
+            match Self::blocking(&self.state, move || {
                 for golden in stale_snapshots {
                     if let Err(error) = db.remove_retained_fork_snapshot(&golden) {
                         tracing::warn!(%golden, %error, "failed to remove inactive fork pool checkpoint");
@@ -281,19 +315,31 @@ impl ForkPoolController {
             let db = self.state.db().clone();
             let pool_for_deficit = pool.name.clone();
             let deficit =
-                tokio::task::spawn_blocking(move || db.fork_pool_ready_deficit(&pool_for_deficit))
-                    .await
-                    .map_err(|e| e.to_string())?
+                Self::blocking(&self.state, move || db.fork_pool_ready_deficit(&pool_for_deficit))
+                    .await?
                     .map_err(|e| e.to_string())?;
             if deficit > 0 && self.filling.insert(pool.name.clone()) {
                 let state = self.state.clone();
                 let retained_snapshots = self.retained_snapshots.clone();
                 let boot_slots = self.boot_slots.clone();
                 let pool_name = pool.name.clone();
-                self.fills.spawn(async move {
-                    Self::fill_pool(state, pool, retained_snapshots, boot_slots).await;
-                    pool_name
-                });
+                let runtime = self
+                    .state
+                    .runtime()
+                    .map_err(|error| format!("{error:?}"))?
+                    .clone();
+                let fill = runtime
+                    .spawn(async move {
+                        std::panic::AssertUnwindSafe(async move {
+                            Self::fill_pool(state, pool, retained_snapshots, boot_slots).await;
+                            pool_name
+                        })
+                        .catch_unwind()
+                        .await
+                        .map_err(|_| ())
+                    })
+                    .map_err(|error| error.to_string())?;
+                self.fills.push(fill);
             }
         }
         Ok(())
@@ -327,9 +373,8 @@ impl ForkPoolController {
             let db = self.state.db().clone();
             let pool_name = pool.name.clone();
             let (active, completed) =
-                tokio::task::spawn_blocking(move || db.fork_pool_admission_counts(&pool_name))
-                    .await
-                    .map_err(|error| error.to_string())?
+                Self::blocking(&self.state, move || db.fork_pool_admission_counts(&pool_name))
+                    .await?
                     .map_err(|error| error.to_string())?;
             observations.push((pool.clone(), active, completed));
         }
@@ -366,16 +411,14 @@ impl ForkPoolController {
 
     async fn retire_invalid_ready_workers(&self) -> Result<(), String> {
         let db = self.state.db().clone();
-        let pools = tokio::task::spawn_blocking(move || db.list_fork_pools())
-            .await
-            .map_err(|e| e.to_string())?
+        let pools = Self::blocking(&self.state, move || db.list_fork_pools())
+            .await?
             .map_err(|e| e.to_string())?;
         for pool in pools {
             let db = self.state.db().clone();
             let pool_name = pool.name.clone();
-            let slots = tokio::task::spawn_blocking(move || db.list_fork_pool_slots(&pool_name))
-                .await
-                .map_err(|e| e.to_string())?
+            let slots = Self::blocking(&self.state, move || db.list_fork_pool_slots(&pool_name))
+                .await?
                 .map_err(|e| e.to_string())?;
             for slot in slots
                 .into_iter()
@@ -383,9 +426,8 @@ impl ForkPoolController {
             {
                 let db = self.state.db().clone();
                 let machine = slot.machine_name.clone();
-                let vm = tokio::task::spawn_blocking(move || db.get_vm(&machine))
-                    .await
-                    .map_err(|e| e.to_string())?
+                let vm = Self::blocking(&self.state, move || db.get_vm(&machine))
+                    .await?
                     .map_err(|e| e.to_string())?;
                 let valid = vm
                     .as_ref()
@@ -398,15 +440,14 @@ impl ForkPoolController {
                 if !valid {
                     let db = self.state.db().clone();
                     let machine = slot.machine_name;
-                    tokio::task::spawn_blocking(move || {
+                    Self::blocking(&self.state, move || {
                         db.mark_fork_pool_slot_retiring(
                             &machine,
                             crate::util::current_timestamp(),
                             Some("ready worker is missing, dead, or no longer held".into()),
                         )
                     })
-                    .await
-                    .map_err(|e| e.to_string())?
+                    .await?
                     .map_err(|e| e.to_string())?;
                 }
             }
@@ -416,18 +457,16 @@ impl ForkPoolController {
 
     async fn delete_retired_workers(&self) -> Result<(), String> {
         let db = self.state.db().clone();
-        let slots = tokio::task::spawn_blocking(move || db.list_retiring_fork_pool_slots())
-            .await
-            .map_err(|e| e.to_string())?
+        let slots = Self::blocking(&self.state, move || db.list_retiring_fork_pool_slots())
+            .await?
             .map_err(|e| e.to_string())?;
         for slot in slots {
             match delete_one(self.state.clone(), slot.machine_name.clone()).await {
                 Ok(_) | Err(crate::api::error::ApiError::NotFound(_)) => {
                     let db = self.state.db().clone();
                     let machine = slot.machine_name;
-                    tokio::task::spawn_blocking(move || db.remove_fork_pool_slot(&machine))
-                        .await
-                        .map_err(|e| e.to_string())?
+                    Self::blocking(&self.state, move || db.remove_fork_pool_slot(&machine))
+                        .await?
                         .map_err(|e| e.to_string())?;
                 }
                 Err(error) => {
@@ -445,32 +484,29 @@ impl ForkPoolController {
 
     async fn retire_dead_leased_workers(&self) -> Result<(), String> {
         let db = self.state.db().clone();
-        let leases = tokio::task::spawn_blocking(move || db.list_active_fork_leases())
-            .await
-            .map_err(|e| e.to_string())?
+        let leases = Self::blocking(&self.state, move || db.list_active_fork_leases())
+            .await?
             .map_err(|e| e.to_string())?;
         for lease in leases {
             let db = self.state.db().clone();
             let machine = lease.machine_name.clone();
-            let alive = tokio::task::spawn_blocking(move || {
+            let alive = Self::blocking(&self.state, move || {
                 db.get_vm(&machine)
                     .map(|record| record.map(|vm| vm.is_process_alive()).unwrap_or(false))
             })
-            .await
-            .map_err(|e| e.to_string())?
+            .await?
             .map_err(|e| e.to_string())?;
             if !alive {
                 let db = self.state.db().clone();
                 let lease_id = lease.id.clone();
-                tokio::task::spawn_blocking(move || {
+                Self::blocking(&self.state, move || {
                     db.fail_active_fork_lease(
                         &lease_id,
                         crate::util::current_timestamp(),
                         "leased worker process exited".into(),
                     )
                 })
-                .await
-                .map_err(|e| e.to_string())?
+                .await?
                 .map_err(|e| e.to_string())?;
                 tracing::warn!(
                     pool = %lease.pool_name,
@@ -487,7 +523,7 @@ impl ForkPoolController {
         state: Arc<ApiState>,
         pool: ForkPoolRecord,
         retained_snapshots: RetainedSnapshotMap,
-        boot_slots: Arc<tokio::sync::Semaphore>,
+        boot_slots: Arc<crate::runtime::Semaphore>,
     ) {
         // A golden can produce only one RAM checkpoint at a time. Keep the
         // lifecycle lock through snapshot publication so another pool sharing
@@ -509,7 +545,7 @@ impl ForkPoolController {
             let db = state.db().clone();
             let pool_name = pool.name.clone();
             let machine_for_reservation = machine.clone();
-            let reserved = match tokio::task::spawn_blocking(move || {
+            let reserved = match Self::blocking(&state, move || {
                 db.reserve_fork_pool_slot(
                     &pool_name,
                     &machine_for_reservation,
@@ -524,7 +560,7 @@ impl ForkPoolController {
                     break;
                 }
                 Err(error) => {
-                    tracing::warn!(pool = %pool.name, %error, "fork pool reservation task failed");
+                    tracing::warn!(pool = %pool.name, %error, "failed to reserve fork pool worker");
                     break;
                 }
             };
@@ -539,8 +575,8 @@ impl ForkPoolController {
 
         let retained_snapshot = retained_snapshots.lock().get(&pool.golden).cloned();
         let retained_snapshot_hint = retained_snapshot.clone();
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (snapshot_ready_tx, snapshot_ready_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = async_channel::unbounded();
+        let (snapshot_ready_tx, snapshot_ready_rx) = async_channel::bounded(1);
         let provision = fork_held_machines_inner(
             state.clone(),
             ForkHeldBatch {
@@ -556,19 +592,27 @@ impl ForkPoolController {
         );
         let process_results = async {
             let mut completed = std::collections::HashSet::new();
-            while let Some((machine, result)) = result_rx.recv().await {
+            while let Ok((machine, result)) = result_rx.recv().await {
                 completed.insert(machine.clone());
                 Self::finish_provision(&state, &pool, machine, result).await;
             }
             completed
         };
         let manage_provision = async {
-            tokio::pin!(provision);
+            let mut provision = Box::pin(provision);
             let mut golden_guard = Some(golden_guard);
             let mut published_early = false;
-            let provision_result = tokio::select! {
-                ready = snapshot_ready_rx => {
-                    if let Ok(snapshot) = ready {
+            enum ProvisionEvent {
+                Snapshot(Result<crate::agent::fork::RetainedForkSnapshot, async_channel::RecvError>),
+                Done(Result<crate::api::handlers::machines::ForkBatchOutcome, crate::api::error::ApiError>),
+            }
+            let first = future::race(
+                async { ProvisionEvent::Snapshot(snapshot_ready_rx.recv().await) },
+                async { ProvisionEvent::Done((&mut provision).await) },
+            )
+            .await;
+            let provision_result = match first {
+                ProvisionEvent::Snapshot(Ok(snapshot)) => {
                         update_retained_snapshot(
                             &mut retained_snapshots.lock(),
                             &pool.golden,
@@ -577,15 +621,15 @@ impl ForkPoolController {
                         );
                         published_early = true;
                         drop(golden_guard.take());
-                    }
                     provision.await
                 }
-                result = &mut provision => result,
+                ProvisionEvent::Snapshot(Err(_)) => provision.await,
+                ProvisionEvent::Done(result) => result,
             };
             (provision_result, published_early)
         };
         let ((provision_result, published_early), completed) =
-            tokio::join!(manage_provision, process_results);
+            future::zip(manage_provision, process_results).await;
 
         match provision_result {
             Ok(outcome) => {
@@ -620,7 +664,7 @@ impl ForkPoolController {
             Ok(info) if info.forkpoint_held => {
                 let db = state.db().clone();
                 let machine_ready = machine.clone();
-                match tokio::task::spawn_blocking(move || {
+                match Self::blocking(state, move || {
                     db.mark_fork_pool_slot_ready(&machine_ready, crate::util::current_timestamp())
                 })
                 .await
@@ -664,7 +708,7 @@ impl ForkPoolController {
 
     async fn retire_failed_provision(state: &Arc<ApiState>, machine: String, message: String) {
         let db = state.db().clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = Self::blocking(state, move || {
             db.mark_fork_pool_slot_retiring(
                 &machine,
                 crate::util::current_timestamp(),

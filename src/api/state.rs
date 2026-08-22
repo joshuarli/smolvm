@@ -50,7 +50,7 @@ pub struct ApiState {
     /// the number of distinct machine names, so a retained `Arc<Mutex<()>>` per
     /// deleted name is negligible, and never removing avoids handing two callers
     /// different mutexes for the same name (which would defeat the exclusion).
-    lifecycle_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    lifecycle_locks: RwLock<HashMap<String, Arc<crate::runtime::Semaphore>>>,
     /// Database for persistent state.
     db: SmolvmDb,
     /// Previous CPU samples per VM PID, used to compute the fractional-CPU
@@ -84,9 +84,15 @@ pub struct ApiState {
     /// Advisory wake-up for the automatic fork-pool reconciler. Durable SQLite
     /// state remains authoritative; this only removes the polling delay after a
     /// pool mutation while the periodic pass remains the recovery fallback.
-    pool_reconcile: Arc<tokio::sync::Notify>,
+    pool_reconcile: Arc<crate::runtime::Notify>,
     /// Runtime registry for framework-aware fused rollout executors.
     rollout: crate::api::rollout::RolloutRegistry,
+    /// Server-owned runtime handle for registry clients.
+    ///
+    /// Registry clients retain the Hyper executor used by their connection
+    /// pools, so API requests must obtain them from the server's application
+    /// runtime rather than constructing a private executor per request.
+    registry_runtime: Option<crate::runtime::RuntimeHandle>,
 }
 
 /// Internal machine entry with manager and configuration.
@@ -256,8 +262,9 @@ impl ApiState {
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
-            pool_reconcile: Arc::new(tokio::sync::Notify::new()),
+            pool_reconcile: Arc::new(crate::runtime::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
+            registry_runtime: None,
         })
     }
 
@@ -275,9 +282,74 @@ impl ApiState {
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
-            pool_reconcile: Arc::new(tokio::sync::Notify::new()),
+            pool_reconcile: Arc::new(crate::runtime::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
+            registry_runtime: None,
         }
+    }
+
+    /// Attach the server-lifetime runtime used by registry clients.
+    ///
+    /// Keeping this injection on `ApiState` makes request handlers independent
+    /// of runtime choice and makes test states safe to construct without
+    /// starting a worker pool.
+    pub fn with_registry_runtime(mut self, runtime: crate::runtime::RuntimeHandle) -> Self {
+        self.rollout = crate::api::rollout::RolloutRegistry::new(runtime.clone());
+        self.registry_runtime = Some(runtime);
+        self
+    }
+
+    /// Attach the server-lifetime application runtime used by all API work.
+    ///
+    /// Registry transport was the first consumer of this handle, so the
+    /// original `with_registry_runtime` spelling remains as a compatibility
+    /// forwarding method. New API code should use this name: filesystem, VM,
+    /// and database operations share the same explicit bounded blocking pool.
+    pub fn with_runtime(self, runtime: crate::runtime::RuntimeHandle) -> Self {
+        self.with_registry_runtime(runtime)
+    }
+
+    /// Borrow the server-owned runtime for application work.
+    pub(crate) fn runtime(&self) -> Result<&crate::runtime::RuntimeHandle, ApiError> {
+        self.registry_runtime.as_ref().ok_or_else(|| {
+            ApiError::internal("application runtime is not configured for this API state")
+        })
+    }
+
+    /// Run one synchronous API operation on the server's bounded blocking
+    /// pool. This is the sole blocking-work boundary in production API code;
+    /// callers retain their domain error result and map it at the nearest
+    /// contract boundary.
+    pub(crate) async fn blocking<T, F>(&self, function: F) -> Result<T, ApiError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let task = self
+            .runtime()?
+            .spawn_blocking(function)
+            .map_err(ApiError::internal)?;
+        task.await.map_err(ApiError::internal)
+    }
+
+    /// Borrow the server-owned runtime for registry-adjacent API operations.
+    pub(crate) fn registry_runtime(&self) -> Result<&crate::runtime::RuntimeHandle, ApiError> {
+        self.registry_runtime.as_ref().ok_or_else(|| {
+            ApiError::internal("registry executor is not configured for this API state")
+        })
+    }
+
+    /// Construct a registry client using the server-owned executor.
+    pub(crate) fn registry_client(
+        &self,
+        base_url: String,
+    ) -> Result<smolvm_registry::RegistryClient, ApiError> {
+        self.registry_runtime
+            .as_ref()
+            .map(|runtime| smolvm_registry::RegistryClient::new_with_executor(base_url, runtime.clone()))
+            .ok_or_else(|| {
+                ApiError::internal("registry executor is not configured for this API state")
+            })
     }
 
     /// Shared lease-aware admission registry used by the pool controller and
@@ -316,7 +388,7 @@ impl ApiState {
     }
 
     /// Shared notification consumed by the automatic pool controller.
-    pub(crate) fn pool_reconcile_notify(&self) -> Arc<tokio::sync::Notify> {
+    pub(crate) fn pool_reconcile_notify(&self) -> Arc<crate::runtime::Notify> {
         self.pool_reconcile.clone()
     }
 
@@ -557,7 +629,7 @@ impl ApiState {
     /// the macOS layers-volume mount (start) and detach (stop/delete) can never
     /// interleave for one machine. See the `lifecycle_locks` field docs for the
     /// lock-ordering and scope contract.
-    pub fn lifecycle_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub fn lifecycle_lock(&self, name: &str) -> Arc<crate::runtime::Semaphore> {
         // Fast path: the lock already exists (the common case after first use).
         if let Some(lock) = self.lifecycle_locks.read().get(name) {
             return lock.clone();
@@ -568,7 +640,7 @@ impl ApiState {
         self.lifecycle_locks
             .write()
             .entry(name.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .or_insert_with(|| Arc::new(crate::runtime::Semaphore::new(1)))
             .clone()
     }
 
@@ -998,9 +1070,8 @@ impl ApiState {
     pub async fn lookup_vm(&self, name: &str) -> Result<Option<VmRecord>, ApiError> {
         let db = self.db.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || db.get_vm(&name))
-            .await
-            .map_err(|e| ApiError::internal(format!("db lookup_vm task join: {e}")))?
+        self.blocking(move || db.get_vm(&name))
+            .await?
             .map_err(ApiError::database)
     }
 
@@ -1008,9 +1079,8 @@ impl ApiState {
     /// pool (reads use the connection-pool, so this never serializes behind a write).
     pub async fn list_vm_records(&self) -> Result<Vec<(String, VmRecord)>, ApiError> {
         let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.list_vms())
-            .await
-            .map_err(|e| ApiError::internal(format!("db list_vm_records task join: {e}")))?
+        self.blocking(move || db.list_vms())
+            .await?
             .map_err(ApiError::database)
     }
 
@@ -1024,9 +1094,8 @@ impl ApiState {
     {
         let db = self.db.clone();
         let name = name.to_string();
-        tokio::task::spawn_blocking(move || db.update_vm(&name, f))
-            .await
-            .map_err(|e| ApiError::internal(format!("db update_vm task join: {e}")))?
+        self.blocking(move || db.update_vm(&name, f))
+            .await?
             .map_err(ApiError::database)
     }
 
@@ -1147,6 +1216,7 @@ impl ApiState {
 /// Handles the common pattern: clone entry → spawn_blocking → lock → connect → op → map errors.
 /// Propagates an optional trace ID to the agent for request correlation.
 pub async fn with_machine_client_traced<T, F>(
+    runtime: &crate::runtime::RuntimeHandle,
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
     trace_id: Option<String>,
     op: F,
@@ -1156,7 +1226,8 @@ where
     F: FnOnce(&mut crate::agent::AgentClient) -> crate::Result<T> + Send + 'static,
 {
     let entry_clone = entry.clone();
-    tokio::task::spawn_blocking(move || {
+    runtime
+    .spawn_blocking(move || {
         // Acquire a connected client under the per-machine lock, then RELEASE
         // the lock before running the (potentially long, unbounded-blocking)
         // agent operation. `connect()` returns an owned `AgentClient` over its
@@ -1175,7 +1246,9 @@ where
         };
         op(&mut client)
     })
-    .await?
+    .map_err(ApiError::internal)?
+    .await
+    .map_err(ApiError::internal)?
     .map_err(ApiError::internal)
 }
 
@@ -1230,10 +1303,12 @@ pub fn build_launch_features(
 /// reachable — so callers know a freshly-booted image machine still needs its
 /// workload launched.
 pub async fn ensure_machine_running(
+    runtime: &crate::runtime::RuntimeHandle,
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
 ) -> crate::Result<bool> {
     let entry_clone = entry.clone();
-    tokio::task::spawn_blocking(move || {
+    runtime
+    .spawn_blocking(move || {
         let entry = entry_clone.lock();
         let mounts: Vec<_> = entry
             .mounts
@@ -1276,6 +1351,7 @@ pub async fn ensure_machine_running(
             .ensure_running_via_subprocess(mounts, ports, resources, features)?;
         Ok(!already_up)
     })
+    .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
     .await
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
 }
@@ -1299,7 +1375,10 @@ pub async fn ensure_running_and_persist(
     // released before the caller's actual exec/file/image op, which neither mounts
     // nor detaches. On Linux the guarded mount is a no-op, so this is harmless.
     let lifecycle = state.lifecycle_lock(name);
-    let _guard = lifecycle.lock().await;
+    let _guard = lifecycle
+        .acquire_owned()
+        .await
+        .map_err(|error| crate::Error::agent("ensure running", error.to_string()))?;
 
     // Refresh the entry's launch config from the persisted record before an
     // implicit start. The record is the source of truth and can change while
@@ -1335,7 +1414,13 @@ pub async fn ensure_running_and_persist(
         e.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     }
 
-    let freshly_booted = ensure_machine_running(entry).await?;
+    let freshly_booted = ensure_machine_running(
+        state
+            .runtime()
+            .map_err(|e| crate::Error::agent("ensure running", format!("{e:?}")))?,
+        entry,
+    )
+    .await?;
 
     let pid = {
         let entry = entry.lock();
@@ -1424,7 +1509,7 @@ async fn relaunch_image_workload(
     let overlay_id = crate::workload::persistent_overlay_owner(name, record.golden.as_deref());
 
     let image_pull = image.clone();
-    with_machine_client_traced(entry, None, move |c| {
+    with_machine_client_traced(state.runtime().map_err(|e| crate::Error::agent("pull image for workload", format!("{e:?}")))?, entry, None, move |c| {
         if c.query(&image_pull)?.is_none() {
             c.pull_with_registry_config(&image_pull)?;
         }
@@ -1433,7 +1518,7 @@ async fn relaunch_image_workload(
     .await
     .map_err(|e| crate::Error::agent("pull image for workload", format!("{e:?}")))?;
 
-    with_machine_client_traced(entry, None, move |c| {
+    with_machine_client_traced(state.runtime().map_err(|e| crate::Error::agent("launch workload", format!("{e:?}")))?, entry, None, move |c| {
         let config = crate::agent::RunConfig::new(image, command)
             .with_env(env)
             .with_workdir(workdir)

@@ -15,25 +15,24 @@
 //! trust model and the scoped-token requirement before enabling P2P on a
 //! multi-tenant fleet that hosts private artifacts.
 
-use axum::{
-    body::Body,
-    extract::Path,
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
-};
+use h12tiny::web::{Path, Response, State, StatusCode};
 use smolvm_registry::BlobCache;
-use tokio_util::io::ReaderStream;
+use std::sync::Arc;
 
 use crate::api::error::ApiError;
+use crate::api::state::ApiState;
 
 /// Serve a cached layer blob by digest to a peer node.
 ///
 /// Opens the default blob cache and delegates to [`serve_blob_from`], which does
 /// the digest validation, lookup, and streaming.
-pub async fn serve_blob(Path(digest): Path<String>) -> Result<Response, ApiError> {
+pub async fn serve_blob(
+    State(state): State<Arc<ApiState>>,
+    Path(digest): Path<String>,
+) -> Result<Response, ApiError> {
     let cache = BlobCache::open_default()
         .map_err(|e| ApiError::internal(format!("open blob cache: {e}")))?;
-    serve_blob_from(&cache, &digest).await
+    serve_blob_from(state.runtime()?, &cache, &digest).await
 }
 
 /// Validate the digest, look it up in `cache`, and stream it.
@@ -42,7 +41,11 @@ pub async fn serve_blob(Path(digest): Path<String>) -> Result<Response, ApiError
 /// is used to build a cache filesystem path — then looked up: a miss is `404`, a
 /// hit streams the file from disk. The body is streamed (never buffered) because
 /// a `.smolmachine` layer can be hundreds of MB / multiple GB.
-async fn serve_blob_from(cache: &BlobCache, digest: &str) -> Result<Response, ApiError> {
+async fn serve_blob_from(
+    runtime: &crate::runtime::RuntimeHandle,
+    cache: &BlobCache,
+    digest: &str,
+) -> Result<Response, ApiError> {
     // Reject a malformed / path-traversing digest before it is used to build any
     // cache path (mirrors the check `pull` runs before touching the cache).
     smolvm_registry::validate_digest(digest)
@@ -52,31 +55,35 @@ async fn serve_blob_from(cache: &BlobCache, digest: &str) -> Result<Response, Ap
         return Err(ApiError::NotFound(format!("blob not cached: {digest}")));
     };
 
-    let file = tokio::fs::File::open(&path)
+    // Open and stat the same descriptor on the application-owned blocking
+    // pool. This avoids both a Tokio file handle and the usual open/stat race
+    // that could otherwise advertise a length for a different file.
+    let path_for_open = path.clone();
+    let (file, len) = runtime
+        .spawn_blocking(move || {
+            let file = std::fs::File::open(path_for_open)?;
+            let len = file.metadata()?.len();
+            Ok::<_, std::io::Error>((file, len))
+        })
+        .map_err(ApiError::internal)?
         .await
-        .map_err(|e| ApiError::internal(format!("open cached blob: {e}")))?;
-    let len = file
-        .metadata()
-        .await
-        .map(|m| m.len())
-        .map_err(|e| ApiError::internal(format!("stat cached blob: {e}")))?;
-
-    let body = Body::from_stream(ReaderStream::new(file));
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-            (header::CONTENT_LENGTH, len.to_string()),
-        ],
-        body,
-    )
-        .into_response())
+        .map_err(ApiError::internal)?
+        .map_err(|error| ApiError::internal(format!("open cached blob: {error}")))?;
+    let body = h12tiny::util::boxed_body(h12tiny::util::reader_body(
+        crate::runtime::AsyncFile::from_file(runtime.clone(), file),
+    ));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .header("content-length", len)
+        .body(body)
+        .map_err(|error| ApiError::internal(format!("build blob response: {error}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
+    use h12tiny::util::BodyExt;
     use sha2::{Digest, Sha256};
 
     fn temp_cache() -> (tempfile::TempDir, BlobCache) {
@@ -89,52 +96,61 @@ mod tests {
         format!("sha256:{}", hex::encode(Sha256::digest(data)))
     }
 
-    #[tokio::test]
-    async fn present_blob_streams_with_content_length() {
+    #[test]
+    fn present_blob_streams_with_content_length() {
         let data = b"p2p-served-blob-bytes".to_vec();
         let digest = digest_of(&data);
         let (_tmp, cache) = temp_cache();
         cache.put(&digest, &data).unwrap();
 
-        let resp = serve_blob_from(&cache, &digest)
-            .await
-            .expect("present blob must serve 200")
-            .into_response();
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let resp = runtime
+            .block_on(serve_blob_from(&runtime.handle(), &cache, &digest))
+            .expect("present blob must serve 200");
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
-                .get(header::CONTENT_LENGTH)
+                .get("content-length")
                 .and_then(|v| v.to_str().ok()),
             Some(data.len().to_string().as_str())
         );
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = runtime
+            .block_on(resp.into_body().collect())
+            .unwrap()
+            .to_bytes();
         assert_eq!(body.as_ref(), data.as_slice());
     }
 
-    #[tokio::test]
-    async fn absent_blob_is_404() {
+    #[test]
+    fn absent_blob_is_404() {
         let (_tmp, cache) = temp_cache();
         let digest = digest_of(b"never-cached");
-        let err = serve_blob_from(&cache, &digest)
-            .await
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let err = runtime
+            .block_on(serve_blob_from(&runtime.handle(), &cache, &digest))
             .expect_err("absent blob must be an error");
         assert!(matches!(err, ApiError::NotFound(_)));
     }
 
-    #[tokio::test]
-    async fn malformed_digest_is_400() {
+    #[test]
+    fn malformed_digest_is_400() {
         let (_tmp, cache) = temp_cache();
 
         // Malformed digest is rejected before any cache access.
-        let err = serve_blob_from(&cache, "sha256:not-a-real-digest")
-            .await
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let err = runtime
+            .block_on(serve_blob_from(
+                &runtime.handle(),
+                &cache,
+                "sha256:not-a-real-digest",
+            ))
             .expect_err("malformed digest must be rejected");
         assert!(matches!(err, ApiError::BadRequest(_)));
 
         // A path-traversal attempt is likewise a 400, never a filesystem read.
-        let err = serve_blob_from(&cache, "../../etc/passwd")
-            .await
+        let err = runtime
+            .block_on(serve_blob_from(&runtime.handle(), &cache, "../../etc/passwd"))
             .expect_err("path-traversal digest must be rejected");
         assert!(matches!(err, ApiError::BadRequest(_)));
     }

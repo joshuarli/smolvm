@@ -1,6 +1,5 @@
 //! HTTP API server command.
 
-use axum::Router;
 use clap::Parser;
 use std::net::SocketAddr;
 #[cfg(unix)]
@@ -8,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use smolvm::api::state::ApiState;
+use smolvm::runtime::{Runtime, RuntimeHandle, Shutdown, ShutdownTrigger};
 use smolvm::Result;
 
 use super::openapi::OpenapiCmd;
@@ -101,7 +101,7 @@ impl ServeStartCmd {
         // serve additionally auto-defaults to /var/lib/smolvm when privileged
         // (allow_auto = true). An explicit SMOLVM_DATA_DIR was already applied for
         // every command in main(); calling again is idempotent. Single-threaded
-        // before the tokio runtime, so set_var is safe.
+        // before the application runtime, so set_var is safe.
         smolvm::process::apply_system_data_root(/* allow_auto */ true);
 
         // Lock the state dirs holding machine records / credentials / config down
@@ -149,7 +149,7 @@ impl ServeStartCmd {
         //   advertised via SMOLVM_CGROUP_ROOT so every VM boot subprocess places
         //   itself in a per-VM cgroup. No lossless restart there, which is fine.
         //
-        // Done here — single-threaded, before the tokio runtime — so set_var is
+        // Done here — single-threaded, before the application runtime — so set_var is
         // safe. See docs/runtime-isolation-hardening.md.
         #[cfg(target_os = "linux")]
         if smolvm::systemd_scope::is_available() {
@@ -250,16 +250,42 @@ impl ServeStartCmd {
             }
         }
 
-        // Create the runtime with signal handling enabled
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(smolvm::error::Error::Io)?;
+        // Block termination signals before the application workers are born;
+        // they inherit this mask and a dedicated `sigwait` thread translates
+        // SIGINT/SIGTERM into the explicit application shutdown signal. This
+        // avoids a process-global Tokio runtime merely to receive signals.
+        let (shutdown_trigger, shutdown) = smolvm::runtime::shutdown_signal();
+        install_shutdown_signal(shutdown_trigger.clone())?;
 
-        runtime.block_on(async move { self.run_server(listen_target).await })
+        let mut application_runtime = Runtime::new().map_err(|error| {
+            smolvm::error::Error::config("initialize application runtime", error.to_string())
+        })?;
+        let runtime_handle = application_runtime.handle();
+        let server_result = application_runtime.block_on(self.run_server(
+            listen_target,
+            runtime_handle,
+            shutdown,
+            shutdown_trigger.clone(),
+        ));
+
+        // The caller owns the process lifetime. Always stop accepting new
+        // runtime work and join both worker pools, even after a bind or server
+        // error has already ended the API lifecycle.
+        shutdown_trigger.trigger();
+        let runtime_shutdown = application_runtime.shutdown().map_err(|error| {
+            smolvm::error::Error::config("shut down application runtime", error.to_string())
+        });
+        server_result?;
+        runtime_shutdown
     }
 
-    async fn run_server(self, listen_target: ListenTarget) -> Result<()> {
+    async fn run_server(
+        self,
+        listen_target: ListenTarget,
+        runtime: RuntimeHandle,
+        shutdown: Shutdown,
+        shutdown_trigger: ShutdownTrigger,
+    ) -> Result<()> {
         // On Windows `ListenTarget` has only the `Tcp` variant (Unix-socket
         // listening is unix-gated), making this match irrefutable there.
         #[cfg_attr(not(unix), allow(irrefutable_let_patterns))]
@@ -288,9 +314,13 @@ impl ServeStartCmd {
         smolvm::api::handlers::health::mark_server_start();
 
         // Create shared state and load persisted machines
-        let state = Arc::new(ApiState::new().map_err(|e| {
-            smolvm::error::Error::config("initialize api state", format!("{:?}", e))
-        })?);
+        let state = Arc::new(
+            ApiState::new()
+                .map_err(|e| {
+                    smolvm::error::Error::config("initialize api state", format!("{:?}", e))
+                })?
+                .with_runtime(runtime.clone()),
+        );
         let loaded = state.load_persisted_machines();
         if !loaded.is_empty() {
             println!(
@@ -306,9 +336,6 @@ impl ServeStartCmd {
             println!("Reclaimed {reclaimed} dangling VM data dir(es)");
         }
 
-        // Create shutdown channel for supervisor
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
         // A dedicated loopback listener carries only lease-authenticated rollout
         // operations. The virtio gateway maps its internal host-service port to
         // this socket while the normal strict egress floor remains unchanged.
@@ -322,46 +349,63 @@ impl ServeStartCmd {
             })?
             .host_port;
         let guest_rollout_addr = SocketAddr::from(([127, 0, 0, 1], guest_rollout_host_port));
-        let guest_rollout_listener = tokio::net::TcpListener::bind(guest_rollout_addr)
+        let guest_rollout_listener = async_net::TcpListener::bind(guest_rollout_addr)
             .await
             .map_err(|error| {
                 smolvm::error::Error::config(
                     "bind guest rollout ingress",
                     format!("{guest_rollout_addr}: {error}"),
                 )
-            })?;
+        })?;
         let guest_rollout_app = smolvm::api::guest_rollout::create_router(state.clone());
-        let guest_rollout_shutdown = shutdown_rx.clone();
-        let guest_rollout_failure = shutdown_tx.clone();
-        let guest_rollout_handle = tokio::spawn(async move {
+        let guest_rollout_shutdown = shutdown.clone();
+        let guest_rollout_failure = shutdown_trigger.clone();
+        let guest_rollout_runtime = runtime.clone();
+        let guest_rollout_handle = runtime
+            .spawn(async move {
             tracing::info!(address = %guest_rollout_addr, "starting lease-authenticated guest rollout ingress");
-            let result = axum::serve(guest_rollout_listener, guest_rollout_app)
-                .with_graceful_shutdown(wait_for_shutdown(guest_rollout_shutdown))
-                .await;
+            let result = h12tiny::server::serve(
+                guest_rollout_listener,
+                guest_rollout_app,
+                guest_rollout_runtime.h12_executor(),
+            )
+            .shutdown_on(async move { guest_rollout_shutdown.wait().await })
+            .await;
             if result.is_err() {
-                let _ = guest_rollout_failure.send(true);
+                guest_rollout_failure.trigger();
             }
             result
-        });
+        })
+            .map_err(|error| {
+                smolvm::error::Error::config("start guest rollout ingress", error.to_string())
+            })?;
 
         // Spawn supervisor task
         let supervisor_state = state.clone();
-        let supervisor_shutdown = shutdown_rx.clone();
-        let supervisor_handle = tokio::spawn(async move {
+        let supervisor_shutdown = shutdown.clone();
+        let supervisor_handle = runtime
+            .spawn(async move {
             let supervisor =
                 smolvm::api::supervisor::Supervisor::new(supervisor_state, supervisor_shutdown);
             supervisor.run().await;
-        });
+        })
+            .map_err(|error| {
+                smolvm::error::Error::config("start machine supervisor", error.to_string())
+            })?;
 
         // Automatic fork-pool reconciliation has its own task so slow worker
         // creation or deletion never delays the machine health supervisor.
         let pool_state = state.clone();
-        let pool_shutdown = shutdown_rx.clone();
-        let pool_controller_handle = tokio::spawn(async move {
+        let pool_shutdown = shutdown.clone();
+        let pool_controller_handle = runtime
+            .spawn(async move {
             let controller =
                 smolvm::api::pool_controller::ForkPoolController::new(pool_state, pool_shutdown);
             controller.run().await;
-        });
+        })
+            .map_err(|error| {
+                smolvm::error::Error::config("start fork pool controller", error.to_string())
+            })?;
 
         // Create router
         let drain_state = state.clone();
@@ -383,20 +427,28 @@ impl ServeStartCmd {
         // Listen server on TCP or Unix socket
         let server_result = match listen_target {
             ListenTarget::Tcp(addr) => {
-                self.serve_tcp(addr, app, local_app, tls, shutdown_rx.clone())
+                self.serve_tcp(addr, app, local_app, tls, runtime.clone(), shutdown.clone())
                     .await
             }
             #[cfg(unix)]
-            ListenTarget::Unix(path) => self.serve_unix(path, app, shutdown_rx.clone()).await,
+            ListenTarget::Unix(path) => self.serve_unix(path, app, runtime.clone(), shutdown.clone()).await,
         };
 
         // The HTTP server has stopped accepting (graceful shutdown on SIGTERM).
         // Stop reconcilers before detaching or draining machine managers. In
         // particular, a pool fill must not register a newly booted worker after
         // `detach_all` has already walked the registry.
-        let _ = shutdown_tx.send(true);
-        let guest_rollout_result = guest_rollout_handle.await.map_err(|error| {
-            smolvm::error::Error::config("guest rollout ingress task", error.to_string())
+        shutdown_trigger.trigger();
+        let guest_rollout_result = smolvm::runtime::timeout(
+            std::time::Duration::from_secs(5),
+            guest_rollout_handle,
+        )
+        .await
+        .map_err(|_| {
+            smolvm::error::Error::config(
+                "guest rollout ingress task",
+                "did not shut down within 5 seconds",
+            )
         })?;
         if let Err(error) = guest_rollout_result {
             tracing::error!(%error, "guest rollout ingress stopped unexpectedly");
@@ -405,26 +457,22 @@ impl ServeStartCmd {
             }
         }
         server_result?;
-        let mut pool_controller_handle = pool_controller_handle;
-        match tokio::time::timeout(
+        match smolvm::runtime::timeout(
             std::time::Duration::from_secs(5),
-            &mut pool_controller_handle,
+            pool_controller_handle,
         )
         .await
         {
             Ok(_) => tracing::debug!("fork pool controller shut down cleanly"),
             Err(_) => {
                 tracing::warn!("fork pool controller did not shut down within 5 seconds");
-                pool_controller_handle.abort();
             }
         }
-        let mut supervisor_handle = supervisor_handle;
-        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut supervisor_handle).await
+        match smolvm::runtime::timeout(std::time::Duration::from_secs(5), supervisor_handle).await
         {
             Ok(_) => tracing::debug!("supervisor shut down cleanly"),
             Err(_) => {
                 tracing::warn!("supervisor did not shut down within 5 seconds");
-                supervisor_handle.abort();
             }
         }
 
@@ -452,32 +500,33 @@ impl ServeStartCmd {
     async fn serve_tcp(
         &self,
         addr: SocketAddr,
-        app: Router,
-        local_app: Router,
+        app: smolvm::api::ApiRouter,
+        local_app: smolvm::api::ApiRouter,
         tls: Option<std::sync::Arc<rustls::ServerConfig>>,
-        internal_shutdown: tokio::sync::watch::Receiver<bool>,
+        runtime: RuntimeHandle,
+        shutdown: Shutdown,
     ) -> Result<()> {
         if let Some(tls_config) = tls {
-            return Self::serve_tcp_tls(addr, app, local_app, tls_config, internal_shutdown).await;
+            return Self::serve_tcp_tls(addr, app, local_app, tls_config, runtime, shutdown).await;
         }
 
-        let listener = tokio::net::TcpListener::bind(addr)
+        let listener = async_net::TcpListener::bind(addr)
             .await
             .map_err(smolvm::error::Error::Io)?;
 
         tracing::info!(address = %addr, "starting HTTP API server");
         println!("smolvm API server listening on http://{}", addr);
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal_or_internal(internal_shutdown))
+        h12tiny::server::serve(listener, app, runtime.h12_executor())
+            .shutdown_on(async move { shutdown.wait().await })
             .await
             .map_err(smolvm::error::Error::Io)
     }
 
-    /// HTTPS variant with mutual TLS (fleet mode). `axum-server`'s rustls
-    /// acceptor performs the handshake + client-cert verification configured in
-    /// `tls_config`; graceful shutdown is driven through its `Handle` (the
-    /// `axum::serve` graceful-shutdown future doesn't apply here).
+    /// HTTPS variant with mutual TLS (fleet mode). The h12tiny rustls
+    /// acceptor performs the handshake and client-cert verification configured
+    /// in `tls_config`; graceful shutdown is driven by the shared application
+    /// [`Shutdown`] signal.
     ///
     /// Because mTLS locks the whole network port to CA-signed clients, we ALSO
     /// bind a plain-HTTP listener on loopback (see `serve_tls::local_plain_addr`)
@@ -485,10 +534,11 @@ impl ServeStartCmd {
     /// an mTLS client and is unreachable from the network anyway.
     async fn serve_tcp_tls(
         addr: SocketAddr,
-        app: Router,
-        local_app: Router,
+        app: smolvm::api::ApiRouter,
+        local_app: smolvm::api::ApiRouter,
         tls_config: std::sync::Arc<rustls::ServerConfig>,
-        internal_shutdown: tokio::sync::watch::Receiver<bool>,
+        runtime: RuntimeHandle,
+        shutdown: Shutdown,
     ) -> Result<()> {
         // Loopback plain-HTTP door for the local node-agent.
         if let Some(local_addr) = super::serve_tls::local_plain_addr(addr) {
@@ -519,53 +569,56 @@ impl ServeStartCmd {
                 "smolvm local API (loopback, plain) on http://{}",
                 local_addr
             );
-            let local_shutdown = internal_shutdown.clone();
+            let local_shutdown = shutdown.clone();
             std::thread::Builder::new()
                 .name("smolvm-loopback-api".to_string())
                 .spawn(move || {
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
+                    let mut rt = match Runtime::with_workers(1) {
                         Ok(rt) => rt,
                         Err(e) => {
                             tracing::error!(error = %e, "loopback door runtime failed to build");
                             return;
                         }
                     };
-                    rt.block_on(async move {
-                        // Register the listener with THIS runtime's reactor.
-                        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-                            Ok(l) => l,
-                            Err(e) => {
-                                tracing::error!(error = %e, "loopback door listener registration failed");
-                                return;
-                            }
-                        };
-                        let _ = axum::serve(listener, local_app)
-                            .with_graceful_shutdown(shutdown_signal_or_internal(local_shutdown))
-                            .await;
-                    });
+                    // Register the listener with THIS runtime's reactor. The
+                    // listener was made nonblocking before crossing the
+                    // thread boundary, which is required by async-net.
+                    let listener = match async_net::TcpListener::try_from(std_listener) {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            tracing::error!(%error, "loopback door listener registration failed");
+                            return;
+                        }
+                    };
+                    let local_runtime = rt.handle();
+                    let result = rt.block_on(
+                        h12tiny::server::serve(
+                            listener,
+                            local_app,
+                            local_runtime.h12_executor(),
+                        )
+                        .shutdown_on(async move { local_shutdown.wait().await }),
+                    );
+                    if let Err(error) = result {
+                        tracing::error!(%error, "loopback door stopped unexpectedly");
+                    }
+                    if let Err(error) = rt.shutdown() {
+                        tracing::error!(%error, "loopback door runtime failed to shut down");
+                    }
                 })
                 .map_err(smolvm::error::Error::Io)?;
         }
 
-        let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
-        let handle = axum_server::Handle::new();
-
-        // Trip graceful shutdown on the same signal the plain path observes.
-        let shutdown_handle = handle.clone();
-        tokio::spawn(async move {
-            shutdown_signal_or_internal(internal_shutdown).await;
-            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
-        });
+        let listener = async_net::TcpListener::bind(addr)
+            .await
+            .map_err(smolvm::error::Error::Io)?;
+        let acceptor = h12tiny::server::TlsAcceptor::from(tls_config);
 
         tracing::info!(address = %addr, "starting HTTPS API server (mTLS, client cert required)");
         println!("smolvm API server listening on https://{} (mTLS)", addr);
 
-        axum_server::bind_rustls(addr, rustls_config)
-            .handle(handle)
-            .serve(app.into_make_service())
+        h12tiny::server::serve_tls(listener, acceptor, app, runtime.h12_executor())
+            .shutdown_on(async move { shutdown.wait().await })
             .await
             .map_err(smolvm::error::Error::Io)
     }
@@ -574,12 +627,13 @@ impl ServeStartCmd {
     async fn serve_unix(
         &self,
         path: PathBuf,
-        app: Router,
-        internal_shutdown: tokio::sync::watch::Receiver<bool>,
+        app: smolvm::api::ApiRouter,
+        runtime: RuntimeHandle,
+        shutdown: Shutdown,
     ) -> Result<()> {
         let socket_guard = UnixSocketGuard::bind(&path)?;
-        let listener =
-            tokio::net::UnixListener::bind(&socket_guard.path).map_err(smolvm::error::Error::Io)?;
+        let listener = async_net::unix::UnixListener::bind(&socket_guard.path)
+            .map_err(smolvm::error::Error::Io)?;
 
         tracing::info!(path = %socket_guard.path.display(), "starting HTTP API server");
         println!(
@@ -587,8 +641,8 @@ impl ServeStartCmd {
             socket_guard.path.display()
         );
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal_or_internal(internal_shutdown))
+        h12tiny::server::serve(listener, app, runtime.h12_executor())
+            .shutdown_on(async move { shutdown.wait().await })
             .await
             .map_err(smolvm::error::Error::Io)
     }
@@ -688,56 +742,114 @@ impl Drop for UnixSocketGuard {
     }
 }
 
-/// Wait for shutdown signal.
-/// Note: VMs run independently and survive a normal shutdown/restart; they are
-/// only stopped when SMOLVM_DRAIN_ON_SHUTDOWN is set (see run_server).
-/// Use DELETE /api/v1/machines/:id to stop specific VMs.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::error!(error = %e, "failed to listen for Ctrl+C");
-            std::future::pending::<()>().await;
+/// Install the process-signal half of the explicit application shutdown
+/// boundary. VMs run independently and survive a normal shutdown/restart;
+/// they are only stopped when `SMOLVM_DRAIN_ON_SHUTDOWN` is set (see
+/// `run_server`). Use `DELETE /api/v1/machines/:id` to stop a specific VM.
+///
+/// Unix signals are synchronously consumed by a dedicated thread. Blocking
+/// them before application workers start is important: it prevents a signal
+/// being delivered to an arbitrary executor worker, while `sigwait` gives the
+/// normal Rust code a safe place to trigger graceful server drain.
+#[cfg(unix)]
+fn install_shutdown_signal(trigger: ShutdownTrigger) -> Result<()> {
+    fn termination_set() -> std::io::Result<libc::sigset_t> {
+        // `sigemptyset` initializes the opaque C value before `sigaddset`
+        // touches it. Both operations have no Rust equivalent.
+        let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        if unsafe { libc::sigemptyset(&mut set) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGTERM handler");
-                std::future::pending::<()>().await;
-            }
+        if unsafe { libc::sigaddset(&mut set, libc::SIGINT) } != 0
+            || unsafe { libc::sigaddset(&mut set, libc::SIGTERM) } != 0
+        {
+            return Err(std::io::Error::last_os_error());
         }
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        Ok(set)
     }
 
-    tracing::info!("shutdown signal received");
-    eprintln!("\nShutting down server (VMs continue running)...");
+    let set = termination_set().map_err(smolvm::error::Error::Io)?;
+    let mask_result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
+    if mask_result != 0 {
+        return Err(smolvm::error::Error::Io(std::io::Error::from_raw_os_error(
+            mask_result,
+        )));
+    }
+
+    let spawn = std::thread::Builder::new()
+        .name("smolvm-shutdown-signal".to_string())
+        .spawn(move || {
+            let set = match termination_set() {
+                Ok(set) => set,
+                Err(error) => {
+                    tracing::error!(%error, "failed to prepare shutdown signal set");
+                    return;
+                }
+            };
+            let mut received = 0;
+            let result = unsafe { libc::sigwait(&set, &mut received) };
+            if result != 0 {
+                tracing::error!(
+                    error = %std::io::Error::from_raw_os_error(result),
+                    "failed while waiting for shutdown signal"
+                );
+                return;
+            }
+            tracing::info!(signal = received, "shutdown signal received");
+            eprintln!("\nShutting down server (VMs continue running)...");
+            trigger.trigger();
+        });
+
+    if let Err(error) = spawn {
+        // No application worker has been started yet, so rolling the caller
+        // back to its old mask cannot race a worker that inherited it.
+        let _ = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut()) };
+        return Err(smolvm::error::Error::Io(error));
+    }
+    Ok(())
 }
 
-async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            break;
+#[cfg(windows)]
+static WINDOWS_SHUTDOWN_TRIGGER: std::sync::OnceLock<ShutdownTrigger> = std::sync::OnceLock::new();
+
+#[cfg(windows)]
+unsafe extern "system" fn windows_console_handler(control_type: u32) -> i32 {
+    // CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
+    // and CTRL_SHUTDOWN_EVENT. Closing the shared signal is idempotent, so a
+    // second console notification cannot restart or interrupt the drain.
+    if matches!(control_type, 0 | 1 | 2 | 5 | 6) {
+        if let Some(trigger) = WINDOWS_SHUTDOWN_TRIGGER.get() {
+            trigger.trigger();
         }
+        1
+    } else {
+        0
     }
 }
 
-async fn shutdown_signal_or_internal(shutdown: tokio::sync::watch::Receiver<bool>) {
-    tokio::select! {
-        () = shutdown_signal() => {},
-        () = wait_for_shutdown(shutdown) => {},
+#[cfg(windows)]
+fn install_shutdown_signal(trigger: ShutdownTrigger) -> Result<()> {
+    WINDOWS_SHUTDOWN_TRIGGER.set(trigger).map_err(|_| {
+        smolvm::error::Error::config(
+            "install shutdown signal",
+            "console shutdown handler was already installed",
+        )
+    })?;
+    let installed = unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+            Some(windows_console_handler),
+            1,
+        )
+    };
+    if installed == 0 {
+        return Err(smolvm::error::Error::Io(std::io::Error::last_os_error()));
     }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn install_shutdown_signal(_trigger: ShutdownTrigger) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

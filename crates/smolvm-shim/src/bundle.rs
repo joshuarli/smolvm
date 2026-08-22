@@ -100,13 +100,12 @@ pub fn sandbox_grouping(bundle: &str) -> Option<String> {
 
 /// Mount containerd's rootfs mounts at `<bundle>/rootfs`, returning that path.
 /// No mounts (tests, pre-mounted rootfs) is fine — the directory is used as-is.
-pub async fn mount_rootfs(
+pub fn mount_rootfs(
     bundle: &str,
     mounts: &[containerd_shim_protos::api::Mount],
 ) -> Result<String, String> {
     let target = Path::new(bundle).join("rootfs");
-    tokio::fs::create_dir_all(&target)
-        .await
+    std::fs::create_dir_all(&target)
         .map_err(|e| format!("mkdir {}: {e}", target.display()))?;
     for m in mounts {
         containerd_shim::mount::mount_rootfs(
@@ -121,7 +120,7 @@ pub async fn mount_rootfs(
 }
 
 /// Unmount `<bundle>/rootfs` (best-effort; may never have been mounted).
-pub async fn unmount_rootfs(bundle: &str) {
+pub fn unmount_rootfs(bundle: &str) {
     let target = Path::new(bundle).join("rootfs");
     if let Err(e) = containerd_shim::mount::umount_recursive(target.to_str(), 0) {
         warn!("umount {}: {e}", target.display());

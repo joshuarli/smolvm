@@ -27,7 +27,15 @@ use crate::{Error, Result};
 ///
 /// The registry authorizes `repository:<repo>:pull` for the caller's credentials
 /// during resolution; an unauthorized caller is rejected here.
-pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<String> {
+///
+/// `executor` must be a handle to an application-owned runtime that remains
+/// live until the returned future completes. The handle is passed to each
+/// registry client so transport work cannot create a hidden runtime.
+pub async fn authorized_digest(
+    reference: &str,
+    auth: &PullAuth,
+    executor: &crate::runtime::RuntimeHandle,
+) -> Result<String> {
     let parsed = Reference::parse(reference)
         .map_err(|e| Error::config("image-auth", format!("bad reference: {}", e.reason)))?;
     let want = parsed
@@ -44,7 +52,7 @@ pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<Strin
     // in-guest pull would (a bare `alpine` is Docker Hub, not the smol registry).
     let mut first_err: Option<String> = None;
     for host in &crate::registry::registry_pull_hosts(reference) {
-        let client = registry_client(host, &config, auth);
+        let client = registry_client(host, &config, auth, executor);
         let repo = repo_for(host, &parsed);
         match client.get_manifest_resolved(&repo, &want).await {
             Ok(manifest_bytes) => {
@@ -105,50 +113,79 @@ mod tests {
     /// even though the image plainly exists and another caller can resolve it.
     #[test]
     fn resolution_requires_authorization() {
-        use wiremock::matchers::{header, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let server = MockServer::start().await;
-            let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#.to_vec();
+        let body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","size":0},"layers":[]}"#.to_vec();
+        let runtime = crate::runtime::Runtime::with_workers(2).unwrap();
+        let executor = runtime.handle();
+        let listener = runtime
+            .block_on(async_net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let response_body = body.clone();
+        let accept_runtime = runtime.handle();
+        runtime
+            .spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let response_body = response_body.clone();
+                    if let Ok(task) = accept_runtime.spawn(async move {
+                        loop {
+                            let mut request = [0_u8; 8192];
+                            let count = match stream.read(&mut request).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(count) => count,
+                            };
+                            let request = String::from_utf8_lossy(&request[..count]);
+                            let authorized = request.starts_with(
+                                "GET /v2/myrepo/manifests/latest ",
+                            ) && request
+                                .lines()
+                                .any(|line| {
+                                    line.trim()
+                                        .eq_ignore_ascii_case("authorization: Bearer good-token")
+                                });
+                            let response = if authorized {
+                                format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.oci.image.manifest.v1+json\r\ncontent-length: {}\r\n\r\n{}",
+                                    response_body.len(),
+                                    String::from_utf8_lossy(&response_body),
+                                )
+                            } else {
+                                "HTTP/1.1 401 Unauthorized\r\ncontent-length: 12\r\n\r\nunauthorized".to_string()
+                            };
+                            if stream.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }) {
+                        task.detach();
+                    }
+                }
+            })
+            .detach();
 
-            // Authorized bearer → 200 with the manifest.
-            Mock::given(method("GET"))
-                .and(path("/v2/myrepo/manifests/latest"))
-                .and(header("authorization", "Bearer good-token"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
-                        .set_body_bytes(body.clone()),
-                )
-                .with_priority(1)
-                .mount(&server)
-                .await;
-            // Anyone else → 401 (no challenge header → the client does not retry).
-            Mock::given(method("GET"))
-                .and(path("/v2/myrepo/manifests/latest"))
-                .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
-                .with_priority(5)
-                .mount(&server)
-                .await;
+        let reference = format!("{host}/myrepo:latest");
 
-            let host = server.uri().strip_prefix("http://").unwrap().to_string();
-            let reference = format!("{host}/myrepo:latest");
+        // DENY: an unauthorized caller cannot resolve the image at all.
+        let denied = runtime.block_on(authorized_digest(
+            &reference,
+            &PullAuth::Anonymous,
+            &executor,
+        ));
+        assert!(denied.is_err(), "unauthorized caller must be rejected");
 
-            // DENY: an unauthorized caller cannot resolve the image at all.
-            let denied = authorized_digest(&reference, &PullAuth::Anonymous).await;
-            assert!(denied.is_err(), "unauthorized caller must be rejected");
-
-            // ALLOW: the authorized caller gets the manifest's content digest.
-            let digest = authorized_digest(&reference, &PullAuth::Bearer("good-token".into()))
-                .await
-                .expect("authorized caller should resolve");
-            assert_eq!(
-                digest,
-                format!("sha256:{}", hex::encode(Sha256::digest(&body))),
-                "the digest is the content address of the manifest"
-            );
-        });
+        // ALLOW: the authorized caller gets the manifest's content digest.
+        let digest = runtime
+            .block_on(authorized_digest(
+                &reference,
+                &PullAuth::Bearer("good-token".into()),
+                &executor,
+            ))
+            .expect("authorized caller should resolve");
+        assert_eq!(
+            digest,
+            format!("sha256:{}", hex::encode(Sha256::digest(&body))),
+            "the digest is the content address of the manifest"
+        );
     }
 }

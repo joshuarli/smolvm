@@ -102,9 +102,10 @@ fn build_server_config(
     key_path: &Path,
     client_ca_path: &Path,
 ) -> Result<Arc<ServerConfig>, String> {
-    // Pin the ring provider explicitly rather than relying on a process-global
-    // install — avoids ordering hazards if anything else touches rustls.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    // Pin the Graviola provider explicitly rather than relying on a
+    // process-global install — avoids ordering hazards if anything else
+    // touches rustls and keeps ring out of the host binary.
+    let provider = Arc::new(rustls_graviola::default_provider());
 
     // Client-cert trust anchor: the node-CA. Only the control plane holds a
     // client cert signed by it.

@@ -5,10 +5,13 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use std::time::Instant;
+
+use futures_lite::future;
 
 use crate::api::state::ApiState;
 use crate::config::RecordState;
+use crate::runtime::Shutdown;
 
 /// Interval between health checks.
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -30,7 +33,7 @@ enum RestartTiming {
 /// Machine supervisor for health monitoring and automatic restarts.
 pub struct Supervisor {
     state: Arc<ApiState>,
-    shutdown_rx: watch::Receiver<bool>,
+    shutdown: Shutdown,
     /// Per-machine instant at which a scheduled restart becomes due. Lets the
     /// supervisor honor restart backoff WITHOUT sleeping inside the shared
     /// health-check loop: a crash-looping machine with a long exponential
@@ -38,15 +41,15 @@ pub struct Supervisor {
     /// reconcile, and log rotation. The supervisor is the single task that owns
     /// the loop, so a plain map needs no synchronization. Entries are cleared
     /// when a machine is alive again, its restart fires, or its policy stops it.
-    next_restart_at: std::collections::HashMap<String, tokio::time::Instant>,
+    next_restart_at: std::collections::HashMap<String, Instant>,
 }
 
 impl Supervisor {
     /// Create a new supervisor.
-    pub fn new(state: Arc<ApiState>, shutdown_rx: watch::Receiver<bool>) -> Self {
+    pub fn new(state: Arc<ApiState>, shutdown: Shutdown) -> Self {
         Self {
             state,
-            shutdown_rx,
+            shutdown,
             next_restart_at: std::collections::HashMap::new(),
         }
     }
@@ -55,35 +58,58 @@ impl Supervisor {
     ///
     /// This method blocks until shutdown is signaled.
     pub async fn run(mut self) {
-        let mut ticker = tokio::time::interval(CHECK_INTERVAL);
-        // Don't catch up on missed ticks
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         tracing::info!("supervisor started");
 
+        // Tokio's interval fires its first tick immediately. Preserve that
+        // startup check before switching to the skip-missed-ticks cadence
+        // below, so persisted dead machines are considered without a five
+        // second blind window after `serve` starts.
+        self.run_health_tick().await;
+
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    // The tick firing proves the main runtime's timer wheel is
-                    // still being driven — record it so the loopback `/capacity`
-                    // door (on its own runtime) can report the node stalled if
-                    // these ever stop. Bump BEFORE the work below so a slow
-                    // health check doesn't itself register as a stall.
-                    self.state.beat_runtime_heartbeat();
-                    // Reap exited VM boot subprocesses (selective, per registered
-                    // PID) BEFORE the health check, so a just-crashed VM's zombie
-                    // is gone and `is_alive` reports it crashed this same tick.
-                    crate::process::reap_vm_children();
-                    self.check_all_machines().await;
+            enum Wake {
+                Tick,
+                Shutdown,
+            }
+
+            // A fresh timer is created after the work below completes. That
+            // deliberately skips missed ticks rather than making a slow health
+            // pass run repeatedly to catch up.
+            match future::or(
+                async {
+                    crate::runtime::sleep(CHECK_INTERVAL).await;
+                    Wake::Tick
+                },
+                async {
+                    self.shutdown.wait().await;
+                    Wake::Shutdown
+                },
+            )
+            .await
+            {
+                Wake::Tick => {
+                    self.run_health_tick().await;
                 }
-                _ = self.shutdown_rx.changed() => {
-                    if *self.shutdown_rx.borrow() {
-                        tracing::info!("supervisor shutting down");
-                        break;
-                    }
+                Wake::Shutdown => {
+                    tracing::info!("supervisor shutting down");
+                    break;
                 }
             }
         }
+    }
+
+    async fn run_health_tick(&mut self) {
+        // The tick firing proves the main runtime's timer wheel is still being
+        // driven — record it so the loopback `/capacity` door (on its own
+        // runtime) can report the node stalled if these ever stop. Bump BEFORE
+        // the work below so a slow health check doesn't itself register as a
+        // stall.
+        self.state.beat_runtime_heartbeat();
+        // Reap exited VM boot subprocesses (selective, per registered PID)
+        // BEFORE the health check, so a just-crashed VM's zombie is gone and
+        // `is_alive` reports it crashed this same tick.
+        crate::process::reap_vm_children();
+        self.check_all_machines().await;
     }
 
     /// Check all machines and restart any that need it.
@@ -160,7 +186,7 @@ impl Supervisor {
         // Honor the backoff by SCHEDULING, not sleeping: blocking here would
         // stall every other machine's check this tick. See `restart_timing`.
         let backoff = restart_config.backoff_duration();
-        let now = tokio::time::Instant::now();
+        let now = Instant::now();
         match Self::restart_timing(&mut self.next_restart_at, name, backoff, now) {
             RestartTiming::Waiting => return Ok(()),
             RestartTiming::Armed => {
@@ -196,10 +222,10 @@ impl Supervisor {
     /// unit-testable; the live ticker's resolution bounds how promptly `Armed`
     /// transitions to `Fire`.
     fn restart_timing(
-        schedule: &mut std::collections::HashMap<String, tokio::time::Instant>,
+        schedule: &mut std::collections::HashMap<String, Instant>,
         name: &str,
         backoff: Duration,
-        now: tokio::time::Instant,
+        now: Instant,
     ) -> RestartTiming {
         if backoff <= MIN_RESTART_DELAY {
             schedule.remove(name);
@@ -295,7 +321,12 @@ impl Supervisor {
         let name_for_features = name.to_string();
 
         let entry_clone = entry.clone();
-        let start_result = tokio::task::spawn_blocking(move || {
+        let runtime = self
+            .state
+            .runtime()
+            .map_err(|error| crate::Error::agent("ensure running", format!("{error:?}")))?;
+        let start_result = runtime
+            .spawn_blocking(move || {
             let entry = entry_clone.lock();
             // Wire pre-extracted layers if this machine was created from a .smolmachine.
             let mut features = crate::api::state::build_launch_features(
@@ -310,8 +341,9 @@ impl Supervisor {
                 .manager
                 .ensure_running_via_subprocess(mounts, ports, resources, features)
         })
-        .await
-        .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?;
+            .map_err(|error| crate::Error::agent("ensure running", error.to_string()))?
+            .await
+            .map_err(|error| crate::Error::agent("ensure running", error.to_string()))?;
 
         // Handle start result
         match start_result {
@@ -384,7 +416,7 @@ mod restart_timing_tests {
     use super::{RestartTiming, Supervisor, MIN_RESTART_DELAY};
     use std::collections::HashMap;
     use std::time::Duration;
-    use tokio::time::Instant;
+    use std::time::Instant;
 
     // A backoff at or below the minimum restarts immediately and schedules nothing.
     #[test]

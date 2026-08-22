@@ -12,9 +12,11 @@ use crate::{
     OciDescriptor, OciIndex, OciIndexManifest, OciManifest, OciPlatform, Result, CONFIG_MEDIA_TYPE,
     INDEX_MEDIA_TYPE, LAYER_MEDIA_TYPE, MANIFEST_MEDIA_TYPE,
 };
+use crate::blocking_io::BlockingFile;
+use h12tiny::util;
 use sha2::{Digest, Sha256};
+use futures_lite::io::AsyncReadExt;
 use std::path::Path;
-use tokio::io::AsyncReadExt;
 
 /// Result of a successful push.
 #[derive(Debug)]
@@ -44,11 +46,11 @@ pub async fn push(
     smolmachine_path: &Path,
 ) -> Result<PushResult> {
     // 1. Compute SHA256 digest (pass 1: stream through hasher, no full-file buffer).
-    let file = tokio::fs::File::open(smolmachine_path).await?;
-    let file_meta = file.metadata().await?;
+    let file_meta = crate::blocking_io::metadata(&client.blocking_executor(), smolmachine_path).await?;
     let layer_size = file_meta.len();
 
-    let mut reader = tokio::io::BufReader::new(file);
+    let file = BlockingFile::open(client.blocking_executor(), smolmachine_path).await?;
+    let mut reader = futures_lite::io::BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 256 * 1024];
     loop {
@@ -89,14 +91,18 @@ pub async fn push(
     // fresh stream; the OS page cache makes reopens cheap.
     tracing::info!("uploading sidecar blob...");
     let path = smolmachine_path.to_path_buf();
+    let executor = client.blocking_executor();
+    let make_body = move || {
+        let path = path.clone();
+        let executor = executor.clone();
+        async move {
+            let file = BlockingFile::open(executor, path).await?;
+            let stream = util::reader_body(file);
+            Ok(util::boxed_body(stream))
+        }
+    };
     client
-        .push_blob_stream(repo, &layer_digest, layer_size, move || {
-            // std::fs::File::open is synchronous but fast (just a syscall).
-            let file = std::fs::File::open(&path).map_err(crate::RegistryError::from)?;
-            let async_file = tokio::fs::File::from_std(file);
-            let stream = tokio_util::io::ReaderStream::with_capacity(async_file, 256 * 1024);
-            Ok(reqwest::Body::wrap_stream(stream))
-        })
+        .push_blob_stream(repo, &layer_digest, layer_size, make_body)
         .await?;
 
     // 4. Upload config blob (small, buffered is fine).

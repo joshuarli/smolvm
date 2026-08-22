@@ -7,6 +7,7 @@
 
 use crate::api::rollout::RolloutError;
 use crate::cuda_daemon::RedeemedTensorBundle;
+use crate::runtime::RuntimeHandle;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
@@ -70,10 +71,17 @@ impl DeviceHandoffClient {
         &self.path
     }
 
-    pub(crate) async fn health(&self) -> Result<(), RolloutError> {
+    pub(crate) async fn health(
+        &self,
+        runtime: &RuntimeHandle,
+    ) -> Result<(), RolloutError> {
         let path = self.path.clone();
         let timeout = self.timeout.min(Duration::from_secs(10));
-        tokio::task::spawn_blocking(move || transact(&path, timeout, OP_HEALTH, "", None))
+        runtime
+            .spawn_blocking(move || transact(&path, timeout, OP_HEALTH, "", None))
+            .map_err(|error| {
+                RolloutError::Backend(format!("device handoff task failed: {error}"))
+            })?
             .await
             .map_err(|error| {
                 RolloutError::Backend(format!("device handoff task failed: {error}"))
@@ -83,6 +91,7 @@ impl DeviceHandoffClient {
 
     pub(crate) async fn load(
         &self,
+        runtime: &RuntimeHandle,
         model: &str,
         bundle: RedeemedTensorBundle,
     ) -> Result<(), RolloutError> {
@@ -91,20 +100,32 @@ impl DeviceHandoffClient {
         let path = self.path.clone();
         let timeout = self.timeout;
         let model = model.to_string();
-        tokio::task::spawn_blocking(move || {
-            transact(&path, timeout, OP_LOAD, &model, Some(bundle))
-        })
-        .await
-        .map_err(|error| RolloutError::Backend(format!("device handoff task failed: {error}")))??;
+        runtime
+            .spawn_blocking(move || transact(&path, timeout, OP_LOAD, &model, Some(bundle)))
+            .map_err(|error| {
+                RolloutError::Backend(format!("device handoff task failed: {error}"))
+            })?
+            .await
+            .map_err(|error| {
+                RolloutError::Backend(format!("device handoff task failed: {error}"))
+            })??;
         Ok(())
     }
 
-    pub(crate) async fn unload(&self, model: &str) -> Result<(), RolloutError> {
+    pub(crate) async fn unload(
+        &self,
+        runtime: &RuntimeHandle,
+        model: &str,
+    ) -> Result<(), RolloutError> {
         validate_model_name(model)?;
         let path = self.path.clone();
         let timeout = self.timeout;
         let model = model.to_string();
-        tokio::task::spawn_blocking(move || transact(&path, timeout, OP_UNLOAD, &model, None))
+        runtime
+            .spawn_blocking(move || transact(&path, timeout, OP_UNLOAD, &model, None))
+            .map_err(|error| {
+                RolloutError::Backend(format!("device handoff task failed: {error}"))
+            })?
             .await
             .map_err(|error| {
                 RolloutError::Backend(format!("device handoff task failed: {error}"))
@@ -483,8 +504,8 @@ mod tests {
         assert!(validate_bundle_metadata(&metadata(duplicate, &[(0, 16), (16, 16)]), 64).is_err());
     }
 
-    #[tokio::test]
-    async fn descriptor_owner_survives_load_until_unload_acknowledgement() {
+    #[test]
+    fn descriptor_owner_survives_load_until_unload_acknowledgement() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("device-adapter.sock");
         let listener = UnixListener::bind(&path).unwrap();
@@ -520,7 +541,9 @@ mod tests {
         });
 
         let client = DeviceHandoffClient::new(&path, Duration::from_secs(2)).unwrap();
-        client.health().await.unwrap();
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let runtime_handle = runtime.handle();
+        runtime.block_on(client.health(&runtime_handle)).unwrap();
         let manifest = serde_json::json!({
             "schema": MANIFEST_SCHEMA,
             "adapterConfig": {},
@@ -534,8 +557,12 @@ mod tests {
             allocation_size: 64,
             metadata: metadata(manifest, &[(0, 16)]),
         };
-        client.load("executor-policy-step", bundle).await.unwrap();
-        client.unload("executor-policy-step").await.unwrap();
+        runtime
+            .block_on(client.load(&runtime_handle, "executor-policy-step", bundle))
+            .unwrap();
+        runtime
+            .block_on(client.unload(&runtime_handle, "executor-policy-step"))
+            .unwrap();
         server.join().unwrap();
     }
 }

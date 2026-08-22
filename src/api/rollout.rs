@@ -6,9 +6,7 @@
 //! OpenAI-compatible completion API; isolated fork pools remain the advertised
 //! fallback for requests a fused backend cannot represent.
 
-use futures_util::StreamExt;
-use parking_lot::Mutex as SyncMutex;
-use reqwest::{redirect::Policy, Client};
+use parking_lot::{Mutex as SyncMutex, RwLock as SyncRwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -17,8 +15,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, OnceCell, RwLock, Semaphore};
 use utoipa::ToSchema;
+
+use h12tiny::client::{Client, Error as HttpError};
+use h12tiny::util::{self, BoxBody};
+use h12tiny::web::{Method, Request, StatusCode};
+
+use crate::runtime::{sleep, timeout, timeout_at, Notify, RuntimeHandle, Semaphore};
 
 #[cfg(target_os = "linux")]
 use crate::api::device_handoff::DeviceHandoffClient;
@@ -413,7 +416,29 @@ struct CachedError {
 struct IdempotencyEntry {
     digest: [u8; 32],
     created: Instant,
-    result: OnceCell<Result<Arc<RolloutGenerateResponse>, CachedError>>,
+    result: SyncMutex<Option<Result<Arc<RolloutGenerateResponse>, CachedError>>>,
+    running: AtomicBool,
+    changed: Notify,
+}
+
+/// Resets a claimed idempotency entry if the caller that owns the execution is
+/// cancelled before publishing a result. Tokio's `OnceCell` provided this
+/// cancellation safety implicitly; the runtime-neutral state machine keeps it
+/// explicit so retries cannot wait forever on a dropped request.
+struct IdempotencyRunGuard {
+    entry: Arc<IdempotencyEntry>,
+    completed: bool,
+}
+
+impl Drop for IdempotencyRunGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.entry.running.store(false, Ordering::Release);
+            // Keep one edge for a waiter that has not yet registered. That
+            // waiter can claim the entry and retry the cancelled operation.
+            self.entry.changed.notify_one();
+        }
+    }
 }
 
 struct PolicyEntry {
@@ -427,7 +452,7 @@ struct PolicyEntry {
     active: AtomicUsize,
     retiring: AtomicBool,
     drained: Notify,
-    retirement: Mutex<()>,
+    retirement: Semaphore,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -467,9 +492,17 @@ struct CohortEntry {
 #[derive(Default)]
 struct CohortAdmission {
     entries: SyncMutex<HashMap<String, Arc<CohortEntry>>>,
+    runtime: Option<RuntimeHandle>,
 }
 
 impl CohortAdmission {
+    fn with_runtime(runtime: RuntimeHandle) -> Self {
+        Self {
+            entries: SyncMutex::new(HashMap::new()),
+            runtime: Some(runtime),
+        }
+    }
+
     fn join(
         self: &Arc<Self>,
         cohort: &RolloutCohort,
@@ -571,7 +604,7 @@ impl CohortTicket {
         let deadline = self
             .entry
             .max_wait_ms
-            .map(|wait_ms| tokio::time::Instant::now() + Duration::from_millis(wait_ms));
+            .map(|wait_ms| Instant::now() + Duration::from_millis(wait_ms));
         loop {
             let changed = self.entry.changed.notified();
             match self.entry.state.load(Ordering::Acquire) {
@@ -588,7 +621,7 @@ impl CohortTicket {
                 }
                 _ => {
                     if let Some(deadline) = deadline {
-                        if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                        if timeout_at(deadline, changed).await.is_err() {
                             self.release_partial();
                         }
                     } else {
@@ -620,18 +653,23 @@ impl CohortTicket {
         metrics::histogram!("smolvm_rollout_cohort_size").record(self.entry.expected as f64);
         metrics::histogram!("smolvm_rollout_cohort_admitted_size").record(admitted as f64);
 
-        let admission = self.admission.clone();
-        let entry = self.entry.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(PARTIAL_COHORT_RETENTION).await;
-            let mut entries = admission.entries.lock();
-            if entries
-                .get(&entry.id)
-                .is_some_and(|current| Arc::ptr_eq(current, &entry))
-            {
-                entries.remove(&entry.id);
+        if let Some(runtime) = &self.admission.runtime {
+            let runtime = runtime.clone();
+            let admission = self.admission.clone();
+            let entry = self.entry.clone();
+            if let Ok(task) = runtime.spawn(async move {
+                sleep(PARTIAL_COHORT_RETENTION).await;
+                let mut entries = admission.entries.lock();
+                if entries
+                    .get(&entry.id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                {
+                    entries.remove(&entry.id);
+                }
+            }) {
+                task.detach();
             }
-        });
+        }
     }
 }
 
@@ -667,7 +705,10 @@ impl Drop for CohortTicket {
 impl Drop for PolicyGuard {
     fn drop(&mut self) {
         if self.policy.active.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.policy.drained.notify_waiters();
+            // Only the retirement owner waits on this entry. `notify_one`
+            // retains an edge when the waiter has not yet been polled, which
+            // closes the check/await race without Tokio's `enable` API.
+            self.policy.drained.notify_one();
         }
     }
 }
@@ -691,47 +732,72 @@ struct PolicyState {
 
 pub(crate) struct RolloutExecutor {
     config: ExecutorConfig,
-    http: Client,
+    runtime: RuntimeHandle,
+    http: Client<BoxBody>,
     permits: Semaphore,
     queued: AtomicU32,
     active: AtomicU32,
     accepting: AtomicBool,
-    policy_state: RwLock<PolicyState>,
-    publish_lock: Mutex<()>,
+    policy_state: SyncRwLock<PolicyState>,
+    publish_lock: Semaphore,
     cohort_admission: Arc<CohortAdmission>,
-    idempotency: Mutex<HashMap<String, Arc<IdempotencyEntry>>>,
+    idempotency: SyncMutex<HashMap<String, Arc<IdempotencyEntry>>>,
 }
 
 /// In-memory executor registry. The framework client re-registers declaratively
 /// after a node restart, while immutable policy state remains in its adapter root.
 #[derive(Default)]
 pub struct RolloutRegistry {
-    executors: RwLock<HashMap<String, Arc<RolloutExecutor>>>,
+    executors: SyncRwLock<HashMap<String, Arc<RolloutExecutor>>>,
+    runtime: Option<RuntimeHandle>,
 }
 
 impl RolloutRegistry {
+    /// Construct a registry bound to the caller-owned application runtime.
+    ///
+    /// The runtime supplies h12tiny connection tasks, bounded blocking work,
+    /// cohort retention timers, and request deadlines. `ApiState` should call
+    /// this constructor when it receives its server-lifetime handle.
+    pub fn new(runtime: RuntimeHandle) -> Self {
+        Self {
+            executors: SyncRwLock::new(HashMap::new()),
+            runtime: Some(runtime),
+        }
+    }
+
+    /// Explicit-runtime spelling retained for callers that prefer builder-like
+    /// naming while the API state migration is staged.
+    pub fn with_runtime(runtime: RuntimeHandle) -> Self {
+        Self::new(runtime)
+    }
+
     /// Register an executor after validating its local trust boundary and health.
     pub(crate) async fn create(
         &self,
         request: CreateRolloutExecutorRequest,
     ) -> Result<RolloutExecutorInfo, RolloutError> {
-        let executor = Arc::new(RolloutExecutor::new(request)?);
+        let runtime = self.runtime.clone().ok_or_else(|| {
+            RolloutError::Unavailable(
+                "rollout registry requires an application runtime".into(),
+            )
+        })?;
+        let executor = Arc::new(RolloutExecutor::new(request, runtime)?);
         executor.health().await?;
-        let mut executors = self.executors.write().await;
+        let info = executor.info().await;
+        let mut executors = self.executors.write();
         if executors.contains_key(&executor.config.name) {
             return Err(RolloutError::Conflict(format!(
                 "rollout executor '{}' already exists",
                 executor.config.name
             )));
         }
-        let info = executor.info().await;
         executors.insert(executor.config.name.clone(), executor);
         Ok(info)
     }
 
     /// List registered executors.
     pub async fn list(&self) -> Vec<RolloutExecutorInfo> {
-        let values: Vec<_> = self.executors.read().await.values().cloned().collect();
+        let values: Vec<_> = self.executors.read().values().cloned().collect();
         let mut infos = Vec::with_capacity(values.len());
         for executor in values {
             infos.push(executor.info().await);
@@ -744,7 +810,6 @@ impl RolloutRegistry {
     pub(crate) async fn get(&self, name: &str) -> Result<Arc<RolloutExecutor>, RolloutError> {
         self.executors
             .read()
-            .await
             .get(name)
             .cloned()
             .ok_or_else(|| RolloutError::NotFound(format!("rollout executor '{name}' not found")))
@@ -755,7 +820,6 @@ impl RolloutRegistry {
         let executor = self
             .executors
             .read()
-            .await
             .get(name)
             .cloned()
             .ok_or_else(|| {
@@ -764,7 +828,7 @@ impl RolloutRegistry {
         executor.accepting.store(false, Ordering::Release);
         executor.cohort_admission.cancel_all();
         executor.shutdown().await?;
-        let mut executors = self.executors.write().await;
+        let mut executors = self.executors.write();
         if executors
             .get(name)
             .is_some_and(|current| Arc::ptr_eq(current, &executor))
@@ -776,7 +840,10 @@ impl RolloutRegistry {
 }
 
 impl RolloutExecutor {
-    fn new(request: CreateRolloutExecutorRequest) -> Result<Self, RolloutError> {
+    fn new(
+        request: CreateRolloutExecutorRequest,
+        runtime: RuntimeHandle,
+    ) -> Result<Self, RolloutError> {
         validate_name("executor", &request.name)?;
         if request.backend != "vllm" {
             return Err(RolloutError::BadRequest(format!(
@@ -824,12 +891,15 @@ impl RolloutExecutor {
         if let Some(pool) = &request.fallback_pool {
             validate_name("fallback pool", pool)?;
         }
-        let http = Client::builder()
-            .no_proxy()
-            .redirect(Policy::none())
+        // h12tiny is a direct-origin client: it has no proxy discovery or
+        // redirect layer. Its connector owns only the five-second dial
+        // deadline, while request/body deadlines remain explicit below.
+        let connector = h12tiny::client::Connector::builder()
             .connect_timeout(Duration::from_secs(5))
-            .build()
-            .map_err(|error| RolloutError::Backend(format!("build rollout client: {error}")))?;
+            .build();
+        let mut builder = Client::builder(runtime.h12_executor());
+        builder.connector(connector);
+        let http = builder.build();
         #[cfg(target_os = "linux")]
         let device_handoff = request
             .device_adapter_socket
@@ -856,48 +926,47 @@ impl RolloutExecutor {
                 max_queue_depth,
                 request_timeout: Duration::from_secs(timeout_secs),
             },
+            runtime: runtime.clone(),
             http,
             permits: Semaphore::new(max_concurrent as usize),
             queued: AtomicU32::new(0),
             active: AtomicU32::new(0),
             accepting: AtomicBool::new(true),
-            policy_state: RwLock::new(PolicyState {
+            policy_state: SyncRwLock::new(PolicyState {
                 versions: HashMap::new(),
                 current: HashMap::new(),
             }),
-            publish_lock: Mutex::new(()),
-            cohort_admission: Arc::new(CohortAdmission::default()),
-            idempotency: Mutex::new(HashMap::new()),
+            publish_lock: Semaphore::new(1),
+            cohort_admission: Arc::new(CohortAdmission::with_runtime(runtime)),
+            idempotency: SyncMutex::new(HashMap::new()),
         })
     }
 
     async fn health(&self) -> Result<(), RolloutError> {
-        let response = tokio::time::timeout(
-            Duration::from_secs(10),
-            self.http
-                .get(format!("{}/health", self.config.endpoint))
-                .send(),
-        )
-        .await
-        .map_err(|_| RolloutError::Timeout("rollout backend health check timed out".into()))?
-        .map_err(|error| {
-            RolloutError::Unavailable(format!("rollout backend health check failed: {error}"))
-        })?;
-        if !response.status().is_success() {
+        let (status, _) = self
+            .backend_request(
+                Method::GET,
+                format!("{}/health", self.config.endpoint),
+                None,
+                1024 * 1024,
+                Duration::from_secs(10),
+                "health check",
+            )
+            .await?;
+        if !status.is_success() {
             return Err(RolloutError::Unavailable(format!(
-                "rollout backend health check returned {}",
-                response.status()
+                "rollout backend health check returned {status}"
             )));
         }
         #[cfg(target_os = "linux")]
         if let Some(handoff) = &self.config.device_handoff {
-            handoff.health().await?;
+            handoff.health(&self.runtime).await?;
         }
         Ok(())
     }
 
     pub(crate) async fn info(&self) -> RolloutExecutorInfo {
-        let state = self.policy_state.read().await;
+        let state = self.policy_state.read();
         let mut policies: Vec<_> = state
             .versions
             .values()
@@ -971,7 +1040,11 @@ impl RolloutExecutor {
         validate_name("policy", &request.policy)?;
         validate_name("version", &request.version)?;
         validate_sha256(&request.adapter_sha256)?;
-        let _publish = self.publish_lock.lock().await;
+        let _publish = self
+            .publish_lock
+            .acquire()
+            .await
+            .map_err(|_| RolloutError::Unavailable("rollout executor is closed".into()))?;
         if !self.accepting.load(Ordering::Acquire) {
             return Err(RolloutError::Unavailable(format!(
                 "rollout executor '{}' is draining",
@@ -979,7 +1052,7 @@ impl RolloutExecutor {
             )));
         }
         {
-            let state = self.policy_state.read().await;
+            let state = self.policy_state.read();
             if let Some(existing) = state
                 .versions
                 .get(&(request.policy.clone(), request.version.clone()))
@@ -1018,7 +1091,11 @@ impl RolloutExecutor {
         let adapter_path = resolve_adapter_path(&self.config.adapter_root, &request.adapter_path)?;
         let expected = request.adapter_sha256.clone();
         let hash_path = adapter_path.clone();
-        let actual = tokio::task::spawn_blocking(move || hash_adapter_dir(&hash_path))
+        let task = self
+            .runtime
+            .spawn_blocking(move || hash_adapter_dir(&hash_path))
+            .map_err(|error| RolloutError::Backend(format!("adapter hash task failed: {error}")))?;
+        let actual = task
             .await
             .map_err(|error| {
                 RolloutError::Backend(format!("adapter hash task failed: {error}"))
@@ -1046,10 +1123,10 @@ impl RolloutExecutor {
             active: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
             drained: Notify::new(),
-            retirement: Mutex::new(()),
+            retirement: Semaphore::new(1),
         });
         let previous = {
-            let mut state = self.policy_state.write().await;
+            let mut state = self.policy_state.write();
             let previous_version = state
                 .current
                 .insert(request.policy.clone(), request.version.clone());
@@ -1075,7 +1152,8 @@ impl RolloutExecutor {
         };
         if let Some(previous) = previous {
             let executor = self.clone();
-            tokio::spawn(async move {
+            let runtime = executor.runtime.clone();
+            if let Ok(task) = runtime.spawn(async move {
                 if let Err(error) = executor.retire_tracked_entry(previous).await {
                     tracing::warn!(
                         executor = %executor.config.name,
@@ -1083,7 +1161,9 @@ impl RolloutExecutor {
                         "failed to retire previous rollout policy version"
                     );
                 }
-            });
+            }) {
+                task.detach();
+            }
         }
         metrics::counter!("smolvm_rollout_policy_publications_total", "executor" => self.config.name.clone(), "source" => "filesystem").increment(1);
         Ok(RolloutPolicyInfo {
@@ -1114,7 +1194,11 @@ impl RolloutExecutor {
             ));
         }
         let token_fingerprint: [u8; 32] = Sha256::digest(&token).into();
-        let _publish = self.publish_lock.lock().await;
+        let _publish = self
+            .publish_lock
+            .acquire()
+            .await
+            .map_err(|_| RolloutError::Unavailable("rollout executor is closed".into()))?;
         if !self.accepting.load(Ordering::Acquire) {
             return Err(RolloutError::Unavailable(format!(
                 "rollout executor '{}' is draining",
@@ -1122,7 +1206,7 @@ impl RolloutExecutor {
             )));
         }
         {
-            let state = self.policy_state.read().await;
+            let state = self.policy_state.read();
             if let Some(existing) = state
                 .versions
                 .get(&(request.policy.clone(), request.version.clone()))
@@ -1165,10 +1249,14 @@ impl RolloutExecutor {
             ))
         })?;
         let redeem_token = token.clone();
-        let bundle = tokio::task::spawn_blocking(move || {
-            crate::cuda_daemon::redeem_tensor_bundle(&redeem_token)
-        })
-        .await
+        let task = self
+            .runtime
+            .spawn_blocking(move || crate::cuda_daemon::redeem_tensor_bundle(&redeem_token))
+            .map_err(|error| {
+                RolloutError::Backend(format!("tensor redemption task failed: {error}"))
+            })?;
+        let bundle = task
+            .await
         .map_err(|error| RolloutError::Backend(format!("tensor redemption task failed: {error}")))?
         .map_err(|error| {
             RolloutError::Unavailable(format!("redeem device tensor bundle: {error}"))
@@ -1184,16 +1272,17 @@ impl RolloutExecutor {
             &request.version,
             &publication_sha256,
         );
-        if let Err(error) = handoff.load(&backend_model, bundle).await {
-            if let Err(cleanup) = handoff.unload(&backend_model).await {
+        if let Err(error) = handoff.load(&self.runtime, &backend_model, bundle).await {
+            if let Err(cleanup) = handoff.unload(&self.runtime, &backend_model).await {
                 let handoff = handoff.clone();
                 let executor = self.config.name.clone();
                 let cleanup_model = backend_model.clone();
-                tokio::spawn(async move {
+                let runtime = self.runtime.clone();
+                if let Ok(task) = self.runtime.spawn(async move {
                     let mut last = cleanup;
                     for attempt in 1..=3 {
-                        tokio::time::sleep(Duration::from_secs(attempt)).await;
-                        match handoff.unload(&cleanup_model).await {
+                        sleep(Duration::from_secs(attempt)).await;
+                        match handoff.unload(&runtime, &cleanup_model).await {
                             Ok(()) => return,
                             Err(error) => last = error,
                         }
@@ -1204,7 +1293,9 @@ impl RolloutExecutor {
                         error = %last.message(),
                         "failed to clean up an uncertain device-adapter load"
                     );
-                });
+                }) {
+                    task.detach();
+                }
             }
             return Err(error);
         }
@@ -1218,10 +1309,10 @@ impl RolloutExecutor {
             active: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
             drained: Notify::new(),
-            retirement: Mutex::new(()),
+            retirement: Semaphore::new(1),
         });
         let previous = {
-            let mut state = self.policy_state.write().await;
+            let mut state = self.policy_state.write();
             let previous_version = state
                 .current
                 .insert(request.policy.clone(), request.version.clone());
@@ -1247,7 +1338,7 @@ impl RolloutExecutor {
         };
         if let Some(previous) = previous {
             let executor = self.clone();
-            tokio::spawn(async move {
+            if let Ok(task) = executor.runtime.spawn(async move {
                 if let Err(error) = executor.retire_tracked_entry(previous).await {
                     tracing::warn!(
                         executor = %executor.config.name,
@@ -1255,7 +1346,9 @@ impl RolloutExecutor {
                         "failed to retire previous rollout policy version"
                     );
                 }
-            });
+            }) {
+                task.detach();
+            }
         }
         metrics::counter!("smolvm_rollout_policy_publications_total", "executor" => self.config.name.clone(), "source" => "device").increment(1);
         Ok(RolloutPolicyInfo {
@@ -1278,7 +1371,7 @@ impl RolloutExecutor {
         validate_name("policy", policy)?;
         validate_name("version", version)?;
         let entry = {
-            let mut state = self.policy_state.write().await;
+            let mut state = self.policy_state.write();
             let key = (policy.to_string(), version.to_string());
             let entry = state.versions.get(&key).cloned().ok_or_else(|| {
                 RolloutError::NotFound(format!("policy '{policy}:{version}' not found"))
@@ -1297,9 +1390,13 @@ impl RolloutExecutor {
     }
 
     async fn retire_tracked_entry(&self, entry: Arc<PolicyEntry>) -> Result<(), RolloutError> {
-        let _retirement = entry.retirement.lock().await;
+        let _retirement = entry
+            .retirement
+            .acquire()
+            .await
+            .map_err(|_| RolloutError::Unavailable("rollout executor is closed".into()))?;
         {
-            let state = self.policy_state.read().await;
+            let state = self.policy_state.read();
             let key = (entry.policy.clone(), entry.version.clone());
             if !state
                 .versions
@@ -1311,8 +1408,6 @@ impl RolloutExecutor {
         }
         loop {
             let notified = entry.drained.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
             if entry.active.load(Ordering::Acquire) == 0 {
                 break;
             }
@@ -1330,11 +1425,11 @@ impl RolloutExecutor {
                             "device adapter sidecar is no longer configured".into(),
                         )
                     })?
-                    .unload(&entry.backend_model)
+                    .unload(&self.runtime, &entry.backend_model)
                     .await?;
             }
         }
-        let mut state = self.policy_state.write().await;
+        let mut state = self.policy_state.write();
         let key = (entry.policy.clone(), entry.version.clone());
         if state
             .versions
@@ -1349,9 +1444,13 @@ impl RolloutExecutor {
     async fn shutdown(&self) -> Result<(), RolloutError> {
         // Wait for a publication already in flight, then prevent any later
         // publication from inserting an adapter after this snapshot.
-        let _publish = self.publish_lock.lock().await;
+        let _publish = self
+            .publish_lock
+            .acquire()
+            .await
+            .map_err(|_| RolloutError::Unavailable("rollout executor is closed".into()))?;
         let entries = {
-            let mut state = self.policy_state.write().await;
+            let mut state = self.policy_state.write();
             state.current.clear();
             state
                 .versions
@@ -1370,20 +1469,60 @@ impl RolloutExecutor {
         first.map_or(Ok(()), Err)
     }
 
+    /// Send one direct-origin backend request and collect its response under a
+    /// hard byte cap. h12tiny deliberately leaves request deadlines to this
+    /// application boundary, so the timeout covers both response headers and
+    /// body frames just as Reqwest's request timeout did.
+    async fn backend_request(
+        &self,
+        method: Method,
+        url: String,
+        payload: Option<serde_json::Value>,
+        cap: usize,
+        deadline: Duration,
+        operation: &str,
+    ) -> Result<(StatusCode, Vec<u8>), RolloutError> {
+        let request = json_request(method, url, payload)?;
+        timeout(deadline, async {
+            let response = self
+                .http
+                .request(request)
+                .await
+                .map_err(|error| backend_send_error(operation, error))?;
+            let status = response.status();
+            let bytes = match util::collect_bytes_limited(response.into_body(), cap).await {
+                Ok(bytes) => bytes.to_vec(),
+                Err(error) if error.is_limit_exceeded() => {
+                    return Err(RolloutError::Backend(format!(
+                        "rollout backend response exceeds {cap} bytes"
+                    )))
+                }
+                Err(error) => {
+                    return Err(RolloutError::Unavailable(format!(
+                        "read rollout backend response: {error}"
+                    )))
+                }
+            };
+            Ok((status, bytes))
+        })
+        .await
+        .map_err(|_| RolloutError::Timeout(format!("rollout backend {operation} timed out")))?
+    }
+
     async fn load_adapter(&self, model: &str, path: &Path) -> Result<(), RolloutError> {
-        let response = self
-            .http
-            .post(format!("{}/v1/load_lora_adapter", self.config.endpoint))
-            .json(&serde_json::json!({
+        let (status, bytes) = self
+            .backend_request(
+                Method::POST,
+                format!("{}/v1/load_lora_adapter", self.config.endpoint),
+                Some(serde_json::json!({
                 "lora_name": model,
                 "lora_path": path,
-            }))
-            .timeout(self.config.request_timeout)
-            .send()
-            .await
-            .map_err(|error| backend_send_error("load adapter", error))?;
-        let status = response.status();
-        let bytes = read_body_capped(response, 1024 * 1024).await?;
+                })),
+                1024 * 1024,
+                self.config.request_timeout,
+                "load adapter",
+            )
+            .await?;
         if status.is_success() || self.backend_has_model(model).await? {
             Ok(())
         } else {
@@ -1395,16 +1534,16 @@ impl RolloutExecutor {
     }
 
     async fn unload_adapter(&self, model: &str) -> Result<(), RolloutError> {
-        let response = self
-            .http
-            .post(format!("{}/v1/unload_lora_adapter", self.config.endpoint))
-            .json(&serde_json::json!({"lora_name": model}))
-            .timeout(self.config.request_timeout)
-            .send()
-            .await
-            .map_err(|error| backend_send_error("unload adapter", error))?;
-        let status = response.status();
-        let bytes = read_body_capped(response, 1024 * 1024).await?;
+        let (status, bytes) = self
+            .backend_request(
+                Method::POST,
+                format!("{}/v1/unload_lora_adapter", self.config.endpoint),
+                Some(serde_json::json!({"lora_name": model})),
+                1024 * 1024,
+                self.config.request_timeout,
+                "unload adapter",
+            )
+            .await?;
         if status.is_success() || !self.backend_has_model(model).await? {
             Ok(())
         } else {
@@ -1416,15 +1555,16 @@ impl RolloutExecutor {
     }
 
     async fn backend_has_model(&self, model: &str) -> Result<bool, RolloutError> {
-        let response = self
-            .http
-            .get(format!("{}/v1/models", self.config.endpoint))
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|error| backend_send_error("list models", error))?;
-        let status = response.status();
-        let bytes = read_body_capped(response, 4 * 1024 * 1024).await?;
+        let (status, bytes) = self
+            .backend_request(
+                Method::GET,
+                format!("{}/v1/models", self.config.endpoint),
+                None,
+                4 * 1024 * 1024,
+                Duration::from_secs(10),
+                "list models",
+            )
+            .await?;
         if !status.is_success() {
             return Err(RolloutError::Backend(format!(
                 "rollout backend list models returned {status}: {}",
@@ -1462,14 +1602,14 @@ impl RolloutExecutor {
         )
         .into();
         let (entry, created) = {
-            let mut cache = self.idempotency.lock().await;
+            let mut cache = self.idempotency.lock();
             let now = Instant::now();
             if cache.len() >= MAX_IDEMPOTENCY_ENTRIES {
                 cache.retain(|_, item| now.duration_since(item.created) < IDEMPOTENCY_TTL);
                 if cache.len() >= MAX_IDEMPOTENCY_ENTRIES {
                     let completed_oldest = cache
                         .iter()
-                        .filter(|(_, item)| item.result.get().is_some())
+                        .filter(|(_, item)| item.result.lock().is_some())
                         .min_by_key(|(_, item)| item.created)
                         .map(|(key, _)| key.clone());
                     if let Some(key) = completed_oldest {
@@ -1494,7 +1634,9 @@ impl RolloutExecutor {
                 let entry = Arc::new(IdempotencyEntry {
                     digest,
                     created: now,
-                    result: OnceCell::new(),
+                    result: SyncMutex::new(None),
+                    running: AtomicBool::new(false),
+                    changed: Notify::new(),
                 });
                 cache.insert(request.idempotency_key.clone(), entry.clone());
                 (entry, true)
@@ -1502,16 +1644,37 @@ impl RolloutExecutor {
         };
         let executor = self.clone();
         let request_for_run = request.clone();
-        let result = entry
-            .result
-            .get_or_init(|| async move {
-                executor
+        let result = loop {
+            if let Some(result) = entry.result.lock().clone() {
+                break result;
+            }
+            if entry
+                .running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let mut run_guard = IdempotencyRunGuard {
+                    entry: entry.clone(),
+                    completed: false,
+                };
+                let result = executor
                     .execute_generate(request_for_run)
                     .await
                     .map(Arc::new)
-                    .map_err(|value| CachedError { value })
-            })
-            .await;
+                    .map_err(|value| CachedError { value });
+                *entry.result.lock() = Some(result.clone());
+                run_guard.completed = true;
+                entry.changed.notify_waiters();
+                break result;
+            }
+            let changed = entry.changed.notified();
+            // A result may have been published between the first check and
+            // registration of this waiter. Check again before awaiting so a
+            // notify_waiters edge cannot be lost.
+            if entry.result.lock().is_none() {
+                changed.await;
+            }
+        };
         match result {
             Ok(response) => {
                 let mut response = response.as_ref().clone();
@@ -1519,7 +1682,7 @@ impl RolloutExecutor {
                 Ok(response)
             }
             Err(error) => {
-                let mut cache = self.idempotency.lock().await;
+                let mut cache = self.idempotency.lock();
                 if cache
                     .get(&request.idempotency_key)
                     .is_some_and(|current| Arc::ptr_eq(current, &entry))
@@ -1540,7 +1703,7 @@ impl RolloutExecutor {
             .map(Duration::from_millis)
             .unwrap_or(self.config.request_timeout)
             .min(self.config.request_timeout);
-        tokio::time::timeout(deadline, self.execute_generate_inner(request))
+        timeout(deadline, self.execute_generate_inner(request))
             .await
             .map_err(|_| RolloutError::Timeout("rollout request deadline exceeded".into()))?
     }
@@ -1564,15 +1727,16 @@ impl RolloutExecutor {
         let _permit = self.acquire_queue_permit().await?;
         let body = completion_body(&request, &policy.backend_model)?;
         let started = Instant::now();
-        let response = self
-            .http
-            .post(format!("{}/v1/completions", self.config.endpoint))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| backend_send_error("generate", error))?;
-        let status = response.status();
-        let bytes = read_body_capped(response, MAX_BACKEND_BODY_BYTES).await?;
+        let (status, bytes) = self
+            .backend_request(
+                Method::POST,
+                format!("{}/v1/completions", self.config.endpoint),
+                Some(body),
+                MAX_BACKEND_BODY_BYTES,
+                self.config.request_timeout,
+                "generate",
+            )
+            .await?;
         if !status.is_success() {
             return Err(RolloutError::Backend(format!(
                 "rollout backend generate returned {status}: {}",
@@ -1605,7 +1769,7 @@ impl RolloutExecutor {
         policy: &str,
         version: Option<&str>,
     ) -> Result<Arc<PolicyEntry>, RolloutError> {
-        let state = self.policy_state.read().await;
+        let state = self.policy_state.read();
         let version = match version {
             Some(value) => value.to_string(),
             None => state.current.get(policy).cloned().ok_or_else(|| {
@@ -1685,7 +1849,7 @@ impl Drop for QueuedGuard<'_> {
 }
 
 struct ActivePermit<'a> {
-    _permit: tokio::sync::SemaphorePermit<'a>,
+    _permit: crate::runtime::SemaphorePermit<'a>,
     active: &'a AtomicU32,
 }
 
@@ -2023,40 +2187,30 @@ fn completion_body(
     Ok(body)
 }
 
-fn backend_send_error(operation: &str, error: reqwest::Error) -> RolloutError {
-    if error.is_timeout() {
-        RolloutError::Timeout(format!("rollout backend {operation} timed out"))
-    } else {
-        RolloutError::Unavailable(format!("rollout backend {operation} failed: {error}"))
+fn json_request(
+    method: Method,
+    url: String,
+    payload: Option<serde_json::Value>,
+) -> Result<Request<BoxBody>, RolloutError> {
+    let (body, has_json) = match payload {
+        Some(payload) => {
+            let bytes = serde_json::to_vec(&payload)
+                .map_err(|error| RolloutError::BadRequest(error.to_string()))?;
+            (util::boxed_body(util::bytes_body(bytes)), true)
+        }
+        None => (util::boxed_body(util::empty_body()), false),
+    };
+    let mut builder = Request::builder().method(method).uri(url);
+    if has_json {
+        builder = builder.header("content-type", "application/json");
     }
+    builder
+        .body(body)
+        .map_err(|error| RolloutError::Backend(format!("build rollout backend request: {error}")))
 }
 
-async fn read_body_capped(
-    response: reqwest::Response,
-    cap: usize,
-) -> Result<Vec<u8>, RolloutError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > cap as u64)
-    {
-        return Err(RolloutError::Backend(format!(
-            "rollout backend response exceeds {cap} bytes"
-        )));
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            RolloutError::Unavailable(format!("read rollout backend response: {error}"))
-        })?;
-        if body.len().saturating_add(chunk.len()) > cap {
-            return Err(RolloutError::Backend(format!(
-                "rollout backend response exceeds {cap} bytes"
-            )));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+fn backend_send_error(operation: &str, error: HttpError) -> RolloutError {
+    RolloutError::Unavailable(format!("rollout backend {operation} failed: {error}"))
 }
 
 fn body_excerpt(body: &[u8]) -> String {
@@ -2067,18 +2221,27 @@ fn body_excerpt(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        extract::State,
-        http::StatusCode,
-        routing::{get, post},
-        Json, Router,
-    };
+    use h12tiny::server::serve;
+    use h12tiny::web::{get, post, Router, State, StatusCode};
+    use crate::api::Json;
     use std::io::Write as _;
+    use crate::runtime::{Runtime, RuntimeTask, ShutdownTrigger};
+    use std::sync::OnceLock;
+
+    static TEST_RUNTIME: OnceLock<&'static Runtime> = OnceLock::new();
+
+    fn test_runtime_instance() -> &'static Runtime {
+        *TEST_RUNTIME.get_or_init(|| Box::leak(Box::new(Runtime::with_workers(4).unwrap())))
+    }
+
+    fn test_runtime() -> RuntimeHandle {
+        test_runtime_instance().handle()
+    }
 
     #[derive(Default)]
     struct MockBackend {
-        loads: Mutex<Vec<serde_json::Value>>,
-        unloads: Mutex<Vec<serde_json::Value>>,
+        loads: SyncMutex<Vec<serde_json::Value>>,
+        unloads: SyncMutex<Vec<serde_json::Value>>,
         block_load: AtomicBool,
         load_started: Notify,
         release_load: Notify,
@@ -2086,15 +2249,27 @@ mod tests {
         generations: AtomicUsize,
     }
 
-    async fn start_mock_backend() -> (SocketAddr, Arc<MockBackend>, tokio::task::JoinHandle<()>) {
-        async fn health() -> StatusCode {
+    struct MockBackendServer {
+        task: RuntimeTask<std::io::Result<()>>,
+        shutdown: ShutdownTrigger,
+    }
+
+    impl MockBackendServer {
+        fn stop(self) {
+            self.shutdown.trigger();
+            drop(self.task);
+        }
+    }
+
+    async fn start_mock_backend() -> (SocketAddr, Arc<MockBackend>, MockBackendServer) {
+        async fn health(State(_state): State<Arc<MockBackend>>) -> StatusCode {
             StatusCode::OK
         }
         async fn load(
             State(state): State<Arc<MockBackend>>,
             Json(body): Json<serde_json::Value>,
         ) -> StatusCode {
-            state.loads.lock().await.push(body);
+            state.loads.lock().push(body);
             if state.block_load.load(Ordering::Acquire) {
                 state.load_started.notify_one();
                 state.release_load.notified().await;
@@ -2105,7 +2280,7 @@ mod tests {
             State(state): State<Arc<MockBackend>>,
             Json(body): Json<serde_json::Value>,
         ) -> StatusCode {
-            state.unloads.lock().await.push(body);
+            state.unloads.lock().push(body);
             if state
                 .unload_failures
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -2147,7 +2322,6 @@ mod tests {
             let models = state
                 .loads
                 .lock()
-                .await
                 .iter()
                 .filter_map(|body| body["lora_name"].as_str())
                 .map(|name| serde_json::json!({"id": name}))
@@ -2156,19 +2330,23 @@ mod tests {
         }
 
         let state = Arc::new(MockBackend::default());
-        let app = Router::new()
+        let app = Router::<Arc<MockBackend>>::new()
             .route("/health", get(health))
             .route("/v1/load_lora_adapter", post(load))
             .route("/v1/unload_lora_adapter", post(unload))
             .route("/v1/completions", post(completion))
             .route("/v1/models", get(models))
             .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = async_net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (address, state, handle)
+        let (shutdown, signal) = crate::runtime::shutdown_signal();
+        let executor = test_runtime().h12_executor();
+        let task = test_runtime().spawn(async move {
+            serve(listener, app, executor)
+                .shutdown_on(async move { signal.wait().await })
+                .await
+        }).expect("test runtime accepts mock backend");
+        (address, state, MockBackendServer { task, shutdown })
     }
 
     fn sample_generate(key: &str) -> RolloutGenerateRequest {
@@ -2197,8 +2375,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn distributed_cohort_releases_only_at_exact_membership() {
+    #[test]
+    fn distributed_cohort_releases_only_at_exact_membership() {
+        test_runtime_instance().block_on(async {
         let admission = Arc::new(CohortAdmission::default());
         let cohort = RolloutCohort {
             id: "round-1".into(),
@@ -2206,8 +2385,8 @@ mod tests {
             max_wait_ms: None,
         };
         let first = admission.join(&cohort, "request-1").unwrap();
-        let first = tokio::spawn(first.wait());
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let first = test_runtime().spawn(first.wait()).expect("test runtime accepts cohort waiter");
+        sleep(Duration::from_millis(10)).await;
         assert!(!first.is_finished());
 
         admission
@@ -2216,16 +2395,17 @@ mod tests {
             .wait()
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_millis(50), first)
+        timeout(Duration::from_millis(50), first)
             .await
             .expect("a complete cohort must release every member")
-            .unwrap()
             .unwrap();
         assert!(admission.entries.lock().is_empty());
+        });
     }
 
-    #[tokio::test]
-    async fn distributed_cohort_releases_arrived_members_after_bounded_wait() {
+    #[test]
+    fn distributed_cohort_releases_arrived_members_after_bounded_wait() {
+        test_runtime_instance().block_on(async {
         let admission = Arc::new(CohortAdmission::default());
         let cohort = RolloutCohort {
             id: "round-partial".into(),
@@ -2233,7 +2413,7 @@ mod tests {
             max_wait_ms: Some(10),
         };
 
-        tokio::time::timeout(
+        timeout(
             Duration::from_millis(100),
             admission.join(&cohort, "request-1").unwrap().wait(),
         )
@@ -2242,7 +2422,7 @@ mod tests {
         .unwrap();
         assert_eq!(admission.entries.lock().len(), 1);
 
-        tokio::time::timeout(
+        timeout(
             Duration::from_millis(50),
             admission.join(&cohort, "request-2").unwrap().wait(),
         )
@@ -2250,10 +2430,12 @@ mod tests {
         .expect("a late cohort member must be admitted immediately")
         .unwrap();
         assert!(admission.entries.lock().is_empty());
+        });
     }
 
-    #[tokio::test]
-    async fn distributed_cohort_fails_all_members_when_one_leaves() {
+    #[test]
+    fn distributed_cohort_fails_all_members_when_one_leaves() {
+        test_runtime_instance().block_on(async {
         let admission = Arc::new(CohortAdmission::default());
         let cohort = RolloutCohort {
             id: "round-2".into(),
@@ -2261,22 +2443,21 @@ mod tests {
             max_wait_ms: None,
         };
         let first = admission.join(&cohort, "request-1").unwrap();
-        let first = tokio::spawn(first.wait());
+        let first = test_runtime().spawn(first.wait()).expect("test runtime accepts cohort waiter");
         let second = admission.join(&cohort, "request-2").unwrap();
         drop(second);
 
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_millis(50), first)
-                .await
-                .expect("a failed member must wake the cohort")
-                .unwrap(),
-            Err(RolloutError::Unavailable(_))
-        ));
+        let result = timeout(Duration::from_millis(50), first)
+            .await
+            .expect("a failed member must wake the cohort");
+        assert!(matches!(result, Err(RolloutError::Unavailable(_))));
         assert!(admission.entries.lock().is_empty());
+        });
     }
 
-    #[tokio::test]
-    async fn distributed_cohort_shutdown_wakes_waiters() {
+    #[test]
+    fn distributed_cohort_shutdown_wakes_waiters() {
+        test_runtime_instance().block_on(async {
         let admission = Arc::new(CohortAdmission::default());
         let cohort = RolloutCohort {
             id: "round-shutdown".into(),
@@ -2284,18 +2465,16 @@ mod tests {
             max_wait_ms: None,
         };
         let waiting = admission.join(&cohort, "request-1").unwrap();
-        let waiting = tokio::spawn(waiting.wait());
+        let waiting = test_runtime().spawn(waiting.wait()).expect("test runtime accepts cohort waiter");
 
         admission.cancel_all();
 
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_millis(50), waiting)
-                .await
-                .expect("executor shutdown must wake cohort members")
-                .unwrap(),
-            Err(RolloutError::Unavailable(_))
-        ));
+        let result = timeout(Duration::from_millis(50), waiting)
+            .await
+            .expect("executor shutdown must wake cohort members");
+        assert!(matches!(result, Err(RolloutError::Unavailable(_))));
         assert!(admission.entries.lock().is_empty());
+        });
     }
 
     #[test]
@@ -2336,7 +2515,7 @@ mod tests {
         std::fs::write(adapter.join("adapter_config.json"), b"{}").unwrap();
         std::fs::write(adapter.join("adapter_model.safetensors"), b"weights").unwrap();
         let digest = hash_adapter_dir(&adapter).unwrap();
-        let registry = RolloutRegistry::default();
+        let registry = RolloutRegistry::new(test_runtime());
         registry
             .create(CreateRolloutExecutorRequest {
                 name: "fused".into(),
@@ -2365,8 +2544,9 @@ mod tests {
         (registry, executor, root)
     }
 
-    #[tokio::test]
-    async fn executor_holds_distributed_cohort_before_backend_generation() {
+    #[test]
+    fn executor_holds_distributed_cohort_before_backend_generation() {
+        test_runtime_instance().block_on(async {
         let (address, backend, server) = start_mock_backend().await;
         let (_registry, executor, _root) = create_published_executor(address).await;
         let mut first = sample_generate("cohort-request-1");
@@ -2376,8 +2556,10 @@ mod tests {
             max_wait_ms: None,
         });
         let first_executor = executor.clone();
-        let first = tokio::spawn(async move { first_executor.generate(first).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let first = test_runtime()
+            .spawn(async move { first_executor.generate(first).await })
+            .expect("test runtime accepts rollout");
+        sleep(Duration::from_millis(20)).await;
         assert_eq!(backend.generations.load(Ordering::Acquire), 0);
 
         let mut second = sample_generate("cohort-request-2");
@@ -2386,15 +2568,17 @@ mod tests {
             size: 2,
             max_wait_ms: None,
         });
-        let (first, second) = tokio::join!(first, executor.generate(second));
-        first.unwrap().unwrap();
+        let (first, second) = futures_lite::future::zip(first, executor.generate(second)).await;
+        first.unwrap();
         second.unwrap();
         assert_eq!(backend.generations.load(Ordering::Acquire), 2);
-        server.abort();
+        server.stop();
+        });
     }
 
-    #[tokio::test]
-    async fn timed_out_cohort_can_retry_without_stale_membership() {
+    #[test]
+    fn timed_out_cohort_can_retry_without_stale_membership() {
+        test_runtime_instance().block_on(async {
         let (address, backend, server) = start_mock_backend().await;
         let (_registry, executor, _root) = create_published_executor(address).await;
         let mut abandoned = sample_generate("retry-request-1");
@@ -2414,15 +2598,21 @@ mod tests {
         abandoned.deadline_ms = Some(5_000);
         let mut peer = sample_generate("retry-request-2");
         peer.cohort = abandoned.cohort.clone();
-        let (first, second) = tokio::join!(executor.generate(abandoned), executor.generate(peer));
+        let (first, second) = futures_lite::future::zip(
+            executor.generate(abandoned),
+            executor.generate(peer),
+        )
+        .await;
         first.unwrap();
         second.unwrap();
         assert_eq!(backend.generations.load(Ordering::Acquire), 2);
-        server.abort();
+        server.stop();
+        });
     }
 
-    #[tokio::test]
-    async fn publish_generate_retry_and_retire_are_end_to_end_safe() {
+    #[test]
+    fn publish_generate_retry_and_retire_are_end_to_end_safe() {
+        test_runtime_instance().block_on(async {
         let (address, backend, server) = start_mock_backend().await;
         let root = tempfile::tempdir().unwrap();
         let adapter = root.path().join("adapter-v1");
@@ -2431,7 +2621,7 @@ mod tests {
         std::fs::write(adapter.join("adapter_model.safetensors"), b"weights").unwrap();
         let digest = hash_adapter_dir(&adapter).unwrap();
 
-        let registry = RolloutRegistry::default();
+        let registry = RolloutRegistry::new(test_runtime());
         let created = registry
             .create(CreateRolloutExecutorRequest {
                 name: "fused".into(),
@@ -2460,7 +2650,7 @@ mod tests {
             .await
             .unwrap();
         assert!(published.current);
-        assert_eq!(backend.loads.lock().await.len(), 1);
+        assert_eq!(backend.loads.lock().len(), 1);
 
         let first = executor
             .generate(sample_generate("request-1"))
@@ -2485,13 +2675,15 @@ mod tests {
         ));
 
         executor.retire_policy("policy", "step-1").await.unwrap();
-        assert_eq!(backend.unloads.lock().await.len(), 1);
+        assert_eq!(backend.unloads.lock().len(), 1);
         registry.delete("fused").await.unwrap();
-        server.abort();
+        server.stop();
+        });
     }
 
-    #[tokio::test]
-    async fn failed_policy_unload_stays_tracked_and_can_be_retried() {
+    #[test]
+    fn failed_policy_unload_stays_tracked_and_can_be_retried() {
+        test_runtime_instance().block_on(async {
         let (address, backend, server) = start_mock_backend().await;
         let (_registry, executor, _root) = create_published_executor(address).await;
         backend.unload_failures.store(1, Ordering::Release);
@@ -2514,12 +2706,14 @@ mod tests {
 
         executor.retire_policy("policy", "step-1").await.unwrap();
         assert!(executor.info().await.policies.is_empty());
-        assert_eq!(backend.unloads.lock().await.len(), 2);
-        server.abort();
+        assert_eq!(backend.unloads.lock().len(), 2);
+        server.stop();
+        });
     }
 
-    #[tokio::test]
-    async fn failed_executor_shutdown_stays_registered_and_can_be_retried() {
+    #[test]
+    fn failed_executor_shutdown_stays_registered_and_can_be_retried() {
+        test_runtime_instance().block_on(async {
         let (address, backend, server) = start_mock_backend().await;
         let (registry, executor, _root) = create_published_executor(address).await;
         backend.unload_failures.store(1, Ordering::Release);
@@ -2546,12 +2740,14 @@ mod tests {
             registry.get("fused").await,
             Err(RolloutError::NotFound(_))
         ));
-        assert_eq!(backend.unloads.lock().await.len(), 2);
-        server.abort();
+        assert_eq!(backend.unloads.lock().len(), 2);
+        server.stop();
+        });
     }
 
-    #[tokio::test]
-    async fn shutdown_waits_for_inflight_publication_and_unloads_it() {
+    #[test]
+    fn shutdown_waits_for_inflight_publication_and_unloads_it() {
+        test_runtime_instance().block_on(async {
         let (address, backend, server) = start_mock_backend().await;
         let root = tempfile::tempdir().unwrap();
         let adapter = root.path().join("adapter-v1");
@@ -2559,7 +2755,7 @@ mod tests {
         std::fs::write(adapter.join("adapter_config.json"), b"{}").unwrap();
         std::fs::write(adapter.join("adapter_model.safetensors"), b"weights").unwrap();
         let digest = hash_adapter_dir(&adapter).unwrap();
-        let registry = Arc::new(RolloutRegistry::default());
+        let registry = Arc::new(RolloutRegistry::new(test_runtime()));
         registry
             .create(CreateRolloutExecutorRequest {
                 name: "fused".into(),
@@ -2578,7 +2774,7 @@ mod tests {
         let observer = executor.clone();
         backend.block_load.store(true, Ordering::Release);
 
-        let publication = tokio::spawn(async move {
+        let publication = test_runtime().spawn(async move {
             executor
                 .publish_policy(PublishRolloutPolicyRequest {
                     policy: "policy".into(),
@@ -2588,27 +2784,30 @@ mod tests {
                     retain_previous: false,
                 })
                 .await
-        });
+        }).expect("test runtime accepts publication");
         backend.load_started.notified().await;
         let registry_for_delete = registry.clone();
-        let deletion = tokio::spawn(async move { registry_for_delete.delete("fused").await });
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let deletion = test_runtime()
+            .spawn(async move { registry_for_delete.delete("fused").await })
+            .expect("test runtime accepts deletion");
+        timeout(Duration::from_secs(1), async {
             while observer.accepting.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
+                futures_lite::future::yield_now().await;
             }
         })
         .await
         .unwrap();
         backend.release_load.notify_one();
 
-        publication.await.unwrap().unwrap();
-        deletion.await.unwrap().unwrap();
-        assert_eq!(backend.unloads.lock().await.len(), 1);
+        publication.await.unwrap();
+        deletion.await.unwrap();
+        assert_eq!(backend.unloads.lock().len(), 1);
         assert!(matches!(
             registry.get("fused").await,
             Err(RolloutError::NotFound(_))
         ));
-        server.abort();
+        server.stop();
+        });
     }
 
     #[test]
@@ -2657,8 +2856,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn zero_queue_depth_still_allows_immediate_capacity() {
+    #[test]
+    fn zero_queue_depth_still_allows_immediate_capacity() {
+        test_runtime_instance().block_on(async {
         let root = tempfile::tempdir().unwrap();
         let executor = RolloutExecutor::new(CreateRolloutExecutorRequest {
             name: "bounded".into(),
@@ -2670,7 +2870,7 @@ mod tests {
             max_concurrent_requests: Some(1),
             max_queue_depth: Some(0),
             request_timeout_secs: Some(1),
-        })
+        }, test_runtime())
         .unwrap();
         let first = executor.acquire_queue_permit().await.unwrap();
         assert!(matches!(
@@ -2679,6 +2879,7 @@ mod tests {
         ));
         drop(first);
         assert!(executor.acquire_queue_permit().await.is_ok());
+        });
     }
 
     #[test]

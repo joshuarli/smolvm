@@ -1,15 +1,12 @@
 //! Lease-authenticated guest ingress for fused rollout workers.
 
-use axum::{
-    extract::{DefaultBodyLimit, Extension, Path, Request, State},
-    http::{header::AUTHORIZATION, StatusCode},
-    middleware::{self, Next},
-    response::Response,
-    routing::{delete, post},
-    Json, Router,
+use h12tiny::web::{
+    delete, post, FromRequest, Path, Request, RequestMeta, Router, State, StatusCode,
 };
+use crate::api::Json;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
 
 use crate::api::error::ApiError;
 use crate::api::handlers;
@@ -19,6 +16,7 @@ use crate::api::rollout::{
 };
 use crate::api::state::ApiState;
 use crate::pool::{ForkLeaseRecord, ForkLeaseState};
+use crate::runtime::{timeout, Semaphore};
 
 /// Dedicated loopback port reachable only through a VM's virtio gateway.
 pub const GUEST_ROLLOUT_PORT: u16 = 10_081;
@@ -39,12 +37,6 @@ const MAX_ROLLOUT_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 const TOKEN_SECRET_BYTES: usize = 32;
 const MAX_CONCURRENT_AUTH_LOOKUPS: usize = 64;
 const AUTH_LOOKUP_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-
-#[derive(Clone)]
-struct RolloutAuthState {
-    api: Arc<ApiState>,
-    lookup_permits: Arc<tokio::sync::Semaphore>,
-}
 
 #[derive(Clone)]
 struct RolloutLeaseScope {
@@ -137,50 +129,76 @@ fn credential_lease_id(credential: &str) -> Option<&str> {
 }
 
 fn bearer_credential(request: &Request) -> Option<&str> {
-    let value = request.headers().get(AUTHORIZATION)?.to_str().ok()?;
+    let value = request.headers().get("authorization")?.to_str().ok()?;
     let (scheme, credential) = value.split_once(' ')?;
     (scheme.eq_ignore_ascii_case("bearer") && !credential.is_empty()).then_some(credential)
 }
 
-async fn authenticate_lease(
-    State(auth): State<RolloutAuthState>,
-    mut request: Request,
-    next: Next,
-) -> Result<Response, ApiError> {
-    let credential = bearer_credential(&request).ok_or_else(|| {
-        ApiError::Unauthorized("a valid rollout lease bearer credential is required".into())
-    })?;
-    let lease_id = credential_lease_id(credential).ok_or_else(|| {
-        ApiError::Unauthorized("a valid rollout lease bearer credential is required".into())
-    })?;
-    let lookup = lease_id.to_string();
-    let presented = credential.to_string();
-    let _lookup_permit =
-        tokio::time::timeout(AUTH_LOOKUP_QUEUE_TIMEOUT, auth.lookup_permits.acquire())
+static AUTH_LOOKUP_PERMITS: std::sync::OnceLock<Arc<Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn auth_lookup_permits() -> &'static Arc<Semaphore> {
+    AUTH_LOOKUP_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_AUTH_LOOKUPS)))
+}
+
+/// Authenticate a guest lease before any body-consuming extractor runs.
+///
+/// h12tiny has no generic middleware layer. Making the lease scope itself an
+/// extractor preserves the ordering contract explicitly: handlers list this
+/// extractor before `Json`, so malformed or oversized JSON is never consumed
+/// before the bearer has been checked against the live lease.
+impl FromRequest<Arc<ApiState>> for RolloutLeaseScope {
+    type Rejection = ApiError;
+
+    fn from_request(
+        request: Request,
+        state: &Option<Arc<ApiState>>,
+        _meta: &RequestMeta,
+    ) -> Pin<Box<dyn Future<Output = Result<(Self, Request), Self::Rejection>> + Send>> {
+        let state = state.clone();
+        Box::pin(async move {
+            let state = state.ok_or_else(|| ApiError::internal("router state is not configured"))?;
+            let credential = bearer_credential(&request).ok_or_else(|| {
+                ApiError::Unauthorized("a valid rollout lease bearer credential is required".into())
+            })?;
+            let lease_id = credential_lease_id(credential).ok_or_else(|| {
+                ApiError::Unauthorized("a valid rollout lease bearer credential is required".into())
+            })?;
+            let lookup = lease_id.to_string();
+            let presented = credential.to_string();
+            let _lookup_permit = timeout(
+                AUTH_LOOKUP_QUEUE_TIMEOUT,
+                auth_lookup_permits().clone().acquire_owned(),
+            )
             .await
             .map_err(|_| {
                 ApiError::Unavailable("rollout authentication is busy; retry shortly".into())
             })?
             .map_err(|_| ApiError::internal("rollout authentication is shutting down"))?;
-    let db = auth.api.db().clone();
-    let lease = tokio::task::spawn_blocking(move || db.get_fork_lease_by_id(&lookup))
-        .await
-        .map_err(|error| ApiError::internal(format!("rollout lease lookup task failed: {error}")))?
-        .map_err(ApiError::database)?
-        .ok_or_else(|| {
-            ApiError::Unauthorized("a valid rollout lease bearer credential is required".into())
-        })?;
-    let scope =
-        lease_scope(&lease, &presented, crate::util::current_timestamp()).ok_or_else(|| {
-            ApiError::Unauthorized("a valid rollout lease bearer credential is required".into())
-        })?;
-    drop(_lookup_permit);
-    request.extensions_mut().insert(scope);
-    Ok(next.run(request).await)
+            let db = state.db().clone();
+            let lease = state
+                .blocking(move || db.get_fork_lease_by_id(&lookup))
+                .await?
+                .map_err(ApiError::database)?
+                .ok_or_else(|| {
+                    ApiError::Unauthorized(
+                        "a valid rollout lease bearer credential is required".into(),
+                    )
+                })?;
+            let scope = lease_scope(&lease, &presented, crate::util::current_timestamp())
+                .ok_or_else(|| {
+                    ApiError::Unauthorized(
+                        "a valid rollout lease bearer credential is required".into(),
+                    )
+                })?;
+            Ok((scope, request))
+        })
+    }
 }
 
 async fn publish_device_policy(
-    Extension(scope): Extension<RolloutLeaseScope>,
+    scope: RolloutLeaseScope,
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Json(request): Json<PublishDeviceRolloutPolicyRequest>,
@@ -191,7 +209,7 @@ async fn publish_device_policy(
 }
 
 async fn retire_policy(
-    Extension(scope): Extension<RolloutLeaseScope>,
+    scope: RolloutLeaseScope,
     State(state): State<Arc<ApiState>>,
     Path((name, policy, version)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
@@ -201,7 +219,7 @@ async fn retire_policy(
 }
 
 async fn generate(
-    Extension(scope): Extension<RolloutLeaseScope>,
+    scope: RolloutLeaseScope,
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Json(request): Json<RolloutGenerateRequest>,
@@ -212,7 +230,7 @@ async fn generate(
 }
 
 async fn generate_batch(
-    Extension(scope): Extension<RolloutLeaseScope>,
+    scope: RolloutLeaseScope,
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
     Json(request): Json<RolloutBatchRequest>,
@@ -225,30 +243,52 @@ async fn generate_batch(
 }
 
 /// Build the dedicated guest-only router; no machine or executor-management routes exist here.
-pub fn create_router(state: Arc<ApiState>) -> Router {
-    let auth = RolloutAuthState {
-        api: state.clone(),
-        lookup_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_AUTH_LOOKUPS)),
-    };
+pub fn create_router(state: Arc<ApiState>) -> Router<Arc<ApiState>> {
     let protected = Router::new()
         .route("/{name}/device-policies", post(publish_device_policy))
         .route("/{name}/policies/{policy}/{version}", delete(retire_policy))
         .route("/{name}/generate", post(generate))
         .route("/{name}/batches", post(generate_batch))
-        .layer(DefaultBodyLimit::max(MAX_ROLLOUT_REQUEST_BYTES))
-        .layer(middleware::from_fn_with_state(auth, authenticate_lease));
+        .body_limit(MAX_ROLLOUT_REQUEST_BYTES);
     Router::new()
         .nest("/api/v1/rollout-executors", protected)
-        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::Request as HttpRequest;
-    use tower::ServiceExt;
+    use h12tiny::util;
+    use h12tiny::web::Request as HttpRequest;
+
+    fn status(
+        runtime: &crate::runtime::Runtime,
+        router: &Router<Arc<ApiState>>,
+        request: HttpRequest,
+    ) -> StatusCode {
+        runtime.block_on(router.call_boxed(request)).status()
+    }
+
+    fn json_request(
+        method: &str,
+        uri: &str,
+        body: &str,
+        credential: Option<&str>,
+    ) -> HttpRequest {
+        let mut request = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(util::boxed_body(util::bytes_body(body.to_owned())))
+            .unwrap();
+        if let Some(credential) = credential {
+            request.headers_mut().insert(
+                "authorization",
+                format!("Bearer {credential}").parse().unwrap(),
+            );
+        }
+        request
+    }
 
     fn lease(state: ForkLeaseState, expires_at: u64, token: &str) -> ForkLeaseRecord {
         ForkLeaseRecord {
@@ -304,36 +344,40 @@ mod tests {
         assert!(lease_scope(&ambiguous, &token, 10).is_none());
     }
 
-    #[tokio::test]
-    async fn guest_router_exposes_no_control_plane_routes_and_requires_auth() {
+    #[test]
+    fn guest_router_exposes_no_control_plane_routes_and_requires_auth() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = crate::db::SmolvmDb::open_at(&dir.path().join("state.db")).unwrap();
-        let router = create_router(Arc::new(ApiState::with_db(db.clone())));
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let router = create_router(Arc::new(
+            ApiState::with_db(db.clone()).with_runtime(runtime.handle()),
+        ));
         let control = HttpRequest::builder()
             .method("GET")
             .uri("/api/v1/machines")
-            .body(Body::empty())
+            .body(util::boxed_body(util::empty_body()))
             .unwrap();
         assert_eq!(
-            router.clone().oneshot(control).await.unwrap().status(),
+            status(&runtime, &router, control),
             StatusCode::NOT_FOUND
         );
-        let rollout = HttpRequest::builder()
-            .method("POST")
-            .uri("/api/v1/rollout-executors/executor/generate")
-            .header("content-type", "application/json")
-            .body(Body::from("{}"))
-            .unwrap();
+        let rollout = json_request(
+            "POST",
+            "/api/v1/rollout-executors/executor/generate",
+            "not-json",
+            None,
+        );
         assert_eq!(
-            router.oneshot(rollout).await.unwrap().status(),
+            status(&runtime, &router, rollout),
             StatusCode::UNAUTHORIZED
         );
     }
 
-    #[tokio::test]
-    async fn live_lease_authenticates_and_scope_blocks_other_executors() {
+    #[test]
+    fn live_lease_authenticates_and_scope_blocks_other_executors() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = crate::db::SmolvmDb::open_at(&dir.path().join("state.db")).unwrap();
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
         let now = crate::util::current_timestamp();
         db.insert_fork_pool_if_not_exists(&crate::pool::ForkPoolRecord {
             name: "pool".into(),
@@ -380,63 +424,56 @@ mod tests {
         ));
         db.mark_fork_lease_active("lease-0123456789abcdef", now)
             .unwrap();
-        let router = create_router(Arc::new(ApiState::with_db(db.clone())));
+        let router = create_router(Arc::new(
+            ApiState::with_db(db.clone()).with_runtime(runtime.handle()),
+        ));
         let body = r#"{"idempotencyKey":"request","policy":"policy","prompts":[{"text":"hi"}],"sampling":{"maxTokens":1}}"#;
 
-        let correct = HttpRequest::builder()
-            .method("POST")
-            .uri("/api/v1/rollout-executors/executor/generate")
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::from(body))
-            .unwrap();
+        let correct = json_request(
+            "POST",
+            "/api/v1/rollout-executors/executor/generate",
+            body,
+            Some(&token),
+        );
         assert_eq!(
-            router.clone().oneshot(correct).await.unwrap().status(),
+            status(&runtime, &router, correct),
             StatusCode::NOT_FOUND,
             "valid scoped auth must reach the handler"
         );
 
-        let wrong_executor = HttpRequest::builder()
-            .method("POST")
-            .uri("/api/v1/rollout-executors/other/generate")
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::from(body))
-            .unwrap();
+        let wrong_executor = json_request(
+            "POST",
+            "/api/v1/rollout-executors/other/generate",
+            body,
+            Some(&token),
+        );
         assert_eq!(
-            router
-                .clone()
-                .oneshot(wrong_executor)
-                .await
-                .unwrap()
-                .status(),
+            status(&runtime, &router, wrong_executor),
             StatusCode::FORBIDDEN
         );
 
         let wrong_policy_body = r#"{"idempotencyKey":"request-2","policy":"other","prompts":[{"text":"hi"}],"sampling":{"maxTokens":1}}"#;
-        let wrong_policy = HttpRequest::builder()
-            .method("POST")
-            .uri("/api/v1/rollout-executors/executor/generate")
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::from(wrong_policy_body))
-            .unwrap();
+        let wrong_policy = json_request(
+            "POST",
+            "/api/v1/rollout-executors/executor/generate",
+            wrong_policy_body,
+            Some(&token),
+        );
         assert_eq!(
-            router.clone().oneshot(wrong_policy).await.unwrap().status(),
+            status(&runtime, &router, wrong_policy),
             StatusCode::FORBIDDEN
         );
 
         db.complete_fork_lease("pool", "lease-0123456789abcdef", now + 1)
             .unwrap();
-        let revoked = HttpRequest::builder()
-            .method("POST")
-            .uri("/api/v1/rollout-executors/executor/generate")
-            .header("content-type", "application/json")
-            .header("authorization", format!("Bearer {token}"))
-            .body(Body::from(body))
-            .unwrap();
+        let revoked = json_request(
+            "POST",
+            "/api/v1/rollout-executors/executor/generate",
+            body,
+            Some(&token),
+        );
         assert_eq!(
-            router.oneshot(revoked).await.unwrap().status(),
+            status(&runtime, &router, revoked),
             StatusCode::UNAUTHORIZED
         );
     }

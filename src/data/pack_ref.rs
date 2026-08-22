@@ -182,6 +182,7 @@ pub async fn resolve_pack_ref(
     image: &str,
     identity_token: Option<&str>,
     blob_peers: &[String],
+    executor: &crate::runtime::RuntimeHandle,
 ) -> Result<Option<PathBuf>> {
     let Some(host) = explicit_registry_host(image) else {
         return Ok(None);
@@ -209,7 +210,10 @@ pub async fn resolve_pack_ref(
     } else {
         format!("https://{}", effective_registry)
     };
-    let mut client = smolvm_registry::RegistryClient::new(base_url);
+    let mut client = smolvm_registry::RegistryClient::new_with_executor(
+        base_url,
+        executor.clone(),
+    );
     if let Some(token) = identity_token {
         client = client.with_identity_token(token.to_string());
     } else if let Some(cred) = configured_credential(&settings, &parsed.registry) {
@@ -273,9 +277,10 @@ pub fn resolve_pack_ref_blocking(image: &str) -> Result<Option<PathBuf>> {
     if explicit_registry_host(image).is_none() {
         return Ok(None);
     }
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
-    rt.block_on(resolve_pack_ref(image, None, &[]))
+    let rt = crate::runtime::Runtime::with_workers(2)
+        .map_err(|e| Error::agent("create application runtime", e.to_string()))?;
+    let executor = rt.handle();
+    rt.block_on(resolve_pack_ref(image, None, &[], &executor))
 }
 
 #[cfg(test)]
@@ -459,16 +464,20 @@ mod tests {
     ///
     /// Returns the bound address, plus flags for "a request arrived" and "the
     /// identity token reached the token service".
-    async fn stub_private_registry() -> (
+    fn stub_private_registry(
+        runtime: &crate::runtime::Runtime,
+    ) -> (
         String,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = runtime
+            .block_on(async_net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let saw_request = Arc::new(AtomicBool::new(false));
         let saw_identity_token = Arc::new(AtomicBool::new(false));
@@ -478,11 +487,15 @@ mod tests {
             addr.clone(),
         );
 
-        tokio::spawn(async move {
+        let accept_runtime = runtime.handle();
+        runtime
+            .spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
                 let (req, ident, realm) = (req.clone(), ident.clone(), realm.clone());
-                tokio::spawn(async move {
-                    // reqwest keeps the connection alive, so serve in a loop.
+                let connection_runtime = accept_runtime.clone();
+                if let Ok(task) = connection_runtime.spawn(async move {
+                    // The h12tiny client may retain the H1 connection, so
+                    // preserve the prior mock's keep-alive request loop.
                     loop {
                         let mut buf = [0u8; 8192];
                         let n = match sock.read(&mut buf).await {
@@ -518,9 +531,12 @@ mod tests {
                             return;
                         }
                     }
-                });
+                }) {
+                    task.detach();
+                }
             }
-        });
+        })
+            .detach();
 
         (addr, saw_request, saw_identity_token)
     }
@@ -534,14 +550,18 @@ mod tests {
     /// The fail-open is right for third-party registries (a 401 there really
     /// does mean "I can't tell, let the in-guest puller try"), so this test
     /// pins the CURRENT behavior as the thing a fix must change deliberately.
-    #[tokio::test]
-    async fn an_unauthorized_probe_is_swallowed_as_not_a_pack() {
+    #[test]
+    fn an_unauthorized_probe_is_swallowed_as_not_a_pack() {
         use std::sync::atomic::Ordering;
 
-        let (addr, saw_request, saw_identity_token) = stub_private_registry().await;
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let (addr, saw_request, saw_identity_token) = stub_private_registry(&runtime);
         let image = format!("{addr}/tenants/tenant-abc/e2smoke:v1");
 
-        let resolved = resolve_pack_ref(&image, None, &[]).await.unwrap();
+        let executor = runtime.handle();
+        let resolved = runtime
+            .block_on(resolve_pack_ref(&image, None, &[], &executor))
+            .unwrap();
 
         assert!(
             saw_request.load(Ordering::SeqCst),
@@ -561,14 +581,21 @@ mod tests {
     /// The other half: a supplied identity token DOES reach the token service.
     /// The engine side was never the blocker — the control plane simply never
     /// minted a token for an `image`-typed source.
-    #[tokio::test]
-    async fn a_supplied_identity_token_reaches_the_token_service() {
+    #[test]
+    fn a_supplied_identity_token_reaches_the_token_service() {
         use std::sync::atomic::Ordering;
 
-        let (addr, saw_request, saw_identity_token) = stub_private_registry().await;
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let (addr, saw_request, saw_identity_token) = stub_private_registry(&runtime);
         let image = format!("{addr}/tenants/tenant-abc/e2smoke:v1");
 
-        let _ = resolve_pack_ref(&image, Some(TEST_IDENTITY_TOKEN), &[]).await;
+        let executor = runtime.handle();
+        let _ = runtime.block_on(resolve_pack_ref(
+            &image,
+            Some(TEST_IDENTITY_TOKEN),
+            &[],
+            &executor,
+        ));
 
         assert!(saw_request.load(Ordering::SeqCst));
         assert!(

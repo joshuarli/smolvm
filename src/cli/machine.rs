@@ -1476,10 +1476,13 @@ impl RunCmd {
             if self.oci_cache {
                 if let Some(image) = params.image.as_deref() {
                     let auth = smolvm::registry::PullAuth::FromConfig;
-                    let rt = tokio::runtime::Runtime::new()
+                    let runtime = smolvm::runtime::Runtime::new()
                         .map_err(|e| Error::config("oci-cache", e.to_string()))?;
+                    let executor = runtime.handle();
                     resolved_digest =
-                        Some(rt.block_on(smolvm::image_store::authorized_digest(image, &auth))?);
+                        Some(runtime.block_on(smolvm::image_store::authorized_digest(
+                            image, &auth, &executor,
+                        ))?);
                 }
             }
             let cached = ensure_init_layer(

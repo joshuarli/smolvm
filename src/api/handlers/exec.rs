@@ -1,14 +1,11 @@
 //! Command execution handlers.
 
-use axum::{
-    extract::{
-        ws::{Message, WebSocketUpgrade},
-        Path, Query, State,
-    },
-    response::sse::{Event, KeepAlive, Sse},
-    Json,
+use h12tiny::web::{
+    Event, Extension, KeepAlive, Path, Request, Response, Sse, State,
+    WebSocketFrame, WebSocketOpCode, WebSocketPayload, WebSocketUpgrade,
 };
-use futures_util::{SinkExt, StreamExt};
+use crate::api::Json;
+use crate::api::Query;
 use std::convert::Infallible;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -24,7 +21,7 @@ use crate::api::validate_command;
 use crate::api::TraceId;
 use crate::data::consts::BYTES_PER_MIB;
 use crate::data::storage::HostMount;
-use tokio::sync::Semaphore;
+use crate::runtime::Semaphore;
 
 /// Execute a command in a machine.
 ///
@@ -47,7 +44,7 @@ use tokio::sync::Semaphore;
 pub async fn exec_command(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-    trace_id: Option<axum::Extension<TraceId>>,
+    trace_id: Option<Extension<TraceId>>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
@@ -98,7 +95,7 @@ pub async fn exec_command(
             // (see `persistent_overlay_owner`).
             let overlay_id =
                 crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
-            with_machine_client_traced(&entry, tid, move |c| {
+            with_machine_client_traced(state.runtime()?, &entry, tid, move |c| {
                 if c.query(&image)?.is_none() {
                     c.pull_with_registry_config(&image)?;
                 }
@@ -111,7 +108,7 @@ pub async fn exec_command(
             })
             .await?
         } else {
-            with_machine_client_traced(&entry, tid, move |c| {
+            with_machine_client_traced(state.runtime()?, &entry, tid, move |c| {
                 c.vm_exec_background(command, env, workdir)
             })
             .await?
@@ -155,7 +152,7 @@ pub async fn exec_command(
         // A fork clone's inherited overlay lives under the golden's id.
         let overlay_id = crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
         let stdin_data = stdin_data.clone();
-        with_machine_client_traced(&entry, tid, move |c| {
+        with_machine_client_traced(state.runtime()?, &entry, tid, move |c| {
             // Pull only if the image isn't already present — avoids a registry
             // round-trip on every exec, and works once cached even on
             // network-restricted machines.
@@ -173,7 +170,7 @@ pub async fn exec_command(
         })
         .await?
     } else {
-        with_machine_client_traced(&entry, tid, move |c| {
+        with_machine_client_traced(state.runtime()?, &entry, tid, move |c| {
             c.vm_exec(command, env, workdir, timeout, stdin_data)
         })
         .await?
@@ -210,7 +207,7 @@ pub async fn exec_command(
 pub async fn exec_stream(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-    trace_id: Option<axum::Extension<TraceId>>,
+    trace_id: Option<Extension<TraceId>>,
     Json(req): Json<ExecRequest>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
@@ -250,11 +247,14 @@ pub async fn exec_stream(
     // per-session output cap is still enforced inside the agent client's
     // streaming collector (MAX_STREAMING_EXEC_OUTPUT), which emits a
     // truncation Error event and stops relaying.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::agent::ExecEvent>();
+    let (tx, rx) = async_channel::unbounded::<crate::agent::ExecEvent>();
     let err_tx = tx.clone();
     let entry_exec = entry.clone();
     let start = std::time::Instant::now();
-    tokio::spawn(async move {
+    let runtime = state.runtime()?.clone();
+    let execution_runtime = runtime.clone();
+    runtime
+        .spawn(async move {
         let result = if let Some(image) = machine_image {
             let mounts_config = {
                 let e = entry_exec.lock();
@@ -267,7 +267,7 @@ pub async fn exec_stream(
             // A fork clone's inherited overlay lives under the golden's id.
             let overlay_id =
                 crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
-            with_machine_client_traced(&entry_exec, tid, move |c| {
+            with_machine_client_traced(&execution_runtime, &entry_exec, tid, move |c| {
                 if c.query(&image)?.is_none() {
                     c.pull_with_registry_config(&image)?;
                 }
@@ -283,7 +283,7 @@ pub async fn exec_stream(
             })
             .await
         } else {
-            with_machine_client_traced(&entry_exec, tid, move |c| {
+            with_machine_client_traced(&execution_runtime, &entry_exec, tid, move |c| {
                 c.vm_exec_streaming_with(command, env, workdir, timeout, |e| {
                     let _ = tx.send(e);
                 })
@@ -297,22 +297,24 @@ pub async fn exec_stream(
         if let Err(e) = result {
             let _ = err_tx.send(crate::agent::ExecEvent::Error(format!("{e:?}")));
         }
-    });
+    })
+        .map_err(ApiError::internal)?
+        .detach();
 
     // Yield each event as an SSE frame the instant it lands in the channel.
     let stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
+        while let Ok(event) = rx.recv().await {
             let sse_event = match event {
-                crate::agent::ExecEvent::Stdout(data) => Event::default()
+                crate::agent::ExecEvent::Stdout(data) => Event::new()
                     .event("stdout")
                     .data(String::from_utf8_lossy(&data)),
-                crate::agent::ExecEvent::Stderr(data) => Event::default()
+                crate::agent::ExecEvent::Stderr(data) => Event::new()
                     .event("stderr")
                     .data(String::from_utf8_lossy(&data)),
-                crate::agent::ExecEvent::Exit(code) => Event::default()
+                crate::agent::ExecEvent::Exit(code) => Event::new()
                     .event("exit")
                     .data(format!("{{\"exitCode\":{}}}", code)),
-                crate::agent::ExecEvent::Error(msg) => Event::default()
+                crate::agent::ExecEvent::Error(msg) => Event::new()
                     .event("error")
                     .data(format!("{{\"message\":\"{}\"}}", msg)),
             };
@@ -344,7 +346,7 @@ pub async fn exec_stream(
 pub async fn run_command(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-    trace_id: Option<axum::Extension<TraceId>>,
+    trace_id: Option<Extension<TraceId>>,
     Json(req): Json<RunRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
@@ -385,7 +387,7 @@ pub async fn run_command(
     };
 
     let start = std::time::Instant::now();
-    let (exit_code, stdout, stderr) = with_machine_client_traced(&entry, tid, move |c| {
+    let (exit_code, stdout, stderr) = with_machine_client_traced(state.runtime()?, &entry, tid, move |c| {
         let config = crate::agent::RunConfig::new(image, command)
             .with_env(env)
             .with_workdir(workdir)
@@ -416,6 +418,18 @@ pub struct InteractiveQuery {
     pub rows: Option<u16>,
 }
 
+/// Messages owned by the WebSocket writer task.
+///
+/// The reader and the blocking PTY session never write to the upgraded socket
+/// directly. Keeping one writer preserves frame ordering and lets a closed
+/// socket release both producers through the bounded channel.
+enum InteractiveWebSocketOutput {
+    Binary(Vec<u8>),
+    Pong(Vec<u8>),
+    Close(Vec<u8>),
+    Exit(i32),
+}
+
 /// Interactive PTY session over a WebSocket.
 ///
 /// The client connects a WebSocket; binary frames are forwarded to the
@@ -430,9 +444,15 @@ pub async fn exec_interactive(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(q): Query<InteractiveQuery>,
-    _trace_id: Option<axum::Extension<TraceId>>,
-    ws: WebSocketUpgrade,
-) -> Result<axum::response::Response, ApiError> {
+    _trace_id: Option<Extension<TraceId>>,
+    mut request: Request,
+) -> Result<Response, ApiError> {
+    // Keep malformed-handshake failures in smolvm's established JSON error
+    // envelope rather than h12tiny's generic extractor rejection. The
+    // constructor still captures the raw H1 upgrade future for the task below.
+    let websocket = WebSocketUpgrade::try_from_request(&mut request)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+
     let entry = state.get_machine(&id)?;
     ensure_running_and_persist(&state, &id, &entry)
         .await
@@ -454,54 +474,220 @@ pub async fn exec_interactive(
             .collect::<Vec<_>>()
     };
 
-    Ok(ws.on_upgrade(move |socket| async move {
-        let (mut ws_tx, mut ws_rx) = socket.split();
-
-        // Input channel: WS task → blocking session (sync mpsc; session try_recv's it).
-        let (in_tx, in_rx) = std::sync::mpsc::channel::<crate::agent::InteractiveInput>();
-        // Output channel: blocking session → WS task (tokio mpsc; blocking_send from session).
-        let (out_tx, mut out_rx) =
-            tokio::sync::mpsc::channel::<crate::agent::InteractiveOutput>(256);
-
-        // Seed the initial PTY size before any input.
-        let _ = in_tx.send(crate::agent::InteractiveInput::Resize {
-            cols: init_size.0,
-            rows: init_size.1,
-        });
-
-        // Run the interactive session on a DEDICATED agent connection — NOT the
-        // shared per-machine client. A PTY can outlive its usefulness (a client
-        // that disconnects while a `sleep` or daemon keeps running), and holding
-        // the shared client lock for the whole session would block every other
-        // operation on that machine until the command exits. A fresh connection
-        // also lets the agent kill the PTY child the moment we drop it on
-        // disconnect. We lock the entry only briefly, to dial.
-        let session_entry = entry.clone();
-        let session = tokio::spawn(async move {
-            let connect = { session_entry.lock().manager.connect() };
-            let mut client = match connect {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = ?e, "pty: failed to open dedicated agent connection");
-                    return -1;
+    // h12tiny's optional WebSocket boundary has already validated RFC 6455
+    // headers. It owns the 101 response and server-role framing, while this
+    // handler owns the PTY protocol and every application-runtime task.
+    let response = websocket.response();
+    let runtime = state.runtime()?.clone();
+    runtime
+        .clone()
+        .spawn(async move {
+            let connection = match websocket.into_connection().await {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::debug!(error = ?error, "pty: HTTP upgrade did not complete");
+                    return;
                 }
             };
-            tokio::task::spawn_blocking(move || {
-                let on_output = move |o| {
-                    // If the WS side is gone, the receiver is dropped; ignore.
-                    let _ = out_tx.blocking_send(o);
+            let (mut reader, writer) = connection.split();
+            let (outgoing_tx, outgoing_rx) =
+                async_channel::bounded::<InteractiveWebSocketOutput>(256);
+
+            let writer_task = match runtime.spawn(async move {
+                let mut writer = writer;
+                while let Ok(output) = outgoing_rx.recv().await {
+                    let write_result = match output {
+                        InteractiveWebSocketOutput::Binary(bytes) => {
+                            writer
+                                .write_frame(WebSocketFrame::binary(WebSocketPayload::Owned(bytes)))
+                                .await
+                        }
+                        InteractiveWebSocketOutput::Pong(bytes) => {
+                            writer
+                                .write_frame(WebSocketFrame::pong(WebSocketPayload::Owned(bytes)))
+                                .await
+                        }
+                        InteractiveWebSocketOutput::Close(bytes) => {
+                            let result = writer
+                                .write_frame(WebSocketFrame::close_raw(WebSocketPayload::Owned(bytes)))
+                                .await;
+                            if result.is_ok() {
+                                let _ = writer.flush().await;
+                            }
+                            break;
+                        }
+                        InteractiveWebSocketOutput::Exit(code) => {
+                            let text = format!("{{\"type\":\"exit\",\"code\":{code}}}");
+                            if writer
+                                .write_frame(WebSocketFrame::text(WebSocketPayload::Owned(
+                                    text.into_bytes(),
+                                )))
+                                .await
+                                .is_ok()
+                                && writer
+                                    .write_frame(WebSocketFrame::close(1000, &[]))
+                                    .await
+                                    .is_ok()
+                            {
+                                let _ = writer.flush().await;
+                            }
+                            break;
+                        }
+                    };
+
+                    if write_result.is_err() || writer.flush().await.is_err() {
+                        break;
+                    }
+                }
+            }) {
+                Ok(task) => task,
+                Err(error) => {
+                    tracing::warn!(error = ?error, "pty: runtime stopped before WebSocket writer started");
+                    return;
+                }
+            };
+
+            // Input channel: WS reader → blocking session. Closing this sender
+            // signals EOF to the synchronous PTY loop without blocking an async
+            // executor worker.
+            let (input_tx, input_rx) = std::sync::mpsc::channel::<crate::agent::InteractiveInput>();
+            let _ = input_tx.send(crate::agent::InteractiveInput::Resize {
+                cols: init_size.0,
+                rows: init_size.1,
+            });
+            let reader_output = outgoing_tx.clone();
+            let reader_task = match runtime.spawn(async move {
+                let control_output = reader_output.clone();
+                let mut send_control = move |frame: WebSocketFrame<'_>| {
+                    let control_output = control_output.clone();
+                    let output = match frame.opcode {
+                        WebSocketOpCode::Pong => Some(InteractiveWebSocketOutput::Pong(Vec::from(frame.payload))),
+                        WebSocketOpCode::Close => Some(InteractiveWebSocketOutput::Close(Vec::from(frame.payload))),
+                        _ => None,
+                    };
+                    async move {
+                        if let Some(output) = output {
+                            control_output
+                                .send(output)
+                                .await
+                                .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+                        }
+                        Ok::<(), std::io::Error>(())
+                    }
                 };
+
+                loop {
+                    let frame = match reader.read_frame(&mut send_control).await {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            tracing::debug!(error = ?error, "pty: invalid or disconnected WebSocket client");
+                            let _ = reader_output
+                                .send(InteractiveWebSocketOutput::Close(vec![0x03, 0xea]))
+                                .await;
+                            break;
+                        }
+                    };
+
+                    match frame.opcode {
+                        WebSocketOpCode::Binary => {
+                            if input_tx
+                                .send(crate::agent::InteractiveInput::Stdin(Vec::from(frame.payload)))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        WebSocketOpCode::Text => {
+                            let text = Vec::from(frame.payload);
+                            // FragmentCollectorRead has already enforced UTF-8
+                            // for text frames. JSON controls retain the legacy
+                            // interactive protocol; other text is stdin.
+                            match serde_json::from_slice::<serde_json::Value>(&text) {
+                                Ok(value) if value["type"] == "resize" => {
+                                    let cols = value["cols"].as_u64().unwrap_or(80) as u16;
+                                    let rows = value["rows"].as_u64().unwrap_or(24) as u16;
+                                    if input_tx
+                                        .send(crate::agent::InteractiveInput::Resize { cols, rows })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Ok(value) if value["type"] == "stdin" => {
+                                    if let Some(data) = value["data"].as_str() {
+                                        if input_tx
+                                            .send(crate::agent::InteractiveInput::Stdin(
+                                                data.as_bytes().to_vec(),
+                                            ))
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ if input_tx
+                                    .send(crate::agent::InteractiveInput::Stdin(text))
+                                    .is_err() => break,
+                                _ => {}
+                            }
+                        }
+                        WebSocketOpCode::Close => {
+                            let _ = input_tx.send(crate::agent::InteractiveInput::Eof);
+                            break;
+                        }
+                        // Ping and Pong are handled by the parser's automatic
+                        // control-frame response path. Continuations are
+                        // collected before this point.
+                        WebSocketOpCode::Ping
+                        | WebSocketOpCode::Pong
+                        | WebSocketOpCode::Continuation => {}
+                    }
+                }
+            }) {
+                Ok(task) => task,
+                Err(error) => {
+                    tracing::warn!(error = ?error, "pty: runtime stopped before WebSocket reader started");
+                    drop(outgoing_tx);
+                    let _ = writer_task.await;
+                    return;
+                }
+            };
+
+            // Run the interactive session on a DEDICATED agent connection — NOT
+            // the shared per-machine client. Holding the shared client lock for
+            // a long-lived PTY would block every other operation on the machine.
+            let session_entry = entry.clone();
+            let session_output = outgoing_tx.clone();
+            let session = runtime.spawn_blocking(move || {
+                let connect = { session_entry.lock().manager.connect() };
+                let mut client = match connect {
+                    Ok(client) => client,
+                    Err(error) => {
+                        tracing::warn!(error = ?error, "pty: failed to open dedicated agent connection");
+                        return -1;
+                    }
+                };
+                let on_output = move |output| {
+                    let bytes = match output {
+                        crate::agent::InteractiveOutput::Stdout(bytes)
+                        | crate::agent::InteractiveOutput::Stderr(bytes) => bytes,
+                    };
+                    // A closed browser socket drops the receiver and unblocks
+                    // this synchronous callback instead of holding a PTY open.
+                    let _ = session_output.send_blocking(InteractiveWebSocketOutput::Binary(bytes));
+                };
+
                 if let Some(image) = machine_image {
                     match client.query(&image) {
                         Ok(Some(_)) => {}
                         Ok(None) => {
-                            if let Err(e) = client.pull_with_registry_config(&image) {
-                                tracing::warn!(error = ?e, "pty: image pull failed");
+                            if let Err(error) = client.pull_with_registry_config(&image) {
+                                tracing::warn!(error = ?error, "pty: image pull failed");
                                 return -1;
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(error = ?e, "pty: image query failed");
+                        Err(error) => {
+                            tracing::warn!(error = ?error, "pty: image query failed");
                             return -1;
                         }
                     }
@@ -509,92 +695,45 @@ pub async fn exec_interactive(
                         .with_mounts(mounts_config)
                         .with_tty(true)
                         .with_persistent_overlay(Some(id));
-                    client
-                        .run_interactive_io(config, in_rx, on_output)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(error = ?e, "pty: interactive run failed");
-                            -1
-                        })
+                    client.run_interactive_io(config, input_rx, on_output).unwrap_or_else(|error| {
+                        tracing::warn!(error = ?error, "pty: interactive run failed");
+                        -1
+                    })
                 } else {
                     client
-                        .vm_exec_interactive_io(command, Vec::new(), None, true, in_rx, on_output)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(error = ?e, "pty: interactive vm_exec failed");
+                        .vm_exec_interactive_io(command, Vec::new(), None, true, input_rx, on_output)
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(error = ?error, "pty: interactive vm_exec failed");
                             -1
                         })
                 }
-            })
-            .await
-            .unwrap_or(-1)
-        });
+            });
 
-        // Pump WS → session input. Dropping `in_tx` (when this task ends) signals
-        // EOF to the session via channel disconnect.
-        let input_pump = tokio::spawn(async move {
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                match msg {
-                    Message::Binary(b)
-                        if in_tx
-                            .send(crate::agent::InteractiveInput::Stdin(b.to_vec()))
-                            .is_err() =>
-                    {
-                        break;
+            let code = match session {
+                Ok(session) => match session.await {
+                    Ok(code) => code,
+                    Err(error) => {
+                        tracing::warn!(error = ?error, "pty: blocking session did not complete");
+                        -1
                     }
-                    Message::Binary(_) => {}
-                    Message::Text(t) => {
-                        // Control frames are JSON; anything else is treated as raw stdin.
-                        match serde_json::from_str::<serde_json::Value>(t.as_str()) {
-                            Ok(v) if v["type"] == "resize" => {
-                                let cols = v["cols"].as_u64().unwrap_or(80) as u16;
-                                let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-                                let _ = in_tx
-                                    .send(crate::agent::InteractiveInput::Resize { cols, rows });
-                            }
-                            Ok(v) if v["type"] == "stdin" => {
-                                if let Some(d) = v["data"].as_str() {
-                                    let _ = in_tx.send(crate::agent::InteractiveInput::Stdin(
-                                        d.as_bytes().to_vec(),
-                                    ));
-                                }
-                            }
-                            _ => {
-                                let _ = in_tx.send(crate::agent::InteractiveInput::Stdin(
-                                    t.as_bytes().to_vec(),
-                                ));
-                            }
-                        }
-                    }
-                    Message::Close(_) => {
-                        let _ = in_tx.send(crate::agent::InteractiveInput::Eof);
-                        break;
-                    }
-                    _ => {}
+                },
+                Err(error) => {
+                    tracing::warn!(error = ?error, "pty: runtime cannot schedule blocking session");
+                    -1
                 }
-            }
-        });
-
-        // Pump session output → WS. Ends when the session drops `out_tx` (command exit).
-        while let Some(o) = out_rx.recv().await {
-            let bytes = match o {
-                crate::agent::InteractiveOutput::Stdout(d)
-                | crate::agent::InteractiveOutput::Stderr(d) => d,
             };
-            if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
-                break;
-            }
-        }
 
-        // Report the exit code and close. The session task returns the command's
-        // exit code (or a sentinel: -1 on internal error, 130 on disconnect).
-        let code = session.await.unwrap_or(-1);
-        let _ = ws_tx
-            .send(Message::Text(
-                format!("{{\"type\":\"exit\",\"code\":{code}}}").into(),
-            ))
-            .await;
-        let _ = ws_tx.send(Message::Close(None)).await;
-        input_pump.abort();
-    }))
+            // FIFO ordering means all PTY output sent before the blocking task
+            // returned is emitted before this terminal exit control frame.
+            let _ = outgoing_tx.send(InteractiveWebSocketOutput::Exit(code)).await;
+            drop(reader_task);
+            drop(outgoing_tx);
+            let _ = writer_task.await;
+        })
+        .map_err(ApiError::internal)?
+        .detach();
+
+    Ok(response)
 }
 
 /// Maximum number of concurrent log-follow SSE streams.
@@ -622,7 +761,7 @@ pub async fn stream_logs(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     // get_machine only knows machines in the running map. Distinguish a real
     // typo (absent from the DB too) from a machine that exists but was never
     // started (present in the DB, no console log yet) so clients don't read a
@@ -653,9 +792,7 @@ pub async fn stream_logs(
 
     // Check if file exists (blocking check is acceptable here since it's fast)
     let path_check = log_path.clone();
-    let exists = tokio::task::spawn_blocking(move || path_check.exists())
-        .await
-        .map_err(ApiError::internal)?;
+    let exists = state.blocking(move || path_check.exists()).await?;
 
     if !exists {
         // The machine is registered (get_machine succeeded above) but has no
@@ -699,15 +836,16 @@ pub async fn stream_logs(
     // For tail, read last N lines upfront using spawn_blocking with bounded memory
     let (initial_lines, start_pos) = if let Some(n) = tail {
         let path = log_path.clone();
-        tokio::task::spawn_blocking(move || read_last_n_lines_bounded(&path, n))
-            .await
-            .map_err(ApiError::internal)?
+        state
+            .blocking(move || read_last_n_lines_bounded(&path, n))
+            .await?
             .map_err(ApiError::internal)?
     } else {
         (Vec::new(), 0)
     };
 
     // Create the SSE stream
+    let log_runtime = state.runtime()?.clone();
     let stream = async_stream::stream! {
         // Hold the follow permit for the stream's lifetime so it's released
         // when the client disconnects or the stream ends.
@@ -718,7 +856,7 @@ pub async fn stream_logs(
             if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
                 continue; // skip non-JSON lines in json mode
             }
-            yield Ok(Event::default().data(line));
+            yield Ok(Event::new().data(line));
         }
 
         if tail.is_some() && !follow {
@@ -734,11 +872,15 @@ pub async fn stream_logs(
             let path = log_path.clone();
             let current_pos = pos;
 
-            let result = tokio::task::spawn_blocking(move || {
-                read_from_position(&path, current_pos)
-            })
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+            let result = match log_runtime
+                .spawn_blocking(move || read_from_position(&path, current_pos))
+            {
+                Ok(task) => task
+                    .await
+                    .map_err(std::io::Error::other)
+                    .and_then(|result| result),
+                Err(error) => Err(std::io::Error::other(error)),
+            };
 
             match result {
                 Ok((new_data, new_pos)) => {
@@ -752,17 +894,17 @@ pub async fn stream_logs(
                             if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
                                 continue; // skip non-JSON lines in json mode
                             }
-                            yield Ok(Event::default().data(line));
+                            yield Ok(Event::new().data(line));
                         }
                         // Flush partial line if it exceeds the safety cap
                         if partial_line.len() > MAX_PARTIAL_LINE {
-                            yield Ok(Event::default().data(partial_line.clone()));
+                            yield Ok(Event::new().data(partial_line.clone()));
                             partial_line.clear();
                         }
                     }
                 }
                 Err(e) => {
-                    yield Ok(Event::default().data(format!("error: {}", e)));
+                    yield Ok(Event::new().data(format!("error: {}", e)));
                     break;
                 }
             }
@@ -770,13 +912,13 @@ pub async fn stream_logs(
             if !follow {
                 // Yield any remaining partial line
                 if !partial_line.is_empty() {
-                    yield Ok(Event::default().data(partial_line.clone()));
+                    yield Ok(Event::new().data(partial_line.clone()));
                 }
                 break;
             }
 
             // Wait before polling again
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            crate::runtime::sleep(Duration::from_millis(100)).await;
         }
     };
 
@@ -848,4 +990,56 @@ fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<(Stri
 
     let text = String::from_utf8_lossy(&buf).into_owned();
     Ok((text, new_pos))
+}
+
+#[cfg(test)]
+mod websocket_tests {
+    use super::*;
+    use h12tiny::util::BodyExt;
+    use h12tiny::web::{IntoResponse, StatusCode};
+
+    #[test]
+    fn malformed_websocket_handshake_keeps_the_api_json_error_envelope() {
+        let directory = tempfile::tempdir().expect("create temporary database directory");
+        let database = crate::db::SmolvmDb::open_at(&directory.path().join("smolvm.db"))
+            .expect("open temporary database");
+        let state = Arc::new(ApiState::with_db(database));
+        let request = Request::builder()
+            .version(h12tiny::web::Version::HTTP_11)
+            .header("host", "localhost")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .body(h12tiny::util::boxed_body(h12tiny::util::empty_body()))
+            .expect("the malformed handshake is valid HTTP");
+        let runtime = crate::runtime::Runtime::with_workers(1).expect("start test runtime");
+
+        let error = match runtime.block_on(exec_interactive(
+            State(state),
+            Path("machine".to_owned()),
+            Query(InteractiveQuery {
+                cmd: None,
+                cols: None,
+                rows: None,
+            }),
+            None,
+            request,
+        )) {
+            Ok(_) => panic!("a missing Sec-WebSocket-Key must fail before VM lookup"),
+            Err(error) => error,
+        };
+
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = runtime
+            .block_on(response.into_body().collect())
+            .expect("collect JSON error body")
+            .to_bytes();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("parse API error response as JSON");
+        assert_eq!(body["code"], "BAD_REQUEST");
+        assert!(body["error"].as_str().is_some_and(|message| {
+            message.contains("Sec-WebSocket-Key")
+        }));
+    }
 }

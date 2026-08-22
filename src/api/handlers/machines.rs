@@ -11,15 +11,14 @@
 //! the directory's `name` marker so hash collisions are rejected rather than
 //! sharing storage or sockets.
 
-use axum::{
-    extract::{Path, Query, State},
-    Json,
-};
+use h12tiny::web::{Path, State, StatusCode};
+use crate::api::{Json, OptionalJson};
+use crate::api::Query;
+use async_channel::Sender;
 use futures_util::StreamExt;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount, PortMapping};
 use crate::api::error::ApiError;
@@ -346,6 +345,7 @@ pub async fn create_machine(
     let mut req = req;
     if let Some(ref registry_ref) = req.registry_ref.clone() {
         let pulled_path = pull_from_registry(
+            &state,
             registry_ref,
             req.registry_identity_token.as_deref(),
             &req.blob_peers,
@@ -366,6 +366,7 @@ pub async fn create_machine(
             &image,
             req.registry_identity_token.as_deref(),
             &req.blob_peers,
+            state.registry_runtime()?,
         )
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -618,7 +619,7 @@ pub async fn create_machine(
     let guard = ReservationGuard::new(&state, name.clone())?;
 
     // Create manager (does not boot the VM)
-    let manager = tokio::task::spawn_blocking({
+    let manager = state.blocking({
         let name = name.clone();
         let storage_gb = req.storage_gb;
         let overlay_gb = req.overlay_gb;
@@ -626,9 +627,7 @@ pub async fn create_machine(
             AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
                 .map_err(|e| ApiError::internal(format!("failed to create agent manager: {}", e)))
         }
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+    }).await??;
 
     // Extract the bundle's OCI layers into this machine's own data dir (created
     // by the manager above) rather than the shared pack cache, so every start is
@@ -641,7 +640,7 @@ pub async fn create_machine(
     if let Some(ref sidecar_path) = source_smolmachine {
         let name = name.clone();
         let sidecar_path = sidecar_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        state.blocking(move || -> Result<(), ApiError> {
             let path = std::path::Path::new(&sidecar_path);
             let cache_dir = crate::agent::machine_layers_cache_dir(&name);
             let result = (|| {
@@ -705,9 +704,7 @@ pub async fn create_machine(
                 return Err(e);
             }
             Ok(())
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+        }).await??;
     }
 
     // VM-mode pack: seed this machine's overlay + storage disks from the packed
@@ -723,7 +720,7 @@ pub async fn create_machine(
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| vm_data_dir(&name));
-        let seed_result = tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        let seed_result = state.blocking(move || -> Result<(), ApiError> {
             let cache_dir = crate::agent::machine_layers_cache_dir(&name2);
             // With the shared store, the pack contents live in `_shared/<checksum>`
             // (the per-machine `pack` dir is an empty mountpoint), so seed the
@@ -756,9 +753,7 @@ pub async fn create_machine(
                 },
             )
             .map_err(|e| ApiError::internal(format!("seed VM-mode disks: {}", e)))
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+        }).await?;
         // On failure roll back the data dir the manager created, so a retry starts
         // clean (the reservation guard releases the name but leaves the dir).
         if let Err(e) = seed_result {
@@ -935,7 +930,7 @@ pub struct EgressEventsQuery {
 pub async fn get_machine_egress_events(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<EgressEventsQuery>,
+    Query(query): Query<EgressEventsQuery>,
 ) -> Result<Json<EgressEventsResponse>, ApiError> {
     state
         .lookup_vm(&name)
@@ -1014,17 +1009,17 @@ pub async fn start_machine(
     Query(query): Query<StartMachineQuery>,
     // Optional: the route took only a query string before this existed, so a
     // caller that sends no body (or a non-JSON one) still starts normally.
-    body: Option<Json<crate::api::types::StartMachineRequest>>,
+    body: OptionalJson<crate::api::types::StartMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     let registry_auth: Option<crate::registry::RegistryAuth> =
-        body.and_then(|Json(b)| b.registry_auth).map(Into::into);
+        body.0.and_then(|b| b.registry_auth).map(Into::into);
     // Hold the per-machine lifecycle lock across the whole start so a concurrent
     // stop/delete cannot detach the macOS layers volume between our acquire+mount
     // and the launch, nor launch a guest into the launcher's missing-dir error
     // (review finding #3). Acquired before the DB read and resolve_state probe
     // below so the "is it running?" decision and the launch happen under one held
     // lock; it is the outermost lock (the entry mutex is taken later, inside the
-    // spawn_blocking). Linux: the guarded detach/mount are no-ops.
+    // owned blocking pool). Linux: the guarded detach/mount are no-ops.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
 
@@ -1044,11 +1039,9 @@ pub async fn start_machine(
     // blocking pool rather than in the async task.
     let name_probe = name.clone();
     let record_probe = record.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
+    let resolved = state.blocking(move || {
         crate::agent::state_probe::resolve_state(&name_probe, &record_probe)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    }).await?;
 
     if resolved == RecordState::Running {
         if !state.machine_exists(&name) {
@@ -1056,11 +1049,9 @@ pub async fn start_machine(
             let name_for_repair = name.clone();
             let storage_gb = record.storage_gb;
             let overlay_gb = record.overlay_gb;
-            let manager = tokio::task::spawn_blocking(move || {
+            let manager = state.blocking(move || {
                 AgentManager::for_vm_with_sizes(&name_for_repair, storage_gb, overlay_gb)
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            }).await?
             .map_err(|e| {
                 ApiError::internal(format!(
                     "machine '{}' is running but registry repair failed: {}",
@@ -1076,9 +1067,7 @@ pub async fn start_machine(
     if resolved == RecordState::Frozen {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        let clones = state.blocking(move || db.dependent_clones(&golden)).await?
             .map_err(ApiError::database)?;
         let reason = if clones.is_empty() {
             "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
@@ -1103,11 +1092,9 @@ pub async fn start_machine(
         // cannot be confirmed dead, refuse the start instead of
         // booting on top of it.
         let name_recover = name.clone();
-        tokio::task::spawn_blocking(move || {
+        state.blocking(move || {
             crate::agent::state_probe::recover_if_unreachable(&name_recover)
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        }).await?
         .map_err(|e| {
             ApiError::internal(format!(
                 "machine '{name}' is unreachable and zombie cleanup failed: {e}"
@@ -1165,7 +1152,7 @@ pub async fn start_machine(
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     let forkable = query.forkable || query.fork_pool_size.is_some() || record.forkable_on_start();
-    let (manager, pid) = tokio::task::spawn_blocking(move || {
+    let (manager, pid) = state.blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
@@ -1197,9 +1184,7 @@ pub async fn start_machine(
 
         let pid = manager.child_pid();
         Ok::<_, String>((manager, pid))
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    }).await?
     .map_err(classify_launch_error)?;
 
     // Register in ApiState so exec/run/container endpoints can find it
@@ -1263,7 +1248,7 @@ pub async fn start_machine(
         // is consulted before the config inside `pull`, so passing it here is
         // enough — and passing `None` leaves the previous behaviour untouched.
         let pull_auth = registry_auth.clone();
-        let pull = with_machine_client_traced(&entry, None, move |c| {
+        let pull = with_machine_client_traced(state.runtime()?, &entry, None, move |c| {
             if c.query(&image_pull)?.is_none() {
                 let mut opts = crate::agent::PullOptions::new().use_registry_config(true);
                 if let Some(auth) = pull_auth {
@@ -1286,10 +1271,9 @@ pub async fn start_machine(
             // clears) and deletable — then surface the pull failure.
             let st = pid.and_then(process_start_time);
             let name_rb = name.clone();
-            tokio::task::spawn_blocking(move || {
+            state.blocking(move || {
                 shutdown_machine_process(&name_rb, pid, st, false);
-            })
-            .await
+            }).await
             .ok();
             return Err(e);
         }
@@ -1297,7 +1281,7 @@ pub async fn start_machine(
         // crun/overlay hiccup leaves a reachable (exec-able) VM rather than
         // failing an otherwise-pullable start — the image is already local, so a
         // retry or the health loop can bring the workload up.
-        let launch = with_machine_client_traced(&entry, None, move |c| {
+        let launch = with_machine_client_traced(state.runtime()?, &entry, None, move |c| {
             let config = crate::agent::RunConfig::new(image, command)
                 .with_env(env)
                 .with_workdir(workdir)
@@ -1469,11 +1453,9 @@ pub(crate) async fn fork_machine_inner(
 
     if wait_ready {
         let golden_b = golden.clone();
-        tokio::task::spawn_blocking(move || {
+        state.blocking(move || {
             crate::agent::fork::wait_for_forkpoint(&golden_b, ready_timeout)
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        }).await?
         .map_err(classify_fork_error)?;
     }
 
@@ -1494,7 +1476,7 @@ pub(crate) async fn fork_machine_inner(
         let ports = pinned_ports.clone();
         let env = fork_env.clone();
         let secrets = fork_secrets.clone();
-        tokio::task::spawn_blocking(move || {
+        state.blocking(move || {
             if req_hold {
                 crate::agent::fork::prepare_held_fork(
                     &db, &golden_b, &clone_b, &ports, &env, &secrets,
@@ -1505,9 +1487,7 @@ pub(crate) async fn fork_machine_inner(
                     &secrets,
                 )
             }
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        }).await?
         .map_err(classify_fork_error)?
     };
 
@@ -1540,21 +1520,16 @@ pub(crate) async fn fork_machine_inner(
     // golden and invalidate the checkpoint before releasing its lifecycle lock.
     let db = state.db().clone();
     let golden_for_rollback = golden.clone();
-    let rollback = match tokio::task::spawn_blocking(move || {
+    let rollback = match state.blocking(move || {
         crate::agent::fork::rollback_retained_fork_snapshot(
             &db,
             &golden_for_rollback,
             &snapshot_dir,
             true,
         )
-    })
-    .await
-    {
+    }).await {
         Ok(result) => result,
-        Err(error) => Err(SmolvmError::agent(
-            "fork rollback",
-            format!("task error: {error}"),
-        )),
+        Err(error) => Err(SmolvmError::agent("fork rollback", format!("{error:?}"))),
     };
     match rollback {
         Ok(()) => Err(ApiError::CloneIdentityRejuvenationFailed(message)),
@@ -1576,15 +1551,15 @@ pub(crate) struct ForkHeldBatch {
     pub share_weights: bool,
     pub ready_timeout: std::time::Duration,
     pub retained_snapshot: Option<crate::agent::fork::RetainedForkSnapshot>,
-    pub boot_slots: Arc<tokio::sync::Semaphore>,
+    pub boot_slots: Arc<crate::runtime::Semaphore>,
     pub snapshot_ready:
-        Option<tokio::sync::oneshot::Sender<crate::agent::fork::RetainedForkSnapshot>>,
+        Option<Sender<crate::agent::fork::RetainedForkSnapshot>>,
 }
 
 pub(crate) async fn fork_held_machines_inner(
     state: Arc<ApiState>,
     batch: ForkHeldBatch,
-    result_tx: UnboundedSender<(String, Result<MachineInfo, ApiError>)>,
+    result_tx: Sender<(String, Result<MachineInfo, ApiError>)>,
 ) -> Result<ForkBatchOutcome, ApiError> {
     let ForkHeldBatch {
         golden,
@@ -1600,11 +1575,9 @@ pub(crate) async fn fork_held_machines_inner(
     }
 
     let golden_for_wait = golden.clone();
-    tokio::task::spawn_blocking(move || {
+    state.blocking(move || {
         crate::agent::fork::wait_for_forkpoint(&golden_for_wait, ready_timeout)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+    }).await?
     .map_err(classify_fork_error)?;
 
     // Keep every clone lifecycle locked through registration and boot. Names are
@@ -1622,7 +1595,7 @@ pub(crate) async fn fork_held_machines_inner(
         let db = state.db().clone();
         let golden_for_prep = golden.clone();
         let clones_for_prep = clones.clone();
-        tokio::task::spawn_blocking(move || {
+        state.blocking(move || {
             let empty_secrets = std::collections::BTreeMap::new();
             let specs: Vec<_> = clones_for_prep
                 .iter()
@@ -1642,9 +1615,7 @@ pub(crate) async fn fork_held_machines_inner(
                 retained_snapshot.as_ref(),
                 true,
             )
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+        }).await?
         .map_err(classify_fork_error)?
     };
 
@@ -1657,8 +1628,9 @@ pub(crate) async fn fork_held_machines_inner(
         let state = state.clone();
         let boot_slots = boot_slots.clone();
         async move {
-            let result = match boot_slots.acquire_owned().await {
-                Ok(boot_permit) => {
+            let result = {
+                let boot_permit = boot_slots.lock_owned().await;
+                {
                     boot_prepared_fork_inner(
                         state,
                         clone.clone(),
@@ -1671,12 +1643,8 @@ pub(crate) async fn fork_held_machines_inner(
                             cuda_worker_ready_timeout: Some(ready_timeout),
                             boot_permit: Some(boot_permit),
                         },
-                    )
-                    .await
+                    ).await
                 }
-                Err(error) => Err(ApiError::internal(format!(
-                    "fork boot scheduler closed: {error}"
-                ))),
             };
             (clone, result)
         }
@@ -1691,10 +1659,10 @@ pub(crate) async fn fork_held_machines_inner(
             if let (Some(sender), Some(snapshot)) =
                 (snapshot_ready.take(), reusable_snapshot.clone())
             {
-                let _ = sender.send(snapshot);
+                let _ = sender.try_send(snapshot);
             }
         }
-        if result_tx.send(result).is_err() {
+        if result_tx.try_send(result).is_err() {
             tracing::warn!("fork pool result receiver closed before provisioning completed");
         }
         succeeded
@@ -1769,7 +1737,7 @@ struct PreparedForkBoot {
     wait_ready: bool,
     hold: bool,
     cuda_worker_ready_timeout: Option<std::time::Duration>,
-    boot_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    boot_permit: Option<crate::runtime::OwnedSemaphorePermit>,
 }
 
 enum PreparedForkBootError {
@@ -1811,7 +1779,7 @@ async fn boot_prepared_fork_inner(
     // there is no image workload to launch), then rejuvenate its identity.
     let clone_b = clone.clone();
     let db = state.db().clone();
-    let (manager, pid, clone_record) = tokio::task::spawn_blocking(move || {
+    let (manager, pid, clone_record) = state.blocking(move || {
         let record = prep.clone_record;
         let mounts = record.host_mounts();
         let ports = record.port_mappings();
@@ -1909,9 +1877,7 @@ async fn boot_prepared_fork_inner(
         }
 
         Ok::<_, PreparedForkBootError>((manager, pid, record))
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    }).await?
     .map_err(classify_prepared_fork_boot_error)?;
 
     // Register the clone so exec/run endpoints can reach it.
@@ -1962,9 +1928,7 @@ pub async fn release_held_fork(
     let _guard = lifecycle.lock().await;
     let db = state.db().clone();
     let clone_for_pool = clone.clone();
-    let pool_slot = tokio::task::spawn_blocking(move || db.get_fork_pool_slot(&clone_for_pool))
-        .await
-        .map_err(|e| ApiError::internal(format!("pool ownership task failed: {e}")))?
+    let pool_slot = state.blocking(move || db.get_fork_pool_slot(&clone_for_pool)).await?
         .map_err(ApiError::database)?;
     if let Some(slot) = pool_slot {
         return Err(ApiError::Conflict(format!(
@@ -2021,11 +1985,9 @@ pub async fn release_held_fork(
     let clone_b = clone.clone();
     let record_b = record.clone();
     let assignment_b = assignment.clone();
-    let activated = tokio::task::spawn_blocking(move || {
+    let activated = state.blocking(move || {
         crate::agent::fork::activate_held_fork(&clone_b, &record_b, &assignment_b)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+    }).await?
     .map_err(|error| {
         ApiError::Internal(format!(
             "slot '{clone}' was claimed and will not be reused after activation failed: {error}"
@@ -2078,9 +2040,7 @@ pub async fn stop_machine(
     {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        let clones = state.blocking(move || db.dependent_clones(&golden)).await?
             .map_err(ApiError::database)?;
         if !clones.is_empty() {
             return Err(ApiError::Conflict(format!(
@@ -2105,13 +2065,11 @@ pub async fn stop_machine(
         // a no-op on Linux.
         if record.source_smolmachine.is_some() {
             let name_clone = name.clone();
-            tokio::task::spawn_blocking(move || {
+            state.blocking(move || {
                 smolvm_pack::extract::force_detach_layers_volume(
                     &crate::agent::machine_layers_cache_dir(&name_clone),
                 );
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+            }).await?;
         }
         return Ok(Json(record_to_info(&name, &record)));
     }
@@ -2125,7 +2083,7 @@ pub async fn stop_machine(
     // a subsequent start can re-acquire it.
     let entry = state.get_machine(&name).ok();
     let name_clone = name.clone();
-    let stopped = tokio::task::spawn_blocking(move || {
+    let stopped = state.blocking(move || {
         let ok = if let Some(ref entry) = entry {
             let e = entry.lock();
             match e.manager.stop() {
@@ -2148,9 +2106,7 @@ pub async fn stop_machine(
             );
         }
         ok
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    }).await?;
 
     if !stopped {
         return Err(ApiError::Internal(format!(
@@ -2195,10 +2151,10 @@ pub async fn stop_machine(
 /// The control plane (autoscaler scale-in) calls this BEFORE terminating the host
 /// so VMs flush cleanly. Control-only by construction: the serve listener is mTLS-
 /// gated, and the loopback door is localhost. See docs/lossless-serve-restart.md.
-pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::StatusCode {
+pub async fn drain_node(State(state): State<Arc<ApiState>>) -> StatusCode {
     tracing::info!("drain requested via API (node decommission)");
     drain_machines(&state).await;
-    axum::http::StatusCode::OK
+    StatusCode::OK
 }
 
 /// Gracefully stop every running VM. Two callers: the opt-in shutdown path
@@ -2227,13 +2183,14 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
         "draining running machines before shutdown"
     );
 
-    let mut handles = Vec::with_capacity(running.len());
-    for (name, pid, pid_start_time) in running {
-        let state = state.clone();
-        handles.push(tokio::spawn(async move {
+    let drain_width = running.len().max(1);
+    let drain_all = async {
+        let mut pending = futures_util::stream::iter(running.into_iter().map(|(name, pid, pid_start_time)| {
+            let state = state.clone();
+            async move {
             let name_for_kill = name.clone();
             let entry = state.get_machine(&name).ok();
-            let stopped = tokio::task::spawn_blocking(move || {
+            let stopped = state.blocking(move || {
                 // Prefer the registered manager (holds the flock); fall back to a
                 // PID-verified signal — same path as the stop handler.
                 let via_manager = entry
@@ -2241,8 +2198,7 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                     .map(|e| e.lock().manager.stop().is_ok())
                     .unwrap_or(false);
                 via_manager || shutdown_machine_process(&name_for_kill, pid, pid_start_time, true)
-            })
-            .await
+            }).await
             .unwrap_or(false);
             if let Ok(entry) = state.get_machine(&name) {
                 entry.lock().manager.mark_stopped();
@@ -2260,15 +2216,12 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                 })
                 .await;
             tracing::info!(machine = %name, stopped, "drain: machine stopped");
-        }));
-    }
-
-    let drain_all = async {
-        for h in handles {
-            let _ = h.await;
+            }
+        })).buffer_unordered(drain_width);
+        while pending.next().await.is_some() {
         }
     };
-    if tokio::time::timeout(std::time::Duration::from_secs(25), drain_all)
+    if crate::runtime::timeout(std::time::Duration::from_secs(25), drain_all)
         .await
         .is_err()
     {
@@ -2305,9 +2258,7 @@ pub async fn delete_machine(
     if query.cascade {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        let clones = state.blocking(move || db.dependent_clones(&golden)).await?
             .map_err(ApiError::database)?;
         for clone in clones {
             delete_one(state.clone(), clone).await?;
@@ -2346,9 +2297,7 @@ pub(crate) async fn delete_one(
     {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        let clones = state.blocking(move || db.dependent_clones(&golden)).await?
             .map_err(ApiError::database)?;
         if !clones.is_empty() {
             return Err(ApiError::Conflict(format!(
@@ -2367,7 +2316,7 @@ pub(crate) async fn delete_one(
 
     // Stop if running (in blocking task)
     let name_clone = name.clone();
-    let stopped = tokio::task::spawn_blocking(move || {
+    let stopped = state.blocking(move || {
         let ok = shutdown_machine_process(&name_clone, pid, pid_start_time, false);
         if ok {
             // Process is gone — detach this machine's case-sensitive layers
@@ -2379,9 +2328,7 @@ pub(crate) async fn delete_one(
             );
         }
         ok
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    }).await?;
 
     if !stopped {
         return Err(ApiError::Internal(format!(
@@ -2403,9 +2350,7 @@ pub(crate) async fn delete_one(
     {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        let clones = state.blocking(move || db.dependent_clones(&golden)).await?
             .map_err(ApiError::database)?;
         if !clones.is_empty() {
             return Err(ApiError::Conflict(format!(
@@ -2423,7 +2368,7 @@ pub(crate) async fn delete_one(
     // where it would starve the small per-node reactor under delete churn.
     let state_rm = state.clone();
     let name_rm = name.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+    state.blocking(move || -> Result<(), ApiError> {
         match state_rm.remove_machine(&name_rm) {
             Ok(_) => Ok(()),
             Err(ApiError::NotFound(_)) => {
@@ -2443,9 +2388,7 @@ pub(crate) async fn delete_one(
             }
             Err(e) => Err(e),
         }
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+    }).await??;
 
     // Remove VM data directory (disk images, sockets, etc.)
     let data_dir = vm_data_dir(&name);
@@ -2518,9 +2461,7 @@ pub async fn resize_machine(
     {
         let db = state.db().clone();
         let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        let clones = state.blocking(move || db.dependent_clones(&golden)).await?
             .map_err(ApiError::database)?;
         if !clones.is_empty() {
             return Err(ApiError::Conflict(format!(
@@ -2646,10 +2587,9 @@ pub async fn export_machine(
     // still being written) can't be snapshotted into an inconsistent image.
     let name_probe = name.clone();
     let record_probe = record.clone();
-    let resolved =
-        tokio::task::spawn_blocking(move || resolve_machine_state(&name_probe, &record_probe))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    let resolved = state
+        .blocking(move || resolve_machine_state(&name_probe, &record_probe))
+        .await?;
     if resolved != RecordState::Stopped {
         return Err(ApiError::Conflict(
             "machine must be stopped to export".to_string(),
@@ -2668,18 +2608,16 @@ pub async fn export_machine(
     let exe =
         std::env::current_exe().map_err(|e| ApiError::internal(format!("current_exe: {}", e)))?;
 
-    let output = tokio::process::Command::new(&exe)
-        .args([
-            "pack",
-            "create",
-            "--from-vm",
-            &name,
-            "-o",
-            &tmp_path.to_string_lossy(),
-        ])
-        .output()
-        .await
-        .map_err(|e| ApiError::internal(format!("spawn pack export: {}", e)))?;
+    let export_name = name.clone();
+    let export_path = tmp_path.to_string_lossy().into_owned();
+    let output = state
+        .blocking(move || {
+            std::process::Command::new(&exe)
+                .args(["pack", "create", "--from-vm", &export_name, "-o", &export_path])
+                .output()
+                .map_err(|e| ApiError::internal(format!("spawn pack export: {}", e)))
+        })
+        .await??;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ApiError::internal(format!(
@@ -2714,7 +2652,9 @@ pub async fn export_machine(
     } else {
         format!("https://{}", req.reference_host)
     };
-    let client = smolvm_registry::RegistryClient::new(base_url).with_token(req.push_token.clone());
+    let client = state
+        .registry_client(base_url)?
+        .with_token(req.push_token.clone());
 
     let result = smolvm_registry::push(&client, &req.repo, &req.tag, &artifact)
         .await
@@ -2768,11 +2708,12 @@ fn is_ssrf_prone_registry_host(host: &str) -> bool {
 }
 
 async fn pull_from_registry(
+    state: &ApiState,
     registry_ref: &str,
     identity_token: Option<&str>,
     blob_peers: &[String],
 ) -> Result<String, ApiError> {
-    let result = pull_smolmachine(registry_ref, identity_token, blob_peers).await?;
+    let result = pull_smolmachine(state, registry_ref, identity_token, blob_peers).await?;
     tracing::info!(path = %result.path.display(), cached = result.cached, "pull complete");
     Ok(result.path.to_string_lossy().into_owned())
 }
@@ -2787,6 +2728,7 @@ async fn pull_from_registry(
 /// even slightly differently would cache a blob under one key and leave the
 /// create looking for another — a silent no-op that still looks like a success.
 pub(crate) async fn pull_smolmachine(
+    state: &ApiState,
     registry_ref: &str,
     identity_token: Option<&str>,
     blob_peers: &[String],
@@ -2823,7 +2765,7 @@ pub(crate) async fn pull_smolmachine(
         format!("https://{}", api_host)
     };
 
-    let mut client = smolvm_registry::RegistryClient::new(base_url);
+    let mut client = state.registry_client(base_url)?;
 
     // A request-supplied identity token (the control plane's short-lived,
     // tenant-scoped pull token) takes precedence over any persisted credential.
@@ -2903,6 +2845,7 @@ mod tests {
 
     use super::*;
     use crate::db::SmolvmDb;
+    use crate::runtime::Runtime;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -2949,191 +2892,206 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn bounded_futures_stream_results_without_exceeding_the_limit() {
+    #[test]
+    fn bounded_futures_stream_results_without_exceeding_the_limit() {
         const TOTAL: usize = 8;
         const WIDTH: usize = 4;
 
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        let (started_tx, mut started_rx) = tokio::sync::watch::channel(0usize);
-        let jobs = (0..TOTAL)
-            .map(|index| {
-                let active = active.clone();
-                let peak = peak.clone();
-                let gate = gate.clone();
-                let started_tx = started_tx.clone();
-                async move {
-                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now_active, Ordering::SeqCst);
-                    started_tx.send_modify(|started| *started += 1);
-                    let permit = gate.acquire().await.expect("test gate closed");
-                    permit.forget();
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    index
-                }
-            })
-            .collect::<Vec<_>>();
-        drop(started_tx);
+        let runtime = Runtime::with_workers(2).expect("test runtime");
+        runtime.block_on(async {
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let (gate_tx, gate_rx) = async_channel::unbounded::<()>();
+            let (started_tx, started_rx) = async_channel::unbounded::<()>();
+            let jobs = (0..TOTAL)
+                .map(|index| {
+                    let active = active.clone();
+                    let peak = peak.clone();
+                    let gate_rx = gate_rx.clone();
+                    let started_tx = started_tx.clone();
+                    async move {
+                        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now_active, Ordering::SeqCst);
+                        started_tx.send(()).await.expect("started receiver open");
+                        gate_rx.recv().await.expect("test gate open");
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        index
+                    }
+                })
+                .collect::<Vec<_>>();
+            drop(started_tx);
 
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
-        let runner = tokio::spawn(async move {
-            run_bounded_futures(jobs, WIDTH, move |result| {
-                result_tx.send(result).expect("result receiver open");
-                true
-            })
-            .await
+            let (result_tx, result_rx) = async_channel::unbounded();
+            let runner = runtime.spawn(async move {
+                run_bounded_futures(jobs, WIDTH, move |result| {
+                    result_tx.try_send(result).expect("result receiver open");
+                    true
+                })
+                .await
+            });
+
+            for _ in 0..WIDTH {
+                started_rx.recv().await.expect("workers still pending");
+            }
+            assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+
+            gate_tx.try_send(()).expect("test gate receiver open");
+            let first = result_rx.recv().await.expect("first result");
+            assert!(first < TOTAL);
+            started_rx.recv().await.expect("next worker pending");
+            assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+
+            for _ in 0..TOTAL {
+                gate_tx.try_send(()).expect("test gate receiver open");
+            }
+            let mut received = 1;
+            while received < TOTAL {
+                result_rx.recv().await.expect("remaining result");
+                received += 1;
+            }
+            assert!(runner.await);
+            assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
+            assert_eq!(active.load(Ordering::SeqCst), 0);
         });
-
-        while *started_rx.borrow() < WIDTH {
-            started_rx.changed().await.expect("workers still pending");
-        }
-        assert_eq!(*started_rx.borrow(), WIDTH);
-        assert_eq!(active.load(Ordering::SeqCst), WIDTH);
-        assert!(!runner.is_finished());
-
-        gate.add_permits(1);
-        let first = result_rx.recv().await.expect("first result");
-        assert!(first < TOTAL);
-        while *started_rx.borrow() < WIDTH + 1 {
-            started_rx.changed().await.expect("workers still pending");
-        }
-        assert_eq!(active.load(Ordering::SeqCst), WIDTH);
-
-        gate.add_permits(TOTAL);
-        let mut received = 1;
-        while received < TOTAL {
-            result_rx.recv().await.expect("remaining result");
-            received += 1;
-        }
-        assert!(runner.await.expect("runner task"));
-        assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
-        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
-    async fn boot_slots_release_while_prior_workers_wait_for_readiness() {
+    #[test]
+    fn boot_slots_release_while_prior_workers_wait_for_readiness() {
         const TOTAL: usize = 8;
         const WIDTH: usize = 2;
 
-        let boot_slots = Arc::new(tokio::sync::Semaphore::new(WIDTH));
-        let boot_release = Arc::new(tokio::sync::Semaphore::new(0));
-        let readiness_release = Arc::new(tokio::sync::Semaphore::new(0));
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let (started_tx, mut started_rx) = tokio::sync::watch::channel(0usize);
-        let jobs = (0..TOTAL)
-            .map(|index| {
-                let boot_slots = boot_slots.clone();
-                let boot_release = boot_release.clone();
-                let readiness_release = readiness_release.clone();
-                let active = active.clone();
-                let peak = peak.clone();
-                let started_tx = started_tx.clone();
-                async move {
-                    let boot_permit = boot_slots.acquire_owned().await.expect("scheduler open");
-                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now_active, Ordering::SeqCst);
-                    started_tx.send_modify(|started| *started += 1);
-
-                    let permit = boot_release.acquire().await.expect("test gate open");
-                    permit.forget();
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    drop(boot_permit);
-
-                    let permit = readiness_release
-                        .acquire()
-                        .await
-                        .expect("readiness gate open");
-                    permit.forget();
-                    index
-                }
-            })
-            .collect::<Vec<_>>();
-        drop(started_tx);
-
-        let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
-        let runner = tokio::spawn(async move {
-            run_bounded_futures(jobs, TOTAL, move |result| {
-                result_tx.send(result).expect("result receiver open");
-                true
-            })
-            .await
-        });
-
-        for expected in (WIDTH..=TOTAL).step_by(WIDTH) {
-            while *started_rx.borrow() < expected {
-                started_rx.changed().await.expect("boots still pending");
-            }
-            assert_eq!(active.load(Ordering::SeqCst), WIDTH);
-            boot_release.add_permits(WIDTH);
-        }
-        while active.load(Ordering::SeqCst) != 0 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!runner.is_finished());
-        assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
-
-        readiness_release.add_permits(TOTAL);
-        for _ in 0..TOTAL {
-            result_rx.recv().await.expect("remaining result");
-        }
-        assert!(runner.await.expect("runner task"));
-    }
-
-    #[tokio::test]
-    async fn shared_boot_slots_bound_independent_batches() {
-        const WIDTH: usize = 2;
-        const PER_BATCH: usize = 4;
-
-        let boot_slots = Arc::new(tokio::sync::Semaphore::new(WIDTH));
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let (started_tx, mut started_rx) = tokio::sync::watch::channel(0usize);
-        let build_batch = |offset| {
-            (0..PER_BATCH)
+        let runtime = Runtime::with_workers(2).expect("test runtime");
+        runtime.block_on(async {
+            let boot_slots = Arc::new(crate::runtime::Semaphore::new(WIDTH));
+            let (boot_release_tx, boot_release_rx) = async_channel::unbounded::<()>();
+            let (readiness_release_tx, readiness_release_rx) = async_channel::unbounded::<()>();
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let (started_tx, started_rx) = async_channel::unbounded::<()>();
+            let jobs = (0..TOTAL)
                 .map(|index| {
                     let boot_slots = boot_slots.clone();
-                    let release = release.clone();
+                    let boot_release_rx = boot_release_rx.clone();
+                    let readiness_release_rx = readiness_release_rx.clone();
                     let active = active.clone();
                     let peak = peak.clone();
                     let started_tx = started_tx.clone();
                     async move {
-                        let permit = boot_slots.acquire_owned().await.expect("scheduler open");
+                        let boot_permit = boot_slots.lock_owned().await;
                         let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(now_active, Ordering::SeqCst);
-                        started_tx.send_modify(|started| *started += 1);
-                        let gate = release.acquire().await.expect("test gate open");
-                        gate.forget();
+                        started_tx.send(()).await.expect("started receiver open");
+
+                        boot_release_rx.recv().await.expect("test gate open");
                         active.fetch_sub(1, Ordering::SeqCst);
-                        drop(permit);
-                        offset + index
+                        drop(boot_permit);
+
+                        readiness_release_rx
+                            .recv()
+                            .await
+                            .expect("readiness gate open");
+                        index
                     }
                 })
-                .collect::<Vec<_>>()
-        };
-        let first = build_batch(0);
-        let second = build_batch(PER_BATCH);
-        drop(started_tx);
+                .collect::<Vec<_>>();
+            drop(started_tx);
 
-        let first =
-            tokio::spawn(async move { run_bounded_futures(first, PER_BATCH, |_| true).await });
-        let second =
-            tokio::spawn(async move { run_bounded_futures(second, PER_BATCH, |_| true).await });
+            let (result_tx, result_rx) = async_channel::unbounded();
+            let runner = runtime.spawn(async move {
+                run_bounded_futures(jobs, TOTAL, move |result| {
+                    result_tx.try_send(result).expect("result receiver open");
+                    true
+                })
+                .await
+            });
 
-        while *started_rx.borrow() < WIDTH {
-            started_rx.changed().await.expect("boots still pending");
-        }
-        assert_eq!(active.load(Ordering::SeqCst), WIDTH);
-        assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
+            for expected in (WIDTH..=TOTAL).step_by(WIDTH) {
+                for _ in 0..WIDTH {
+                    started_rx.recv().await.expect("boots still pending");
+                }
+                assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+                for _ in 0..WIDTH {
+                    boot_release_tx
+                        .try_send(())
+                        .expect("test gate receiver open");
+                }
+                let _ = expected;
+            }
+            while active.load(Ordering::SeqCst) != 0 {
+                futures_lite::future::yield_now().await;
+            }
+            assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
 
-        release.add_permits(PER_BATCH * 2);
-        assert!(first.await.expect("first batch task"));
-        assert!(second.await.expect("second batch task"));
-        assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
-        assert_eq!(active.load(Ordering::SeqCst), 0);
+            for _ in 0..TOTAL {
+                readiness_release_tx
+                    .try_send(())
+                    .expect("readiness gate receiver open");
+            }
+            for _ in 0..TOTAL {
+                result_rx.recv().await.expect("remaining result");
+            }
+            assert!(runner.await);
+        });
+    }
+
+    #[test]
+    fn shared_boot_slots_bound_independent_batches() {
+        const WIDTH: usize = 2;
+        const PER_BATCH: usize = 4;
+
+        let runtime = Runtime::with_workers(2).expect("test runtime");
+        runtime.block_on(async {
+            let boot_slots = Arc::new(crate::runtime::Semaphore::new(WIDTH));
+            let (release_tx, release_rx) = async_channel::unbounded::<()>();
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let (started_tx, started_rx) = async_channel::unbounded::<()>();
+            let build_batch = |offset| {
+                (0..PER_BATCH)
+                    .map(|index| {
+                        let boot_slots = boot_slots.clone();
+                        let release_rx = release_rx.clone();
+                        let active = active.clone();
+                        let peak = peak.clone();
+                        let started_tx = started_tx.clone();
+                        async move {
+                            let permit = boot_slots.lock_owned().await;
+                            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now_active, Ordering::SeqCst);
+                            started_tx.send(()).await.expect("started receiver open");
+                            release_rx.recv().await.expect("test gate open");
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            drop(permit);
+                            offset + index
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let first_jobs = build_batch(0);
+            let second_jobs = build_batch(PER_BATCH);
+            drop(started_tx);
+
+            let first = runtime.spawn(async move {
+                run_bounded_futures(first_jobs, PER_BATCH, |_| true).await
+            });
+            let second = runtime.spawn(async move {
+                run_bounded_futures(second_jobs, PER_BATCH, |_| true).await
+            });
+
+            for _ in 0..WIDTH {
+                started_rx.recv().await.expect("boots still pending");
+            }
+            assert_eq!(active.load(Ordering::SeqCst), WIDTH);
+            assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
+
+            for _ in 0..PER_BATCH * 2 {
+                release_tx.try_send(()).expect("test gate receiver open");
+            }
+            assert!(first.await);
+            assert!(second.await);
+            assert_eq!(peak.load(Ordering::SeqCst), WIDTH);
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]
@@ -3554,51 +3512,61 @@ mod tests {
 
     /// Helper to create a test database and API state.
     #[allow(dead_code)]
-    fn setup_test_state() -> (TempDir, Arc<ApiState>) {
+    fn setup_test_state() -> (TempDir, Runtime, Arc<ApiState>) {
         let dir = TempDir::new().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
         let db = SmolvmDb::open_at(&db_path).expect("failed to open test db");
-        let state = Arc::new(ApiState::with_db(db));
-        (dir, state)
+        let runtime = Runtime::with_workers(2).expect("test runtime");
+        let state = Arc::new(ApiState::with_db(db).with_runtime(runtime.handle()));
+        (dir, runtime, state)
     }
 
-    #[tokio::test]
-    async fn test_resize_validation_shrink_storage_rejected() {
-        let (_dir, state) = setup_test_state();
-        let db = state.db();
-        create_test_vm(db, "test-vm", Some(20), Some(5));
+    #[test]
+    fn test_resize_validation_shrink_storage_rejected() {
+        let (_dir, runtime, state) = setup_test_state();
+        runtime.block_on(async {
+            let db = state.db();
+            create_test_vm(db, "test-vm", Some(20), Some(5));
 
-        let req = ResizeMachineRequest {
-            storage_gb: Some(10),
-            overlay_gb: None,
-        };
-        let result = resize_machine(State(state), Path("test-vm".to_string()), Json(req)).await;
-        assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+            let req = ResizeMachineRequest {
+                storage_gb: Some(10),
+                overlay_gb: None,
+            };
+            let result =
+                resize_machine(State(state), Path("test-vm".to_string()), Json(req)).await;
+            assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+        });
     }
 
-    #[tokio::test]
-    async fn test_resize_validation_no_params_rejected() {
-        let (_dir, state) = setup_test_state();
-        let db = state.db();
-        create_test_vm(db, "test-vm", Some(20), Some(5));
+    #[test]
+    fn test_resize_validation_no_params_rejected() {
+        let (_dir, runtime, state) = setup_test_state();
+        runtime.block_on(async {
+            let db = state.db();
+            create_test_vm(db, "test-vm", Some(20), Some(5));
 
-        let req = ResizeMachineRequest {
-            storage_gb: None,
-            overlay_gb: None,
-        };
-        let result = resize_machine(State(state), Path("test-vm".to_string()), Json(req)).await;
-        assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+            let req = ResizeMachineRequest {
+                storage_gb: None,
+                overlay_gb: None,
+            };
+            let result =
+                resize_machine(State(state), Path("test-vm".to_string()), Json(req)).await;
+            assert!(matches!(result.unwrap_err(), ApiError::BadRequest(_)));
+        });
     }
 
-    #[tokio::test]
-    async fn test_resize_not_found() {
-        let (_dir, state) = setup_test_state();
-        let req = ResizeMachineRequest {
-            storage_gb: Some(30),
-            overlay_gb: None,
-        };
-        let result = resize_machine(State(state), Path("nonexistent".to_string()), Json(req)).await;
-        assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    #[test]
+    fn test_resize_not_found() {
+        let (_dir, runtime, state) = setup_test_state();
+        runtime.block_on(async {
+            let req = ResizeMachineRequest {
+                storage_gb: Some(30),
+                overlay_gb: None,
+            };
+            let result =
+                resize_machine(State(state), Path("nonexistent".to_string()), Json(req)).await;
+            assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+        });
     }
 
     /// Helper to create a VM record in the database.

@@ -1,13 +1,12 @@
 //! Automatic held-fork pool and one-shot lease handlers.
 
-use axum::{
-    extract::{Path, Query, State},
-    Json,
-};
+use h12tiny::web::{Path, State};
+use crate::api::Json;
+use crate::api::Query;
 use base64::Engine as _;
 use futures_util::{stream, StreamExt};
 use sha2::{Digest, Sha256};
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, time::{Duration, Instant}};
 
 use crate::api::error::ApiError;
 use crate::api::state::ApiState;
@@ -340,11 +339,11 @@ async fn activate_claimed_lease(
             let db = state.db().clone();
             let lease_id = lease.id.clone();
             let persisted = message.clone();
-            tokio::task::spawn_blocking(move || {
+            state.blocking(move || {
                 db.fail_fork_lease(&lease_id, crate::util::current_timestamp(), persisted)
             })
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("{e:?}"))?
             .map_err(|e| e.to_string())?;
             state.notify_pool_reconcile();
             return Err(message);
@@ -352,7 +351,8 @@ async fn activate_claimed_lease(
         Err(error) => return Err(format!("pool worker lookup failed: {error:?}")),
     };
     let machine = lease.machine_name.clone();
-    let activation = tokio::task::spawn_blocking(move || {
+    let activation = state
+        .blocking(move || {
         stage_lease_payload(&machine, &files)?;
         crate::agent::fork::activate_held_fork(&machine, &record, &assignment)?;
         if let Some((token, timeout)) = worker_ready {
@@ -361,17 +361,17 @@ async fn activate_claimed_lease(
         Ok::<(), crate::Error>(())
     })
     .await
-    .map_err(|e| format!("pool activation task failed: {e}"))?;
+    .map_err(|e| format!("pool activation task failed: {e:?}"))?;
     if let Err(error) = activation {
         let message = error.to_string();
         let db = state.db().clone();
         let lease_id = lease.id.clone();
         let persisted = message.clone();
-        tokio::task::spawn_blocking(move || {
+        state.blocking(move || {
             db.fail_fork_lease(&lease_id, crate::util::current_timestamp(), persisted)
         })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:?}"))?
         .map_err(|e| e.to_string())?;
         state.notify_pool_reconcile();
         return Err(format!(
@@ -380,11 +380,12 @@ async fn activate_claimed_lease(
     }
     let db = state.db().clone();
     let lease_id = lease.id.clone();
-    let active = tokio::task::spawn_blocking(move || {
+    let active = state
+        .blocking(move || {
         db.mark_fork_lease_active(&lease_id, crate::util::current_timestamp())
     })
     .await
-    .map_err(|e| format!("lease activation commit task failed: {e}"))?
+    .map_err(|e| format!("lease activation commit task failed: {e:?}"))?
     .map_err(|e| e.to_string())?
     .ok_or_else(|| "claimed lease disappeared".to_string())?;
     if active.state != ForkLeaseState::Active {
@@ -401,20 +402,21 @@ async fn wait_for_existing_activation(
     mut lease: ForkLeaseRecord,
     timeout: Duration,
 ) -> Result<ForkLeaseRecord, ApiError> {
-    let deadline = tokio::time::Instant::now() + timeout + Duration::from_secs(5);
+    let deadline = Instant::now() + timeout + Duration::from_secs(5);
     loop {
         match lease.state {
             ForkLeaseState::Active => return Ok(lease),
-            ForkLeaseState::Activating if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            ForkLeaseState::Activating if Instant::now() < deadline => {
+                crate::runtime::sleep(Duration::from_millis(100)).await;
                 let db = state.db().clone();
                 let pool = lease.pool_name.clone();
                 let id = lease.id.clone();
-                lease = tokio::task::spawn_blocking(move || db.get_fork_lease(&pool, &id))
+                lease = state
+                    .blocking(move || db.get_fork_lease(&pool, &id))
                     .await
                     .map_err(|error| {
                         ApiError::internal(format!(
-                            "existing lease activation query task failed: {error}"
+                            "existing lease activation query task failed: {error:?}"
                         ))
                     })?
                     .map_err(ApiError::database)?
@@ -447,9 +449,10 @@ async fn pool_info(state: &ApiState, pool: ForkPoolRecord) -> Result<ForkPoolInf
     let cuda_device_ordinal = pool.admission_device_ordinal();
     let db = state.db().clone();
     let pool_name = pool.name.clone();
-    let slots = tokio::task::spawn_blocking(move || db.list_fork_pool_slots(&pool_name))
+    let slots = state
+        .blocking(move || db.list_fork_pool_slots(&pool_name))
         .await
-        .map_err(|e| ApiError::internal(format!("pool slot query task failed: {e}")))?
+        .map_err(|e| ApiError::internal(format!("pool slot query task failed: {e:?}")))?
         .map_err(ApiError::database)?;
     let mut provisioning = 0;
     let mut ready = 0;
@@ -571,7 +574,8 @@ pub async fn create_pool(
         )));
     }
     let golden_name = req.golden.clone();
-    let forkable = tokio::task::spawn_blocking(move || {
+    let forkable = state
+        .blocking(move || {
         let control = crate::agent::fork::control_socket_path(&golden_name);
         if !control.exists() {
             return false;
@@ -581,7 +585,7 @@ pub async fn create_pool(
             .unwrap_or(false)
     })
     .await
-    .map_err(|e| ApiError::internal(format!("golden forkability task failed: {e}")))?;
+    .map_err(|e| ApiError::internal(format!("golden forkability task failed: {e:?}")))?;
     if !forkable {
         return Err(ApiError::Conflict(format!(
             "golden machine '{}' is not running forkable",
@@ -608,11 +612,11 @@ pub async fn create_pool(
     };
     let db = state.db().clone();
     let inserted_pool = pool.clone();
-    let inserted =
-        tokio::task::spawn_blocking(move || db.insert_fork_pool_if_not_exists(&inserted_pool))
-            .await
-            .map_err(|e| ApiError::internal(format!("pool insert task failed: {e}")))?
-            .map_err(ApiError::database)?;
+    let inserted = state
+        .blocking(move || db.insert_fork_pool_if_not_exists(&inserted_pool))
+        .await
+        .map_err(|e| ApiError::internal(format!("pool insert task failed: {e:?}")))?
+        .map_err(ApiError::database)?;
     if !inserted {
         return Err(ApiError::Conflict(format!(
             "fork pool '{}' already exists",
@@ -635,9 +639,10 @@ pub async fn list_pools(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ListForkPoolsResponse>, ApiError> {
     let db = state.db().clone();
-    let pools = tokio::task::spawn_blocking(move || db.list_fork_pools())
+    let pools = state
+        .blocking(move || db.list_fork_pools())
         .await
-        .map_err(|e| ApiError::internal(format!("pool list task failed: {e}")))?
+        .map_err(|e| ApiError::internal(format!("pool list task failed: {e:?}")))?
         .map_err(ApiError::database)?;
     let mut infos = Vec::with_capacity(pools.len());
     for pool in pools {
@@ -663,9 +668,10 @@ pub async fn get_pool(
 ) -> Result<Json<ForkPoolInfo>, ApiError> {
     let db = state.db().clone();
     let lookup = name.clone();
-    let pool = tokio::task::spawn_blocking(move || db.get_fork_pool(&lookup))
+    let pool = state
+        .blocking(move || db.get_fork_pool(&lookup))
         .await
-        .map_err(|e| ApiError::internal(format!("pool lookup task failed: {e}")))?
+        .map_err(|e| ApiError::internal(format!("pool lookup task failed: {e:?}")))?
         .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("fork pool '{name}' not found")))?;
     Ok(Json(pool_info(&state, pool).await?))
@@ -697,7 +703,8 @@ pub async fn resize_pool(
     }
     let db = state.db().clone();
     let pool_name = name.clone();
-    let pool = tokio::task::spawn_blocking(move || {
+    let pool = state
+        .blocking(move || {
         db.resize_fork_pool(
             &pool_name,
             req.desired_ready,
@@ -705,7 +712,7 @@ pub async fn resize_pool(
         )
     })
     .await
-    .map_err(|e| ApiError::internal(format!("pool resize task failed: {e}")))?
+    .map_err(|e| ApiError::internal(format!("pool resize task failed: {e:?}")))?
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::NotFound(format!("fork pool '{name}' not found")))?;
     if pool.deleting {
@@ -740,11 +747,12 @@ pub async fn delete_pool(
 ) -> Result<Json<DeleteResponse>, ApiError> {
     let db = state.db().clone();
     let pool_name = name.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = state
+        .blocking(move || {
         db.begin_delete_fork_pool(&pool_name, query.force, crate::util::current_timestamp())
     })
     .await
-    .map_err(|e| ApiError::internal(format!("pool deletion task failed: {e}")))?
+    .map_err(|e| ApiError::internal(format!("pool deletion task failed: {e:?}")))?
     .map_err(ApiError::database)?;
     match outcome {
         None => Err(ApiError::NotFound(format!("fork pool '{name}' not found"))),
@@ -828,9 +836,10 @@ async fn acquire_lease_inner(
     let (files, payload_sha256) = validate_lease_payload(&req.files)?;
     let db = state.db().clone();
     let lookup = pool_name.clone();
-    let pool = tokio::task::spawn_blocking(move || db.get_fork_pool(&lookup))
+    let pool = state
+        .blocking(move || db.get_fork_pool(&lookup))
         .await
-        .map_err(|e| ApiError::internal(format!("pool lookup task failed: {e}")))?
+        .map_err(|e| ApiError::internal(format!("pool lookup task failed: {e:?}")))?
         .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("fork pool '{pool_name}' not found")))?;
     if let Some(access) = &req.rollout_access {
@@ -868,7 +877,8 @@ async fn acquire_lease_inner(
     let payload_for_claim = payload_sha256.clone();
     let require_private_workspace = !files.is_empty();
     let admission_limit = state.admission().limit(&pool);
-    let claim = tokio::task::spawn_blocking(move || {
+    let claim = state
+        .blocking(move || {
         db.claim_fork_pool_slot(ForkPoolSlotClaim {
             pool_name: &pool_for_claim,
             lease_id: &lease_id,
@@ -882,7 +892,7 @@ async fn acquire_lease_inner(
         })
     })
     .await
-    .map_err(|e| ApiError::internal(format!("pool claim task failed: {e}")))?
+    .map_err(|e| ApiError::internal(format!("pool claim task failed: {e:?}")))?
     .map_err(ApiError::database)?;
     let lease = match claim {
         ClaimForkPoolSlot::Existing(lease) => {
@@ -944,16 +954,31 @@ async fn acquire_lease_inner(
     // Run activation in its own task. Dropping an HTTP request future does not
     // cancel this task, so a client disconnect after the durable claim cannot
     // strand a successfully released guest forever in `activating` state.
-    let active = tokio::spawn(activate_claimed_lease(
-        state.clone(),
-        lease,
-        assignment,
-        files,
-        worker_ready,
-    ))
-    .await
-    .map_err(|e| ApiError::internal(format!("pool activation task failed: {e}")))?
-    .map_err(ApiError::Internal)?;
+    let runtime = state.runtime()?.clone();
+    let activation_state = state.clone();
+    let (result_tx, result_rx) = async_channel::bounded(1);
+    let activation_task = runtime
+        .spawn(async move {
+            let result = activate_claimed_lease(
+                activation_state,
+                lease,
+                assignment,
+                files,
+                worker_ready,
+            )
+            .await;
+            let _ = result_tx.send(result).await;
+        })
+        .map_err(ApiError::internal)?;
+    // Keep activation alive after request cancellation. The detached task
+    // performs the durable failure/activation transition, while this request
+    // receives the result through a one-shot channel when still connected.
+    activation_task.detach();
+    let active = result_rx
+        .recv()
+        .await
+        .map_err(|e| ApiError::internal(format!("pool activation task failed: {e:?}")))?
+        .map_err(ApiError::Internal)?;
     // The durable claim removed one ready slot. Refill it only after payload
     // staging and any requested worker-readiness wait complete. Starting
     // replacement VMs earlier can starve the held workers' control channels.
@@ -1092,9 +1117,10 @@ pub async fn get_lease(
     let db = state.db().clone();
     let lookup_pool = pool_name.clone();
     let lookup_lease = lease_id.clone();
-    let lease = tokio::task::spawn_blocking(move || db.get_fork_lease(&lookup_pool, &lookup_lease))
+    let lease = state
+        .blocking(move || db.get_fork_lease(&lookup_pool, &lookup_lease))
         .await
-        .map_err(|e| ApiError::internal(format!("lease lookup task failed: {e}")))?
+        .map_err(|e| ApiError::internal(format!("lease lookup task failed: {e:?}")))?
         .map_err(ApiError::database)?
         .ok_or_else(|| {
             ApiError::NotFound(format!(
@@ -1127,11 +1153,12 @@ pub async fn heartbeat_lease(
     let db = state.db().clone();
     let lookup_pool = pool_name.clone();
     let lookup_lease = lease_id.clone();
-    let lease = tokio::task::spawn_blocking(move || {
+    let lease = state
+        .blocking(move || {
         db.heartbeat_fork_lease(&lookup_pool, &lookup_lease, now)
     })
     .await
-    .map_err(|e| ApiError::internal(format!("lease heartbeat task failed: {e}")))?
+    .map_err(|e| ApiError::internal(format!("lease heartbeat task failed: {e:?}")))?
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::NotFound(format!("fork lease '{lease_id}' not found")))?;
     if lease.state != ForkLeaseState::Active || lease.expires_at <= now {
@@ -1147,7 +1174,7 @@ pub async fn heartbeat_lease(
     if !worker_alive {
         let db = state.db().clone();
         let failed_lease = lease.id.clone();
-        tokio::task::spawn_blocking(move || {
+        state.blocking(move || {
             db.fail_active_fork_lease(
                 &failed_lease,
                 crate::util::current_timestamp(),
@@ -1155,7 +1182,7 @@ pub async fn heartbeat_lease(
             )
         })
         .await
-        .map_err(|e| ApiError::internal(format!("failed lease task failed: {e}")))?
+        .map_err(|e| ApiError::internal(format!("failed lease task failed: {e:?}")))?
         .map_err(ApiError::database)?;
         state.notify_pool_reconcile();
         return Err(ApiError::Conflict(format!(
@@ -1187,7 +1214,8 @@ pub async fn complete_lease(
     let db = state.db().clone();
     let complete_pool = pool_name.clone();
     let complete_lease = lease_id.clone();
-    let lease = tokio::task::spawn_blocking(move || {
+    let lease = state
+        .blocking(move || {
         db.complete_fork_lease(
             &complete_pool,
             &complete_lease,
@@ -1195,7 +1223,7 @@ pub async fn complete_lease(
         )
     })
     .await
-    .map_err(|e| ApiError::internal(format!("lease completion task failed: {e}")))?
+    .map_err(|e| ApiError::internal(format!("lease completion task failed: {e:?}")))?
     .map_err(ApiError::database)?
     .ok_or_else(|| ApiError::NotFound(format!("fork lease '{lease_id}' not found")))?;
     if lease.state != ForkLeaseState::Completed {
@@ -1316,12 +1344,14 @@ mod tests {
         assert!(shown.contains("<redacted>"));
     }
 
-    #[tokio::test]
-    async fn lease_batch_preserves_input_order_for_independent_failures() {
+    #[test]
+    fn lease_batch_preserves_input_order_for_independent_failures() {
         let directory = tempfile::TempDir::new().unwrap();
         let db = crate::db::SmolvmDb::open_at(&directory.path().join("test.db")).unwrap();
-        let state = Arc::new(ApiState::with_db(db));
-        let response = acquire_lease_batch(
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let state = Arc::new(ApiState::with_db(db).with_runtime(runtime.handle()));
+        let response = runtime
+            .block_on(acquire_lease_batch(
             State(state),
             Path("missing-pool".into()),
             Json(AcquireForkLeaseBatchRequest {
@@ -1331,10 +1361,9 @@ mod tests {
                     lease_request("third"),
                 ],
             }),
-        )
-        .await
-        .unwrap()
-        .0;
+        ))
+            .unwrap()
+            .0;
 
         assert_eq!(
             response

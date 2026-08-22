@@ -12,6 +12,46 @@ use serde::{Deserialize, Serialize};
 use smolvm_registry::RegistryClient;
 use std::collections::HashMap;
 
+/// Adapt the application's explicit runtime handle to the registry transport
+/// executor boundary. A failed submission means the owning runtime has already
+/// shut down; dropping the future is the only safe action at this late stage.
+impl smolvm_registry::RegistryExecutor for crate::runtime::RuntimeHandle {
+    fn execute(&self, future: smolvm_registry::BoxSendFuture) {
+        match self.spawn(future) {
+            Ok(task) => task.detach(),
+            Err(error) => {
+                tracing::debug!(%error, "dropping registry connection driver after runtime shutdown");
+            }
+        }
+    }
+
+    fn submit_blocking(
+        &self,
+        job: smolvm_registry::BoxBlockingJob,
+    ) -> Result<smolvm_registry::BoxBlockingFuture, smolvm_registry::BlockingSubmitError> {
+        let task = self
+            .spawn_blocking(move || job())
+            .map_err(|error| match error {
+                crate::runtime::SpawnError::Shutdown => {
+                    smolvm_registry::BlockingSubmitError::Shutdown
+                }
+                crate::runtime::SpawnError::BlockingQueueFull => {
+                    smolvm_registry::BlockingSubmitError::QueueFull
+                }
+            })?;
+        Ok(Box::pin(async move {
+            task.await.map_err(|error| match error {
+                crate::runtime::BlockingTaskError::Shutdown => {
+                    smolvm_registry::BlockingTaskError::Shutdown
+                }
+                crate::runtime::BlockingTaskError::Panicked => {
+                    smolvm_registry::BlockingTaskError::Panicked
+                }
+            })
+        }))
+    }
+}
+
 /// How a caller authorizes a registry pull.
 ///
 /// [`PullAuth::FromConfig`] (the default) resolves credentials from the local
@@ -46,9 +86,17 @@ pub enum PullAuth {
 /// applying `auth`: an explicit credential, or the ones from `config` when
 /// [`PullAuth::FromConfig`].
 ///
+/// `executor` must outlive all requests made with the returned client; it is a
+/// weak handle to the caller-owned [`crate::runtime::Runtime`].
+///
 /// This is the single credential-resolution path shared by the pack tooling and
 /// the OCI image cache, so a pull authorizes the same way whoever drives it.
-pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth) -> RegistryClient {
+pub fn registry_client(
+    registry: &str,
+    config: &RegistryConfig,
+    auth: &PullAuth,
+    executor: &crate::runtime::RuntimeHandle,
+) -> RegistryClient {
     // Resolve the config-key hostname to its Distribution API endpoint. The config
     // key stays the user-facing name so credential lookup is consistent — only the
     // HTTP endpoint changes:
@@ -80,7 +128,7 @@ pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth)
         h => h,
     };
 
-    let client = RegistryClient::new(base_url);
+    let client = RegistryClient::new_with_executor(base_url, executor.clone());
     match auth {
         PullAuth::Anonymous => client,
         PullAuth::Basic { username, password } => {
@@ -616,6 +664,81 @@ fn validate_digest(raw_input: &str, digest: &str) -> std::result::Result<(), Ref
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_runtime() -> (crate::runtime::Runtime, crate::runtime::RuntimeHandle) {
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let executor = runtime.handle();
+        (runtime, executor)
+    }
+
+    #[test]
+    fn registry_executor_propagates_runtime_blocking_results() {
+        let (runtime, executor) = test_runtime();
+        let future = smolvm_registry::RegistryExecutor::submit_blocking(
+            &executor,
+            Box::new(|| Box::new(42_u32) as smolvm_registry::BoxBlockingValue),
+        )
+        .unwrap();
+        let value = runtime.block_on(future).unwrap();
+        assert_eq!(*value.downcast::<u32>().unwrap(), 42);
+    }
+
+    #[test]
+    fn registry_executor_preserves_runtime_shutdown_rejection() {
+        let (mut runtime, executor) = test_runtime();
+        runtime.shutdown().unwrap();
+        let error = match smolvm_registry::RegistryExecutor::submit_blocking(
+            &executor,
+            Box::new(|| Box::new(42_u32) as smolvm_registry::BoxBlockingValue),
+        ) {
+            Ok(_) => panic!("shutdown must reject blocking submissions"),
+            Err(error) => error,
+        };
+        assert_eq!(error, smolvm_registry::BlockingSubmitError::Shutdown);
+    }
+
+    #[test]
+    fn registry_executor_preserves_blocking_queue_backpressure() {
+        let runtime = crate::runtime::RuntimeBuilder::new()
+            .worker_threads(1)
+            .blocking_threads(1)
+            .blocking_queue_capacity(1)
+            .build()
+            .unwrap();
+        let executor = runtime.handle();
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_started = started.clone();
+        let first_release = release.clone();
+        let first = smolvm_registry::RegistryExecutor::submit_blocking(
+            &executor,
+            Box::new(move || {
+                first_started.wait();
+                first_release.wait();
+                Box::new(1_u32) as smolvm_registry::BoxBlockingValue
+            }),
+        )
+        .unwrap();
+        started.wait();
+
+        let second = smolvm_registry::RegistryExecutor::submit_blocking(
+            &executor,
+            Box::new(|| Box::new(2_u32) as smolvm_registry::BoxBlockingValue),
+        )
+        .unwrap();
+        let error = match smolvm_registry::RegistryExecutor::submit_blocking(
+            &executor,
+            Box::new(|| Box::new(3_u32) as smolvm_registry::BoxBlockingValue),
+        ) {
+            Ok(_) => panic!("a full blocking queue must reject the third job"),
+            Err(error) => error,
+        };
+        assert_eq!(error, smolvm_registry::BlockingSubmitError::QueueFull);
+
+        release.wait();
+        assert_eq!(*runtime.block_on(first).unwrap().downcast::<u32>().unwrap(), 1);
+        assert_eq!(*runtime.block_on(second).unwrap().downcast::<u32>().unwrap(), 2);
+    }
 
     #[test]
     fn test_extract_registry_implicit_dockerhub() {
@@ -1214,12 +1337,23 @@ mirror = "ghcr-mirror.example.com"
         );
 
         // Canonical name resolves (the pre-existing behavior).
-        let canonical =
-            registry_client("registry.smolmachines.com", &config, &PullAuth::FromConfig);
+        let (canonical_runtime, canonical_executor) = test_runtime();
+        let canonical = registry_client(
+            "registry.smolmachines.com",
+            &config,
+            &PullAuth::FromConfig,
+            &canonical_executor,
+        );
         assert_eq!(canonical.identity_token(), Some("eyJ_upstream_jwt"));
 
         // The apex must resolve to the SAME credential, not silently to anonymous.
-        let apex = registry_client("smolmachines.com", &config, &PullAuth::FromConfig);
+        let (apex_runtime, apex_executor) = test_runtime();
+        let apex = registry_client(
+            "smolmachines.com",
+            &config,
+            &PullAuth::FromConfig,
+            &apex_executor,
+        );
         assert_eq!(
             apex.identity_token(),
             Some("eyJ_upstream_jwt"),
@@ -1227,8 +1361,16 @@ mirror = "ghcr-mirror.example.com"
         );
 
         // An unrelated host still gets no credentials.
-        let other = registry_client("ghcr.io", &config, &PullAuth::FromConfig);
+        let (other_runtime, other_executor) = test_runtime();
+        let other = registry_client(
+            "ghcr.io",
+            &config,
+            &PullAuth::FromConfig,
+            &other_executor,
+        );
         assert_eq!(other.identity_token(), None);
+
+        drop((canonical_runtime, apex_runtime, other_runtime));
     }
 
     #[test]

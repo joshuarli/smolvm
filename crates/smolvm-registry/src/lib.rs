@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod client;
+mod blocking_io;
 pub mod peer;
 pub mod pull;
 pub mod push;
@@ -13,6 +14,69 @@ pub use cache::BlobCache;
 pub use client::{validate_digest, RegistryClient};
 pub use pull::{pull, PullResult};
 pub use push::{push, PushResult};
+
+use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
+
+/// A boxed unit future submitted to the registry transport executor.
+pub type BoxSendFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+/// Erased result value returned by one application-owned blocking job.
+pub type BoxBlockingValue = Box<dyn Any + Send + 'static>;
+
+/// A synchronous operation submitted to the application's blocking pool.
+pub type BoxBlockingJob = Box<dyn FnOnce() -> BoxBlockingValue + Send + 'static>;
+
+/// Future returned by an application-owned blocking submission.
+pub type BoxBlockingFuture = Pin<
+    Box<dyn Future<Output = std::result::Result<BoxBlockingValue, BlockingTaskError>> + Send + 'static>,
+>;
+
+/// Why a blocking operation could not be submitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BlockingSubmitError {
+    /// The application runtime is no longer accepting work.
+    #[error("application runtime has shut down")]
+    Shutdown,
+    /// The runtime-owned blocking queue is full.
+    #[error("application blocking queue is full")]
+    QueueFull,
+    /// This client was constructed without an application blocking boundary.
+    #[error("registry client has no application blocking executor")]
+    Unavailable,
+}
+
+/// Why an accepted blocking operation did not produce a value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum BlockingTaskError {
+    /// The blocking pool closed before the operation produced a result.
+    #[error("application blocking pool shut down")]
+    Shutdown,
+    /// The operation panicked; the application worker remained alive.
+    #[error("application blocking operation panicked")]
+    Panicked,
+}
+
+/// Application-supplied executor used by registry HTTP connection drivers.
+///
+/// The registry crate does not own an executor or a worker lifecycle. Callers
+/// provide an application handle and remain responsible for keeping it alive
+/// while registry operations are in flight.
+pub trait RegistryExecutor: Send + Sync + 'static {
+    /// Submit one transport future for execution.
+    fn execute(&self, future: BoxSendFuture);
+
+    /// Submit one synchronous operation to the caller-owned blocking pool.
+    ///
+    /// The erased value is downcast by the registry's file-I/O adapter. This
+    /// keeps the boundary object-safe while preserving the operation's result
+    /// (including `std::io::Error`) for the caller.
+    fn submit_blocking(
+        &self,
+        job: BoxBlockingJob,
+    ) -> std::result::Result<BoxBlockingFuture, BlockingSubmitError>;
+}
 
 use serde::{Deserialize, Serialize};
 
@@ -141,7 +205,7 @@ pub struct OciIndex {
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
     #[error("HTTP request failed: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
 
     #[error("registry returned {status}: {body}")]
     ApiError { status: u16, body: String },
@@ -170,6 +234,9 @@ pub enum RegistryError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("blocking I/O boundary failed: {0}")]
+    Blocking(String),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

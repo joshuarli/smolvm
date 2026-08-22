@@ -91,6 +91,8 @@ pub mod pool;
 pub mod process;
 pub mod registry;
 pub mod remote_volume;
+/// Application-owned futures-lite runtime, task, timer, and shutdown boundary.
+pub mod runtime;
 pub mod secrets;
 pub mod settings;
 pub mod smolfile;

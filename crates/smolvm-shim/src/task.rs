@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
-use async_trait::async_trait;
 use containerd_shim::publisher::RemotePublisher;
 use containerd_shim::util::{convert_to_any, timestamp};
 use containerd_shim::TtrpcResult;
@@ -18,11 +18,9 @@ use containerd_shim_protos::events::task::{
 };
 use containerd_shim_protos::protobuf::well_known_types::timestamp::Timestamp;
 use containerd_shim_protos::protobuf::{Message, MessageDyn};
-use containerd_shim_protos::shim_async::Task;
-use containerd_shim_protos::ttrpc::r#async::TtrpcContext;
+use containerd_shim_protos::shim_sync::Task;
+use containerd_shim_protos::ttrpc::TtrpcContext;
 use log::{debug, warn};
-use tokio::sync::Mutex;
-
 use crate::backend::{ExitInfo, PodBackend, ProcessSpec, Stdio};
 use crate::bundle;
 
@@ -64,7 +62,7 @@ pub struct TaskService<B: PodBackend> {
     procs: Arc<Mutex<HashMap<ProcKey, Proc>>>,
     publisher: Option<Arc<RemotePublisher>>,
     namespace: String,
-    exit: Arc<containerd_shim::asynchronous::ExitSignal>,
+    exit: Arc<containerd_shim::synchronous::ExitSignal>,
 }
 
 impl<B: PodBackend> Clone for TaskService<B> {
@@ -84,7 +82,7 @@ impl<B: PodBackend> TaskService<B> {
         backend: Arc<B>,
         publisher: Option<Arc<RemotePublisher>>,
         namespace: String,
-        exit: Arc<containerd_shim::asynchronous::ExitSignal>,
+        exit: Arc<containerd_shim::synchronous::ExitSignal>,
     ) -> Self {
         Self {
             backend,
@@ -95,10 +93,10 @@ impl<B: PodBackend> TaskService<B> {
         }
     }
 
-    async fn publish(&self, topic: &str, event: Box<dyn MessageDyn>) {
+    fn publish(&self, topic: &str, event: Box<dyn MessageDyn>) {
         if let Some(p) = &self.publisher {
             let ctx = containerd_shim_protos::ttrpc::context::Context::default();
-            if let Err(e) = p.publish(ctx, topic, &self.namespace, event).await {
+            if let Err(e) = p.publish(ctx, topic, &self.namespace, event) {
                 warn!("publish {topic} failed: {e}");
             }
         }
@@ -106,7 +104,7 @@ impl<B: PodBackend> TaskService<B> {
 
     /// Spawn the exit-watcher for a started process: on exit, mark Stopped and
     /// publish TaskExit exactly once.
-    async fn watch_exit(&self, id: String, exec_id: String, pid: u32) {
+    fn watch_exit(&self, id: String, exec_id: String, pid: u32) {
         let backend = self.backend.clone();
         let procs = self.procs.clone();
         let this = self.clone();
@@ -115,8 +113,8 @@ impl<B: PodBackend> TaskService<B> {
         } else {
             Some(exec_id.clone())
         };
-        tokio::spawn(async move {
-            let mut rx = match backend.wait_channel(&id, exec_opt.as_deref()).await {
+        std::thread::spawn(move || {
+            let mut rx = match backend.wait_channel(&id, exec_opt.as_deref()) {
                 Ok(rx) => rx,
                 Err(e) => {
                     warn!("wait_channel({id},{exec_id}): {e}");
@@ -124,10 +122,10 @@ impl<B: PodBackend> TaskService<B> {
                 }
             };
             let info = loop {
-                if let Some(info) = *rx.borrow() {
+                if let Some(info) = rx.borrow() {
                     break info;
                 }
-                if rx.changed().await.is_err() {
+                if rx.wait().is_err() {
                     // Backend dropped: treat as exit 255 now.
                     break ExitInfo {
                         status: 255,
@@ -137,7 +135,7 @@ impl<B: PodBackend> TaskService<B> {
                 }
             };
             {
-                let mut map = procs.lock().await;
+                let mut map = procs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(p) = map.get_mut(&(id.clone(), exec_id.clone())) {
                     if p.state == ProcState::Stopped {
                         return; // already reported
@@ -152,7 +150,7 @@ impl<B: PodBackend> TaskService<B> {
             if info.oom && exec_id.is_empty() {
                 let mut oom = TaskOOM::new();
                 oom.container_id = id.clone();
-                this.publish("/tasks/oom", Box::new(oom)).await;
+                this.publish("/tasks/oom", Box::new(oom));
             }
             let mut ev = TaskExit::new();
             ev.container_id = id.clone();
@@ -164,7 +162,7 @@ impl<B: PodBackend> TaskService<B> {
             ev.pid = pid;
             ev.exit_status = info.status;
             ev.exited_at = Some(protobuf_ts(info.exited_at_ns)).into();
-            this.publish("/tasks/exit", Box::new(ev)).await;
+            this.publish("/tasks/exit", Box::new(ev));
         });
     }
 }
@@ -187,9 +185,8 @@ fn state_to_api(s: ProcState) -> api::Status {
     }
 }
 
-#[async_trait]
 impl<B: PodBackend> Task for TaskService<B> {
-    async fn create(
+    fn create(
         &self,
         _ctx: &TtrpcContext,
         req: api::CreateTaskRequest,
@@ -208,13 +205,11 @@ impl<B: PodBackend> Task for TaskService<B> {
         let pid = if info.is_sandbox {
             self.backend
                 .create_sandbox(&id, &req.bundle, info.netns.as_deref())
-                .await
                 .map_err(err)?
         } else {
             // Mount containerd's rootfs mounts at bundle/rootfs, then hand the
             // host path to the backend for guest sharing.
             let rootfs = bundle::mount_rootfs(&req.bundle, &req.rootfs)
-                .await
                 .map_err(err)?;
             self.backend
                 .create_container(
@@ -226,32 +221,32 @@ impl<B: PodBackend> Task for TaskService<B> {
                         exec_spec: None,
                     },
                 )
-                .await
                 .map_err(err)?
         };
 
-        let mut map = self.procs.lock().await;
-        if map.contains_key(&(id.clone(), String::new())) {
-            return Err(err(format!("task {id} already exists")));
+        {
+            let mut map = self.procs.lock().map_err(|e| err(e))?;
+            if map.contains_key(&(id.clone(), String::new())) {
+                return Err(err(format!("task {id} already exists")));
+            }
+            map.insert(
+                (id.clone(), String::new()),
+                Proc {
+                    state: ProcState::Created,
+                    pid,
+                    stdio,
+                    exit: None,
+                    is_sandbox: info.is_sandbox,
+                    bundle: req.bundle.clone(),
+                },
+            );
         }
-        map.insert(
-            (id.clone(), String::new()),
-            Proc {
-                state: ProcState::Created,
-                pid,
-                stdio,
-                exit: None,
-                is_sandbox: info.is_sandbox,
-                bundle: req.bundle.clone(),
-            },
-        );
-        drop(map);
 
         let mut ev = TaskCreate::new();
         ev.container_id = id.clone();
         ev.bundle = req.bundle.clone();
         ev.pid = pid;
-        self.publish("/tasks/create", Box::new(ev)).await;
+        self.publish("/tasks/create", Box::new(ev));
 
         Ok(api::CreateTaskResponse {
             pid,
@@ -259,7 +254,7 @@ impl<B: PodBackend> Task for TaskService<B> {
         })
     }
 
-    async fn start(
+    fn start(
         &self,
         _ctx: &TtrpcContext,
         req: api::StartRequest,
@@ -270,28 +265,28 @@ impl<B: PodBackend> Task for TaskService<B> {
         } else {
             Some(exec_id.as_str())
         };
-        let pid = self.backend.start(&id, exec_opt).await.map_err(err)?;
+        let pid = self.backend.start(&id, exec_opt).map_err(err)?;
         {
-            let mut map = self.procs.lock().await;
+            let mut map = self.procs.lock().map_err(|e| err(e))?;
             let p = map
                 .get_mut(&(id.clone(), exec_id.clone()))
                 .ok_or_else(|| not_found(format!("process {id}/{exec_id}")))?;
             p.state = ProcState::Running;
             p.pid = pid;
         }
-        self.watch_exit(id.clone(), exec_id.clone(), pid).await;
+        self.watch_exit(id.clone(), exec_id.clone(), pid);
 
         if exec_id.is_empty() {
             let mut ev = TaskStart::new();
             ev.container_id = id.clone();
             ev.pid = pid;
-            self.publish("/tasks/start", Box::new(ev)).await;
+            self.publish("/tasks/start", Box::new(ev));
         } else {
             let mut ev = TaskExecStarted::new();
             ev.container_id = id.clone();
             ev.exec_id = exec_id.clone();
             ev.pid = pid;
-            self.publish("/tasks/exec-started", Box::new(ev)).await;
+            self.publish("/tasks/exec-started", Box::new(ev));
         }
         Ok(api::StartResponse {
             pid,
@@ -299,12 +294,12 @@ impl<B: PodBackend> Task for TaskService<B> {
         })
     }
 
-    async fn state(
+    fn state(
         &self,
         _ctx: &TtrpcContext,
         req: api::StateRequest,
     ) -> TtrpcResult<api::StateResponse> {
-        let map = self.procs.lock().await;
+        let map = self.procs.lock().map_err(|e| err(e))?;
         let p = map
             .get(&(req.id.clone(), req.exec_id.clone()))
             .ok_or_else(|| not_found(format!("process {}/{}", req.id, req.exec_id)))?;
@@ -326,7 +321,7 @@ impl<B: PodBackend> Task for TaskService<B> {
         Ok(resp)
     }
 
-    async fn wait(
+    fn wait(
         &self,
         _ctx: &TtrpcContext,
         req: api::WaitRequest,
@@ -338,7 +333,7 @@ impl<B: PodBackend> Task for TaskService<B> {
         };
         // Already exited? (Delete-after-exit races.)
         {
-            let map = self.procs.lock().await;
+            let map = self.procs.lock().map_err(|e| err(e))?;
             if let Some(p) = map.get(&(req.id.clone(), req.exec_id.clone())) {
                 if let Some(e) = p.exit {
                     return Ok(api::WaitResponse {
@@ -354,13 +349,12 @@ impl<B: PodBackend> Task for TaskService<B> {
         let mut rx = self
             .backend
             .wait_channel(&req.id, exec_opt)
-            .await
             .map_err(err)?;
         let info = loop {
-            if let Some(info) = *rx.borrow() {
+            if let Some(info) = rx.borrow() {
                 break info;
             }
-            if rx.changed().await.is_err() {
+            if rx.wait().is_err() {
                 break ExitInfo {
                     status: 255,
                     exited_at_ns: 0,
@@ -375,14 +369,14 @@ impl<B: PodBackend> Task for TaskService<B> {
         })
     }
 
-    async fn kill(&self, _ctx: &TtrpcContext, req: api::KillRequest) -> TtrpcResult<api::Empty> {
+    fn kill(&self, _ctx: &TtrpcContext, req: api::KillRequest) -> TtrpcResult<api::Empty> {
         let exec_opt = if req.exec_id.is_empty() {
             None
         } else {
             Some(req.exec_id.as_str())
         };
         {
-            let map = self.procs.lock().await;
+            let map = self.procs.lock().map_err(|e| err(e))?;
             let p = map
                 .get(&(req.id.clone(), req.exec_id.clone()))
                 .ok_or_else(|| not_found(format!("process {}/{}", req.id, req.exec_id)))?;
@@ -393,12 +387,11 @@ impl<B: PodBackend> Task for TaskService<B> {
         }
         self.backend
             .kill(&req.id, exec_opt, req.signal, req.all)
-            .await
             .map_err(err)?;
         Ok(api::Empty::default())
     }
 
-    async fn exec(
+    fn exec(
         &self,
         _ctx: &TtrpcContext,
         req: api::ExecProcessRequest,
@@ -415,7 +408,7 @@ impl<B: PodBackend> Task for TaskService<B> {
             exec_spec: Some(req.spec.value.clone()),
         };
         {
-            let map = self.procs.lock().await;
+            let map = self.procs.lock().map_err(|e| err(e))?;
             if !map.contains_key(&(req.id.clone(), String::new())) {
                 return Err(not_found(format!("container {}", req.id)));
             }
@@ -425,9 +418,8 @@ impl<B: PodBackend> Task for TaskService<B> {
         }
         self.backend
             .create_exec(&req.id, &req.exec_id, spec.clone())
-            .await
             .map_err(err)?;
-        self.procs.lock().await.insert(
+        self.procs.lock().map_err(|e| err(e))?.insert(
             (req.id.clone(), req.exec_id.clone()),
             Proc {
                 state: ProcState::Created,
@@ -441,11 +433,11 @@ impl<B: PodBackend> Task for TaskService<B> {
         let mut ev = TaskExecAdded::new();
         ev.container_id = req.id.clone();
         ev.exec_id = req.exec_id.clone();
-        self.publish("/tasks/exec-added", Box::new(ev)).await;
+        self.publish("/tasks/exec-added", Box::new(ev));
         Ok(api::Empty::default())
     }
 
-    async fn resize_pty(
+    fn resize_pty(
         &self,
         _ctx: &TtrpcContext,
         req: api::ResizePtyRequest,
@@ -457,12 +449,11 @@ impl<B: PodBackend> Task for TaskService<B> {
         };
         self.backend
             .resize_pty(&req.id, exec_opt, req.width, req.height)
-            .await
             .map_err(err)?;
         Ok(api::Empty::default())
     }
 
-    async fn close_io(
+    fn close_io(
         &self,
         _ctx: &TtrpcContext,
         req: api::CloseIORequest,
@@ -474,12 +465,11 @@ impl<B: PodBackend> Task for TaskService<B> {
         };
         self.backend
             .close_io(&req.id, exec_opt)
-            .await
             .map_err(err)?;
         Ok(api::Empty::default())
     }
 
-    async fn delete(
+    fn delete(
         &self,
         _ctx: &TtrpcContext,
         req: api::DeleteRequest,
@@ -490,30 +480,30 @@ impl<B: PodBackend> Task for TaskService<B> {
             Some(req.exec_id.as_str())
         };
         let (pid, mut exit, bundle_dir, is_sandbox) = {
-            let map = self.procs.lock().await;
+            let map = self.procs.lock().map_err(|e| err(e))?;
             let p = map
                 .get(&(req.id.clone(), req.exec_id.clone()))
                 .ok_or_else(|| not_found(format!("process {}/{}", req.id, req.exec_id)))?;
             (p.pid, p.exit, p.bundle.clone(), p.is_sandbox)
         };
-        // The exit-watcher records exits asynchronously; if Delete arrives
+        // The exit-watcher records exits on its own thread; if Delete arrives
         // first, read the backend's exit channel directly so the response
         // still carries the real status.
         if exit.is_none() {
-            if let Ok(rx) = self.backend.wait_channel(&req.id, exec_opt).await {
-                exit = *rx.borrow();
+            if let Ok(rx) = self.backend.wait_channel(&req.id, exec_opt) {
+                exit = rx.borrow();
             }
         }
-        self.backend.delete(&req.id, exec_opt).await.map_err(err)?;
+        self.backend.delete(&req.id, exec_opt).map_err(err)?;
         self.procs
             .lock()
-            .await
+            .map_err(|e| err(e))?
             .remove(&(req.id.clone(), req.exec_id.clone()));
 
         // Unmount the bundle rootfs for workload init processes (best-effort;
         // the sandbox never mounted one).
         if req.exec_id.is_empty() && !is_sandbox && !bundle_dir.is_empty() {
-            bundle::unmount_rootfs(&bundle_dir).await;
+            bundle::unmount_rootfs(&bundle_dir);
         }
 
         let exited_at = exit
@@ -525,7 +515,7 @@ impl<B: PodBackend> Task for TaskService<B> {
             ev.pid = pid;
             ev.exit_status = exit.map(|e| e.status).unwrap_or_default();
             ev.exited_at = Some(exited_at.clone()).into();
-            self.publish("/tasks/delete", Box::new(ev)).await;
+            self.publish("/tasks/delete", Box::new(ev));
         }
         Ok(api::DeleteResponse {
             pid,
@@ -535,12 +525,12 @@ impl<B: PodBackend> Task for TaskService<B> {
         })
     }
 
-    async fn pids(
+    fn pids(
         &self,
         _ctx: &TtrpcContext,
         req: api::PidsRequest,
     ) -> TtrpcResult<api::PidsResponse> {
-        let pids = self.backend.pids(&req.id).await.map_err(err)?;
+        let pids = self.backend.pids(&req.id).map_err(err)?;
         let processes = pids
             .into_iter()
             .map(|pid| containerd_shim_protos::types::task::ProcessInfo {
@@ -554,12 +544,12 @@ impl<B: PodBackend> Task for TaskService<B> {
         })
     }
 
-    async fn stats(
+    fn stats(
         &self,
         _ctx: &TtrpcContext,
         req: api::StatsRequest,
     ) -> TtrpcResult<api::StatsResponse> {
-        let blob = self.backend.stats(&req.id).await.map_err(err)?;
+        let blob = self.backend.stats(&req.id).map_err(err)?;
         let mut resp = api::StatsResponse::default();
         if let Some(bytes) = blob {
             // The backend hands us an encoded cgroups Metrics message.
@@ -571,12 +561,12 @@ impl<B: PodBackend> Task for TaskService<B> {
         Ok(resp)
     }
 
-    async fn connect(
+    fn connect(
         &self,
         _ctx: &TtrpcContext,
         req: api::ConnectRequest,
     ) -> TtrpcResult<api::ConnectResponse> {
-        let map = self.procs.lock().await;
+        let map = self.procs.lock().map_err(|e| err(e))?;
         let pid = map
             .get(&(req.id.clone(), String::new()))
             .map(|p| p.pid)
@@ -588,19 +578,19 @@ impl<B: PodBackend> Task for TaskService<B> {
         })
     }
 
-    async fn shutdown(
+    fn shutdown(
         &self,
         _ctx: &TtrpcContext,
         _req: api::ShutdownRequest,
     ) -> TtrpcResult<api::Empty> {
-        let map = self.procs.lock().await;
+        let map = self.procs.lock().map_err(|e| err(e))?;
         if map.is_empty() {
             self.exit.signal();
         }
         Ok(api::Empty::default())
     }
 
-    async fn update(
+    fn update(
         &self,
         _ctx: &TtrpcContext,
         _req: api::UpdateTaskRequest,
@@ -621,7 +611,7 @@ mod tests {
             backend,
             None,
             "k8s.io".into(),
-            Arc::new(containerd_shim::asynchronous::ExitSignal::default()),
+            Arc::new(containerd_shim::synchronous::ExitSignal::default()),
         )
     }
 
@@ -633,7 +623,7 @@ mod tests {
         }
     }
 
-    async fn create_container(
+    fn create_container(
         s: &TaskService<MockBackend>,
         dir: &std::path::Path,
         id: &str,
@@ -656,16 +646,16 @@ mod tests {
             bundle: bundle.to_string_lossy().into_owned(),
             ..Default::default()
         };
-        s.create(&ttctx(), req).await.unwrap()
+        s.create(&ttctx(), req).unwrap()
     }
 
-    #[tokio::test]
-    async fn lifecycle_create_start_kill_wait_delete() {
+    #[test]
+    fn lifecycle_create_start_kill_wait_delete() {
         let backend = MockBackend::new();
         let s = svc(backend.clone());
         let dir = tempfile::tempdir().unwrap();
 
-        let created = create_container(&s, dir.path(), "c1").await;
+        let created = create_container(&s, dir.path(), "c1");
         assert_eq!(created.pid, 100);
 
         // State: CREATED
@@ -677,7 +667,6 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
             .unwrap();
         assert_eq!(st.status.unwrap(), api::Status::CREATED);
 
@@ -689,7 +678,6 @@ mod tests {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
         // Kill(SIGKILL) → exit 137; Wait resolves
@@ -701,7 +689,6 @@ mod tests {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
         let w = s
             .wait(
@@ -711,7 +698,6 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
             .unwrap();
         assert_eq!(w.exit_status, 137);
 
@@ -724,7 +710,6 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
             .unwrap();
         assert_eq!(d.exit_status, 137);
 
@@ -737,16 +722,15 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
             .is_err());
     }
 
-    #[tokio::test]
-    async fn exec_lifecycle() {
+    #[test]
+    fn exec_lifecycle() {
         let backend = MockBackend::new();
         let s = svc(backend.clone());
         let dir = tempfile::tempdir().unwrap();
-        create_container(&s, dir.path(), "c2").await;
+        create_container(&s, dir.path(), "c2");
         s.start(
             &ttctx(),
             api::StartRequest {
@@ -754,7 +738,6 @@ mod tests {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
 
         let mut ereq = api::ExecProcessRequest {
@@ -764,7 +747,7 @@ mod tests {
         };
         ereq.spec =
             Some(containerd_shim_protos::protobuf::well_known_types::any::Any::default()).into();
-        s.exec(&ttctx(), ereq).await.unwrap();
+        s.exec(&ttctx(), ereq).unwrap();
 
         let started = s
             .start(
@@ -775,11 +758,10 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
             .unwrap();
         assert_eq!(started.pid, 200);
 
-        backend.finish("c2", Some("e1"), 0).await;
+        backend.finish("c2", Some("e1"), 0);
         let w = s
             .wait(
                 &ttctx(),
@@ -789,17 +771,16 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
             .unwrap();
         assert_eq!(w.exit_status, 0);
     }
 
-    #[tokio::test]
-    async fn wait_after_exit_returns_immediately() {
+    #[test]
+    fn wait_after_exit_returns_immediately() {
         let backend = MockBackend::new();
         let s = svc(backend.clone());
         let dir = tempfile::tempdir().unwrap();
-        create_container(&s, dir.path(), "c3").await;
+        create_container(&s, dir.path(), "c3");
         s.start(
             &ttctx(),
             api::StartRequest {
@@ -807,11 +788,10 @@ mod tests {
                 ..Default::default()
             },
         )
-        .await
         .unwrap();
-        backend.finish("c3", None, 7).await;
+        backend.finish("c3", None, 7);
         // Give the watcher a beat to record the exit.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let w = s
             .wait(
                 &ttctx(),
@@ -820,7 +800,6 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
             .unwrap();
         assert_eq!(w.exit_status, 7);
         let st = s
@@ -831,7 +810,6 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .await
             .unwrap();
         assert_eq!(st.status.unwrap(), api::Status::STOPPED);
     }

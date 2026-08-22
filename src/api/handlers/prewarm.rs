@@ -24,9 +24,12 @@
 //! and nothing else — pre-warming grants no access the create path wouldn't
 //! already have.
 
-use axum::Json;
+use h12tiny::web::State;
+use crate::api::Json;
+use std::sync::Arc;
 
 use crate::api::error::ApiError;
+use crate::api::state::ApiState;
 use crate::api::types::{WarmArtifactRequest, WarmArtifactResponse};
 
 /// Pull `req.reference` into this node's blob cache.
@@ -36,6 +39,7 @@ use crate::api::types::{WarmArtifactRequest, WarmArtifactResponse};
 /// re-warm freely (on a retry, a node restart, or a repeated push) without
 /// paying for the transfer twice.
 pub async fn warm_artifact(
+    State(state): State<Arc<ApiState>>,
     Json(req): Json<WarmArtifactRequest>,
 ) -> Result<Json<WarmArtifactResponse>, ApiError> {
     if req.reference.trim().is_empty() {
@@ -45,6 +49,7 @@ pub async fn warm_artifact(
     tracing::info!(reference = %req.reference, "pre-warming .smolmachine artifact");
 
     let result = super::machines::pull_smolmachine(
+        &state,
         &req.reference,
         req.identity_token.as_deref(),
         &req.blob_peers,
@@ -74,15 +79,20 @@ mod tests {
     /// reference parser. Pre-warm is fire-and-forget from the control plane's
     /// side, so a request that could never name an artifact should fail loudly
     /// here instead of turning into a confusing parse error deeper in the pull.
-    #[tokio::test]
-    async fn empty_reference_is_rejected() {
+    #[test]
+    fn empty_reference_is_rejected() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&directory.path().join("state.db")).unwrap();
+        let state = Arc::new(ApiState::with_db(db));
         for blank in ["", "   "] {
-            let err = warm_artifact(Json(WarmArtifactRequest {
-                reference: blank.to_string(),
-                identity_token: None,
-                blob_peers: Vec::new(),
-            }))
-            .await
+            let err = futures_lite::future::block_on(warm_artifact(
+                State(state.clone()),
+                Json(WarmArtifactRequest {
+                    reference: blank.to_string(),
+                    identity_token: None,
+                    blob_peers: Vec::new(),
+                }),
+            ))
             .expect_err("a blank reference must not reach the pull path");
             assert!(matches!(err, ApiError::BadRequest(_)));
         }

@@ -17,8 +17,8 @@
 //! - `kill`/`pids`/`delete` → `PodSignal`/`PodPids`/`PodDelete`; deleting the
 //!   sandbox id stops + deletes the machine itself.
 //!
-//! The engine API is synchronous, so every engine/agent call is wrapped in
-//! `tokio::task::spawn_blocking`.
+//! The engine API is synchronous, so every engine/agent call is submitted to
+//! the root application's blocking pool through `smolvm::runtime`.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -28,16 +28,13 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use log::{debug, warn};
-use tokio::sync::watch;
-
 use smolvm::agent::{AgentClient, HostMount, VmResources};
 use smolvm::embedded::MachineSpec;
 use smolvm::network::NetworkBackend;
 use smolvm_protocol::{AgentRequest, AgentResponse};
 
-use crate::backend::{ExitInfo, ExitWatch, PodBackend, ProcessSpec, Stdio};
+use crate::backend::{ExitInfo, ExitSender, ExitWatch, PodBackend, ProcessSpec, Stdio};
 
 /// Nominal guest target recorded on the sandbox's single [`HostMount`]
 /// (host side: `<bundle>/podshare`). `HostMount` targets only take effect for
@@ -90,7 +87,7 @@ fn key(id: &str, exec_id: Option<&str>) -> String {
     }
 }
 
-/// Commands the async side sends into a process's pump thread. The pump owns
+/// Commands the request side sends into a process's pump thread. The pump owns
 /// the process's streaming agent connection, so PTY resizes and stdin-close
 /// must be relayed through it.
 enum PumpCmd {
@@ -121,7 +118,7 @@ struct Sandbox {
 struct ProcEntry {
     stdio: Stdio,
     pid: u32,
-    exit_tx: Arc<watch::Sender<Option<ExitInfo>>>,
+    exit_tx: Arc<ExitSender>,
     exit_rx: ExitWatch,
     /// Present once the process was started (the pump thread is running).
     cmd_tx: Option<std::sync::mpsc::Sender<PumpCmd>>,
@@ -129,7 +126,7 @@ struct ProcEntry {
 
 impl ProcEntry {
     fn new(stdio: Stdio, pid: u32) -> Self {
-        let (tx, rx) = watch::channel(None);
+        let (tx, rx) = ExitSender::channel();
         Self {
             stdio,
             pid,
@@ -143,10 +140,11 @@ impl ProcEntry {
 pub struct EnginePodBackend {
     sandbox: Mutex<Option<Arc<Sandbox>>>,
     procs: Mutex<HashMap<String, ProcEntry>>,
+    runtime: Arc<smolvm::runtime::Runtime>,
 }
 
 impl EnginePodBackend {
-    pub fn new() -> Self {
+    pub fn new(runtime: Arc<smolvm::runtime::Runtime>) -> Self {
         // Once per shim process, reclaim sandbox VMs left behind by a node reboot
         // or a shim crash (dead process, but the persistent record + disk images
         // survive). containerd can't drive this cleanup after a reboot — its task
@@ -163,6 +161,7 @@ impl EnginePodBackend {
         Self {
             sandbox: Mutex::new(None),
             procs: Mutex::new(HashMap::new()),
+            runtime,
         }
     }
 
@@ -197,6 +196,23 @@ impl EnginePodBackend {
 
 fn connect(socket: &Path) -> Result<AgentClient, String> {
     AgentClient::connect_with_retry(socket).map_err(|e| format!("connect to sandbox agent: {e}"))
+}
+
+/// Run one synchronous engine operation on the application's bounded blocking
+/// pool. The containerd API is synchronous, so this is the only bridge from
+/// its request thread to the engine runtime's bounded blocking pool.
+fn run_blocking<F, T>(
+    runtime: &smolvm::runtime::Runtime,
+    function: F,
+) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let task = runtime
+        .spawn_blocking(function)
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(task).map_err(|e| e.to_string())?
 }
 
 /// One-shot request/response on a fresh agent connection. All Pod* control
@@ -374,12 +390,12 @@ fn open_fifo_stdin(path: &str) -> Option<std::fs::File> {
 /// process's dedicated streaming agent connection:
 ///
 /// ```text
-///   async trait methods ──(mpsc PumpCmd: Resize/CloseStdin)──► pump thread
+///   request methods ──(mpsc PumpCmd: Resize/CloseStdin)──► pump thread
 ///   stdin fifo (nonblocking read) ──────────────────────────►    │
 ///   agent Stdout/Stderr frames ◄── vsock ── PodStart connection ─┘
 ///        │                                     │
 ///        ▼                                     ▼
-///   stdout/stderr fifos                Exited → watch<ExitInfo>
+///   stdout/stderr fifos                Exited → ExitWatch
 /// ```
 ///
 /// Sequence: connect → `PodStart` → wait `Started` → ack `started_tx` (this is
@@ -395,7 +411,7 @@ fn run_pump(
     id: String,
     exec_id: Option<String>,
     stdio: Stdio,
-    exit_tx: Arc<watch::Sender<Option<ExitInfo>>>,
+    exit_tx: Arc<ExitSender>,
     cmd_rx: Receiver<PumpCmd>,
     started_tx: SyncSender<Result<(), String>>,
 ) {
@@ -444,7 +460,7 @@ fn run_pump(
 fn pump_loop(
     client: &mut AgentClient,
     stdio: &Stdio,
-    exit_tx: &watch::Sender<Option<ExitInfo>>,
+    exit_tx: &ExitSender,
     cmd_rx: &Receiver<PumpCmd>,
 ) -> Result<(), String> {
     let mut stdout = open_fifo_writer(&stdio.stdout);
@@ -465,7 +481,7 @@ fn pump_loop(
 
     let mut inbuf = [0u8; 8192];
     loop {
-        // 1) Relay commands from the async side.
+        // 1) Relay commands from request threads.
         loop {
             match cmd_rx.try_recv() {
                 Ok(PumpCmd::Resize { cols, rows }) => {
@@ -552,9 +568,8 @@ fn pump_loop(
 
 // ============================== trait impl ==================================
 
-#[async_trait]
 impl PodBackend for EnginePodBackend {
-    async fn create_sandbox(
+    fn create_sandbox(
         &self,
         id: &str,
         bundle: &str,
@@ -564,7 +579,7 @@ impl PodBackend for EnginePodBackend {
         let bundle = bundle.to_string();
         let netns = netns.map(str::to_string);
 
-        let (sandbox, pid) = tokio::task::spawn_blocking(move || {
+        let (sandbox, pid) = run_blocking(&self.runtime, move || {
             // The pod hostname and sysctls are on the SANDBOX OCI spec (containerd
             // doesn't put them on each container's spec); read them now to inject
             // into every container.
@@ -664,22 +679,20 @@ impl PodBackend for EnginePodBackend {
                 },
                 pid,
             ))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        })?;
 
         *self.sandbox.lock().map_err(|e| e.to_string())? = Some(Arc::new(sandbox));
         self.insert_proc(key(id, None), ProcEntry::new(Stdio::default(), pid))?;
         Ok(pid)
     }
 
-    async fn create_container(&self, id: &str, spec: ProcessSpec) -> Result<u32, String> {
+    fn create_container(&self, id: &str, spec: ProcessSpec) -> Result<u32, String> {
         let sandbox = self.sandbox()?;
         let id_owned = id.to_string();
         let stdio = spec.stdio.clone();
         let pid = next_pid();
 
-        tokio::task::spawn_blocking(move || {
+        run_blocking(&self.runtime, move || {
             // Materialize the container rootfs under the pod share as plain
             // files, so the guest sees it through the boot-time virtiofs mount.
             //
@@ -735,15 +748,13 @@ impl PodBackend for EnginePodBackend {
                 },
             )?;
             expect_ok(resp, "PodCreate")
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        })?;
 
         self.insert_proc(key(id, None), ProcEntry::new(stdio, pid))?;
         Ok(pid)
     }
 
-    async fn create_exec(&self, id: &str, exec_id: &str, spec: ProcessSpec) -> Result<(), String> {
+    fn create_exec(&self, id: &str, exec_id: &str, spec: ProcessSpec) -> Result<(), String> {
         let sandbox = self.sandbox()?;
         let id_owned = id.to_string();
         let exec_owned = exec_id.to_string();
@@ -754,7 +765,7 @@ impl PodBackend for EnginePodBackend {
         let process_json = String::from_utf8(spec.exec_spec.unwrap_or_default())
             .map_err(|e| format!("exec spec is not UTF-8 JSON: {e}"))?;
 
-        tokio::task::spawn_blocking(move || {
+        run_blocking(&self.runtime, move || {
             let resp = pod_request(
                 &sandbox.socket,
                 &AgentRequest::PodExec {
@@ -765,15 +776,13 @@ impl PodBackend for EnginePodBackend {
                 },
             )?;
             expect_ok(resp, "PodExec")
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        })?;
 
         self.insert_proc(key(id, Some(exec_id)), ProcEntry::new(stdio, next_pid()))?;
         Ok(())
     }
 
-    async fn start(&self, id: &str, exec_id: Option<&str>) -> Result<u32, String> {
+    fn start(&self, id: &str, exec_id: Option<&str>) -> Result<u32, String> {
         let k = key(id, exec_id);
         let (stdio, pid, exit_tx) = {
             let map = self.procs.lock().map_err(|e| e.to_string())?;
@@ -795,7 +804,7 @@ impl PodBackend for EnginePodBackend {
         let exec_owned = exec_id.map(str::to_string);
 
         // The pump owns the process's dedicated streaming connection for its
-        // whole lifetime — a plain thread, not a tokio blocking task.
+        // whole lifetime — a plain thread, independent of the request thread.
         std::thread::Builder::new()
             .name(format!("pod-io-{k}"))
             .spawn(move || {
@@ -805,13 +814,11 @@ impl PodBackend for EnginePodBackend {
             })
             .map_err(|e| format!("spawn pump thread: {e}"))?;
 
-        // Block (off the async runtime) until the agent confirms Started.
-        tokio::task::spawn_blocking(move || match started_rx.recv_timeout(START_TIMEOUT) {
+        // Block on the engine runtime until the agent confirms Started.
+        run_blocking(&self.runtime, move || match started_rx.recv_timeout(START_TIMEOUT) {
             Ok(res) => res,
             Err(e) => Err(format!("timed out waiting for Started: {e}")),
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        })?;
 
         if let Some(p) = self.procs.lock().map_err(|e| e.to_string())?.get_mut(&k) {
             p.cmd_tx = Some(cmd_tx);
@@ -819,7 +826,7 @@ impl PodBackend for EnginePodBackend {
         Ok(pid)
     }
 
-    async fn kill(
+    fn kill(
         &self,
         id: &str,
         exec_id: Option<&str>,
@@ -849,21 +856,19 @@ impl PodBackend for EnginePodBackend {
             signal,
             all,
         };
-        tokio::task::spawn_blocking(move || {
+        run_blocking(&self.runtime, move || {
             expect_ok(pod_request(&sandbox.socket, &req)?, "PodSignal")
         })
-        .await
-        .map_err(|e| e.to_string())?
     }
 
-    async fn wait_channel(&self, id: &str, exec_id: Option<&str>) -> Result<ExitWatch, String> {
+    fn wait_channel(&self, id: &str, exec_id: Option<&str>) -> Result<ExitWatch, String> {
         let map = self.procs.lock().map_err(|e| e.to_string())?;
         map.get(&key(id, exec_id))
             .map(|p| p.exit_rx.clone())
             .ok_or_else(|| format!("no such process {}", key(id, exec_id)))
     }
 
-    async fn resize_pty(
+    fn resize_pty(
         &self,
         id: &str,
         exec_id: Option<&str>,
@@ -884,7 +889,7 @@ impl PodBackend for EnginePodBackend {
         Ok(())
     }
 
-    async fn close_io(&self, id: &str, exec_id: Option<&str>) -> Result<(), String> {
+    fn close_io(&self, id: &str, exec_id: Option<&str>) -> Result<(), String> {
         let cmd_tx = {
             let map = self.procs.lock().map_err(|e| e.to_string())?;
             map.get(&key(id, exec_id)).and_then(|p| p.cmd_tx.clone())
@@ -895,22 +900,20 @@ impl PodBackend for EnginePodBackend {
         Ok(())
     }
 
-    async fn delete(&self, id: &str, exec_id: Option<&str>) -> Result<(), String> {
+    fn delete(&self, id: &str, exec_id: Option<&str>) -> Result<(), String> {
         let k = key(id, exec_id);
 
         if self.is_sandbox_task(id, exec_id) {
             // Sandbox delete = tear down the whole VM.
             let sandbox = self.sandbox()?;
-            tokio::task::spawn_blocking(move || {
+            run_blocking(&self.runtime, move || {
                 let rt = smolvm::embedded::runtime().map_err(|e| e.to_string())?;
                 if let Err(e) = rt.stop_machine(&sandbox.id) {
                     warn!("stop sandbox VM {}: {e}", sandbox.id);
                 }
                 rt.delete_machine(&sandbox.id)
                     .map_err(|e| format!("delete sandbox VM: {e}"))
-            })
-            .await
-            .map_err(|e| e.to_string())??;
+            })?;
             *self.sandbox.lock().map_err(|e| e.to_string())? = None;
             self.procs.lock().map_err(|e| e.to_string())?.remove(&k);
             return Ok(());
@@ -919,7 +922,7 @@ impl PodBackend for EnginePodBackend {
         let sandbox = self.sandbox()?;
         let id_owned = id.to_string();
         let exec_owned = exec_id.map(str::to_string);
-        tokio::task::spawn_blocking(move || {
+        run_blocking(&self.runtime, move || {
             // Best-effort guest-side cleanup: the VM may already be gone when
             // containerd deletes exited tasks during pod teardown, and a
             // failing Delete would wedge containerd's teardown loop.
@@ -945,15 +948,13 @@ impl PodBackend for EnginePodBackend {
                 }
             }
             Ok::<(), String>(())
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        })?;
 
         self.procs.lock().map_err(|e| e.to_string())?.remove(&k);
         Ok(())
     }
 
-    async fn pids(&self, id: &str) -> Result<Vec<u32>, String> {
+    fn pids(&self, id: &str) -> Result<Vec<u32>, String> {
         if self.is_sandbox_task(id, None) {
             let map = self.procs.lock().map_err(|e| e.to_string())?;
             let pid = map.get(&key(id, None)).map(|p| p.pid).unwrap_or(1);
@@ -961,23 +962,21 @@ impl PodBackend for EnginePodBackend {
         }
         let sandbox = self.sandbox()?;
         let req = AgentRequest::PodPids { id: id.to_string() };
-        tokio::task::spawn_blocking(move || match pod_request(&sandbox.socket, &req)? {
+        run_blocking(&self.runtime, move || match pod_request(&sandbox.socket, &req)? {
             AgentResponse::Pids { pids } => Ok(pids),
             AgentResponse::Error { message, .. } => Err(format!("PodPids: {message}")),
             other => Err(format!("PodPids: unexpected agent response {other:?}")),
         })
-        .await
-        .map_err(|e| e.to_string())?
     }
 
-    async fn stats(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
+    fn stats(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
         // The pod sandbox "task" has no container process tree to sample.
         if self.is_sandbox_task(id, None) {
             return Ok(None);
         }
         let sandbox = self.sandbox()?;
         let req = AgentRequest::PodStats { id: id.to_string() };
-        tokio::task::spawn_blocking(move || {
+        run_blocking(&self.runtime, move || {
             let (cpu_ns, mem_bytes) = match pod_request(&sandbox.socket, &req)? {
                 AgentResponse::Stats {
                     cpu_usage_ns,
@@ -988,8 +987,6 @@ impl PodBackend for EnginePodBackend {
             };
             Ok(Some(encode_cgroup_metrics(cpu_ns, mem_bytes)?))
         })
-        .await
-        .map_err(|e| e.to_string())?
     }
 }
 
@@ -1162,42 +1159,41 @@ pub enum ShimBackend {
     Engine(EnginePodBackend),
 }
 
-#[async_trait]
 impl PodBackend for ShimBackend {
-    async fn create_sandbox(
+    fn create_sandbox(
         &self,
         id: &str,
         bundle: &str,
         netns: Option<&str>,
     ) -> Result<u32, String> {
         match self {
-            Self::Mock(b) => b.create_sandbox(id, bundle, netns).await,
-            Self::Engine(b) => b.create_sandbox(id, bundle, netns).await,
+            Self::Mock(b) => b.create_sandbox(id, bundle, netns),
+            Self::Engine(b) => b.create_sandbox(id, bundle, netns),
         }
     }
 
-    async fn create_container(&self, id: &str, spec: ProcessSpec) -> Result<u32, String> {
+    fn create_container(&self, id: &str, spec: ProcessSpec) -> Result<u32, String> {
         match self {
-            Self::Mock(b) => b.create_container(id, spec).await,
-            Self::Engine(b) => b.create_container(id, spec).await,
+            Self::Mock(b) => b.create_container(id, spec),
+            Self::Engine(b) => b.create_container(id, spec),
         }
     }
 
-    async fn start(&self, id: &str, exec_id: Option<&str>) -> Result<u32, String> {
+    fn start(&self, id: &str, exec_id: Option<&str>) -> Result<u32, String> {
         match self {
-            Self::Mock(b) => b.start(id, exec_id).await,
-            Self::Engine(b) => b.start(id, exec_id).await,
+            Self::Mock(b) => b.start(id, exec_id),
+            Self::Engine(b) => b.start(id, exec_id),
         }
     }
 
-    async fn create_exec(&self, id: &str, exec_id: &str, spec: ProcessSpec) -> Result<(), String> {
+    fn create_exec(&self, id: &str, exec_id: &str, spec: ProcessSpec) -> Result<(), String> {
         match self {
-            Self::Mock(b) => b.create_exec(id, exec_id, spec).await,
-            Self::Engine(b) => b.create_exec(id, exec_id, spec).await,
+            Self::Mock(b) => b.create_exec(id, exec_id, spec),
+            Self::Engine(b) => b.create_exec(id, exec_id, spec),
         }
     }
 
-    async fn kill(
+    fn kill(
         &self,
         id: &str,
         exec_id: Option<&str>,
@@ -1205,19 +1201,19 @@ impl PodBackend for ShimBackend {
         all: bool,
     ) -> Result<(), String> {
         match self {
-            Self::Mock(b) => b.kill(id, exec_id, signal, all).await,
-            Self::Engine(b) => b.kill(id, exec_id, signal, all).await,
+            Self::Mock(b) => b.kill(id, exec_id, signal, all),
+            Self::Engine(b) => b.kill(id, exec_id, signal, all),
         }
     }
 
-    async fn wait_channel(&self, id: &str, exec_id: Option<&str>) -> Result<ExitWatch, String> {
+    fn wait_channel(&self, id: &str, exec_id: Option<&str>) -> Result<ExitWatch, String> {
         match self {
-            Self::Mock(b) => b.wait_channel(id, exec_id).await,
-            Self::Engine(b) => b.wait_channel(id, exec_id).await,
+            Self::Mock(b) => b.wait_channel(id, exec_id),
+            Self::Engine(b) => b.wait_channel(id, exec_id),
         }
     }
 
-    async fn resize_pty(
+    fn resize_pty(
         &self,
         id: &str,
         exec_id: Option<&str>,
@@ -1225,36 +1221,36 @@ impl PodBackend for ShimBackend {
         h: u32,
     ) -> Result<(), String> {
         match self {
-            Self::Mock(b) => b.resize_pty(id, exec_id, w, h).await,
-            Self::Engine(b) => b.resize_pty(id, exec_id, w, h).await,
+            Self::Mock(b) => b.resize_pty(id, exec_id, w, h),
+            Self::Engine(b) => b.resize_pty(id, exec_id, w, h),
         }
     }
 
-    async fn close_io(&self, id: &str, exec_id: Option<&str>) -> Result<(), String> {
+    fn close_io(&self, id: &str, exec_id: Option<&str>) -> Result<(), String> {
         match self {
-            Self::Mock(b) => b.close_io(id, exec_id).await,
-            Self::Engine(b) => b.close_io(id, exec_id).await,
+            Self::Mock(b) => b.close_io(id, exec_id),
+            Self::Engine(b) => b.close_io(id, exec_id),
         }
     }
 
-    async fn delete(&self, id: &str, exec_id: Option<&str>) -> Result<(), String> {
+    fn delete(&self, id: &str, exec_id: Option<&str>) -> Result<(), String> {
         match self {
-            Self::Mock(b) => b.delete(id, exec_id).await,
-            Self::Engine(b) => b.delete(id, exec_id).await,
+            Self::Mock(b) => b.delete(id, exec_id),
+            Self::Engine(b) => b.delete(id, exec_id),
         }
     }
 
-    async fn pids(&self, id: &str) -> Result<Vec<u32>, String> {
+    fn pids(&self, id: &str) -> Result<Vec<u32>, String> {
         match self {
-            Self::Mock(b) => b.pids(id).await,
-            Self::Engine(b) => b.pids(id).await,
+            Self::Mock(b) => b.pids(id),
+            Self::Engine(b) => b.pids(id),
         }
     }
 
-    async fn stats(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
+    fn stats(&self, id: &str) -> Result<Option<Vec<u8>>, String> {
         match self {
-            Self::Mock(b) => b.stats(id).await,
-            Self::Engine(b) => b.stats(id).await,
+            Self::Mock(b) => b.stats(id),
+            Self::Engine(b) => b.stats(id),
         }
     }
 }

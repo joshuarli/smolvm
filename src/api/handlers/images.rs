@@ -1,9 +1,7 @@
 //! Image management handlers.
 
-use axum::{
-    extract::{Path, State},
-    Json,
-};
+use h12tiny::web::{Extension, Path, State};
+use crate::api::Json;
 use std::sync::Arc;
 
 use crate::agent::PullOptions;
@@ -30,7 +28,7 @@ use crate::api::TraceId;
 pub async fn list_images(
     State(state): State<Arc<ApiState>>,
     Path(machine_id): Path<String>,
-    trace_id: Option<axum::Extension<TraceId>>,
+    trace_id: Option<Extension<TraceId>>,
 ) -> Result<Json<ListImagesResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
     let entry = state.get_machine(&machine_id)?;
@@ -43,7 +41,7 @@ pub async fn list_images(
         }
     }
 
-    let images = with_machine_client_traced(&entry, tid, |c| c.list_images()).await?;
+    let images = with_machine_client_traced(state.runtime()?, &entry, tid, |c| c.list_images()).await?;
 
     let images = images
         .into_iter()
@@ -79,7 +77,7 @@ pub async fn list_images(
 pub async fn pull_image(
     State(state): State<Arc<ApiState>>,
     Path(machine_id): Path<String>,
-    trace_id: Option<axum::Extension<TraceId>>,
+    trace_id: Option<Extension<TraceId>>,
     Json(req): Json<PullImageRequest>,
 ) -> Result<Json<PullImageResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
@@ -101,7 +99,7 @@ pub async fn pull_image(
     let proxy = req.proxy.clone();
     let no_proxy = req.no_proxy.clone();
     let start = std::time::Instant::now();
-    let image_info = with_machine_client_traced(&entry, tid, move |c| {
+    let image_info = with_machine_client_traced(state.runtime()?, &entry, tid, move |c| {
         let mut opts = PullOptions::new().use_registry_config(true);
         if let Some(p) = oci_platform {
             opts = opts.oci_platform(p);

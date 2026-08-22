@@ -25,32 +25,34 @@ pub(crate) mod device_handoff;
 pub mod error;
 pub mod guest_rollout;
 pub mod handlers;
+mod json;
 pub mod pool_controller;
 pub mod rollout;
 pub mod state;
 pub mod supervisor;
 pub mod types;
 
-use axum::{
-    extract::{DefaultBodyLimit, Request},
-    http::{HeaderValue, StatusCode},
-    middleware::{self, Next},
-    response::Response,
-    routing::{delete, get, post, put},
-    Router,
-};
 use std::sync::Arc;
 use std::time::Duration;
-use tower_http::{
-    cors::{AllowOrigin, CorsLayer},
-    timeout::TimeoutLayer,
-    trace::TraceLayer,
-};
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_swagger_ui::{serve as serve_swagger_file, Config as SwaggerConfig};
+
+use h12tiny::web::{
+    delete, get, post, put, Cors, HandlerFuture, HeaderValue, IntoResponse, Path,
+    Request, Response, Router, RouterService, State, StatusCode,
+};
+
+pub use json::{Json, OptionalJson, Query};
 
 use self::error::ApiError;
 use state::ApiState;
+
+/// The concrete h12tiny service used by both the full and loopback API doors.
+/// Keeping the explicit transport wrapper in the public return type makes the
+/// trace/metrics boundary testable without importing Hyper in application code.
+pub type ApiRouter = RouterService<Arc<ApiState>, TraceDispatch>;
+
+type TraceDispatch = fn(Request, Router<Arc<ApiState>>) -> HandlerFuture;
 
 /// OpenAPI documentation for the smolvm API.
 #[derive(OpenApi)]
@@ -214,29 +216,29 @@ pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
 ///
 /// `cors_origins` specifies allowed CORS origins. If empty, defaults to
 /// localhost:8080 and localhost:3000 (both http and 127.0.0.1 variants).
-pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
+pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> ApiRouter {
     // Health check route. `/health` is liveness (pure-async, always answers);
     // `/readyz` is a dispatch-path readiness probe that exercises the blocking pool
     // so the control can detect — and cordon — a node whose start/exec are wedged
     // even while `/health` still returns 200.
-    let health_route = Router::new()
+    let health_route = Router::<Arc<ApiState>>::new()
         .route("/health", get(handlers::health::health))
         .route("/readyz", get(handlers::health::readyz));
 
     // Node capacity introspection (polled by a fleet node-agent over HTTP).
-    let capacity_route = Router::new().route("/capacity", get(handlers::node::capacity));
+    let capacity_route = Router::<Arc<ApiState>>::new().route("/capacity", get(handlers::node::capacity));
 
     // Explicit, control-initiated node drain (decommission). Stops all VMs
     // cleanly. Control-only by construction (the listener is mTLS-gated; the
     // loopback door is localhost). See docs/lossless-serve-restart.md.
-    let drain_route = Router::new().route("/drain", post(handlers::machines::drain_node));
+    let drain_route = Router::<Arc<ApiState>>::new().route("/drain", post(handlers::machines::drain_node));
 
     // Brokered P2P blob serving: hand a cached layer blob to a sibling node so a
     // create on another node can pull it from a peer instead of the registry.
     // Read-only, content-addressed, and mTLS-gated by the listener by
     // construction (like /drain, see the comment above). No request timeout:
     // blobs can be large.
-    let p2p_route = Router::new().route("/p2p/blob/{digest}", get(handlers::p2p::serve_blob));
+    let p2p_route = Router::<Arc<ApiState>>::new().route("/p2p/blob/{digest}", get(handlers::p2p::serve_blob));
 
     // Control-initiated artifact pre-warm: pull a `.smolmachine` layer into this
     // node's blob cache before any machine needs it, so a create finds it warm
@@ -244,11 +246,11 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // readiness timeout. mTLS-gated by the listener like `/drain` and `/p2p`
     // above. No request timeout: the transfer is as large as a blob pull, and
     // it runs off the critical path where slowness costs nothing.
-    let warm_route = Router::new().route("/artifacts/warm", post(handlers::prewarm::warm_artifact));
+    let warm_route = Router::<Arc<ApiState>>::new().route("/artifacts/warm", post(handlers::prewarm::warm_artifact));
 
     // Long-lived streaming routes (no request timeout): SSE logs and the
     // interactive PTY WebSocket both outlive the 5-minute API timeout.
-    let logs_route = Router::new()
+    let logs_route = Router::<Arc<ApiState>>::new()
         .route("/{id}/logs", get(handlers::exec::stream_logs))
         .route(
             "/{id}/exec/interactive",
@@ -256,7 +258,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         );
 
     // Machine routes with timeout
-    let machine_routes_with_timeout = Router::new()
+    let machine_routes_with_timeout = Router::<Arc<ApiState>>::new()
         .route("/", post(handlers::machines::create_machine))
         .route("/", get(handlers::machines::list_machines))
         .route("/{id}", get(handlers::machines::get_machine))
@@ -287,27 +289,25 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         // true maximum.
         .route(
             "/{id}/files/{*path}",
-            put(handlers::files::upload_file).layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
+            put(handlers::files::upload_file).body_limit(MAX_FILE_UPLOAD_BYTES),
         )
         .route("/{id}/files/{*path}", get(handlers::files::download_file))
         // Image routes
         .route("/{id}/images", get(handlers::images::list_images))
         .route("/{id}/images/pull", post(handlers::images::pull_image))
-        // Apply timeout only to these routes
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(API_REQUEST_TIMEOUT_SECS),
-        ));
+        // Apply timeout only to these routes. h12tiny applies the deadline to
+        // the handler future, never a subsequently streamed response body.
+        .timeout(Duration::from_secs(API_REQUEST_TIMEOUT_SECS));
 
     // Machine routes
-    let machine_routes = Router::new()
+    let machine_routes = Router::<Arc<ApiState>>::new()
         .merge(logs_route)
         .merge(machine_routes_with_timeout);
 
     // Automatic pool operations are bounded by the same request timeout as
     // machine lifecycle calls. Pool fill and worker replacement happen in the
     // background controller, so create/delete themselves stay quick.
-    let pool_routes = Router::new()
+    let pool_routes = Router::<Arc<ApiState>>::new()
         .route("/", post(handlers::pools::create_pool))
         .route("/", get(handlers::pools::list_pools))
         .route("/{name}", get(handlers::pools::get_pool))
@@ -327,21 +327,18 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             "/{name}/leases/{lease}/complete",
             post(handlers::pools::complete_lease),
         )
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(API_REQUEST_TIMEOUT_SECS),
-        ));
+        .timeout(Duration::from_secs(API_REQUEST_TIMEOUT_SECS));
 
     // Volume provisioning (node-side storage for the control plane): create the
     // backing storage on THIS worker and return its host path. See
     // handlers::volumes.
-    let volume_routes = Router::new()
+    let volume_routes = Router::<Arc<ApiState>>::new()
         .route("/", post(handlers::volumes::provision_volume))
         .route("/{id}", delete(handlers::volumes::deprovision_volume));
 
     // Fused rollout handlers own their deadlines so cancelled clients abort the
     // backend HTTP request instead of inheriting the generic lifecycle timeout.
-    let rollout_routes = Router::new()
+    let rollout_routes = Router::<Arc<ApiState>>::new()
         .route("/", post(handlers::rollouts::create_executor))
         .route("/", get(handlers::rollouts::list_executors))
         .route("/{name}", get(handlers::rollouts::get_executor))
@@ -357,10 +354,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         )
         .route("/{name}/generate", post(handlers::rollouts::generate))
         .route("/{name}/batches", post(handlers::rollouts::generate_batch))
-        .layer(DefaultBodyLimit::max(MAX_ROLLOUT_REQUEST_BYTES));
+        .body_limit(MAX_ROLLOUT_REQUEST_BYTES);
 
     // API v1 routes
-    let api_v1 = Router::new()
+    let api_v1 = Router::<Arc<ApiState>>::new()
         .nest("/machines", machine_routes)
         .nest("/pools", pool_routes)
         .nest("/rollout-executors", rollout_routes)
@@ -369,10 +366,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     let cors = build_cors(cors_origins);
 
     // Prometheus metrics
-    let metrics_route = Router::new().route("/metrics", get(serve_metrics));
+    let metrics_route = Router::<Arc<ApiState>>::new().route("/metrics", get(serve_metrics));
 
     // Combine all routes
-    Router::new()
+    Router::<Arc<ApiState>>::new()
         .merge(health_route)
         .merge(capacity_route)
         .merge(drain_route)
@@ -380,39 +377,33 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .merge(warm_route)
         .merge(metrics_route)
         .nest("/api/v1", api_v1)
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
-        .layer(middleware::from_fn(trace_id_middleware))
-        .layer(TraceLayer::new_for_http())
-        .layer(cors)
+        .route("/api-docs/openapi.json", get(serve_openapi))
+        .route("/swagger-ui", get(redirect_swagger_ui))
+        .route("/swagger-ui/", get(serve_swagger_ui_root))
+        .route("/swagger-ui/{*path}", get(serve_swagger_ui_path))
+        .cors(cors)
         .with_state(state)
+        .service_with(trace_id_dispatch as TraceDispatch)
 }
 
 /// Build the shared CORS layer from the configured origins (falling back to the
 /// localhost defaults). Shared by [`create_router`] and [`create_local_router`].
-fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
+fn build_cors(cors_origins: Vec<String>) -> Cors {
     let default_origins = || {
         vec![
-            "http://localhost:8080"
-                .parse()
-                .expect("hardcoded CORS origin"),
-            "http://127.0.0.1:8080"
-                .parse()
-                .expect("hardcoded CORS origin"),
-            "http://localhost:3000"
-                .parse()
-                .expect("hardcoded CORS origin"),
-            "http://127.0.0.1:3000"
-                .parse()
-                .expect("hardcoded CORS origin"),
+            "http://localhost:8080".to_owned(),
+            "http://127.0.0.1:8080".to_owned(),
+            "http://localhost:3000".to_owned(),
+            "http://127.0.0.1:3000".to_owned(),
         ]
     };
-    let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
+    let origins: Vec<String> = if cors_origins.is_empty() {
         default_origins()
     } else {
         let mut valid = Vec::new();
         for origin in &cors_origins {
-            match origin.parse() {
-                Ok(v) => valid.push(v),
+            match HeaderValue::from_str(origin) {
+                Ok(_) => valid.push(origin.clone()),
                 Err(e) => {
                     tracing::warn!(origin = %origin, error = %e, "invalid CORS origin, skipping");
                 }
@@ -425,15 +416,12 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
             valid
         }
     };
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
-        .allow_methods([
-            axum::http::Method::GET,
-            axum::http::Method::POST,
-            axum::http::Method::PUT,
-            axum::http::Method::DELETE,
-        ])
-        .allow_headers([axum::http::header::CONTENT_TYPE])
+    origins.into_iter().fold(
+        Cors::new()
+            .allow_methods("GET, POST, PUT, DELETE")
+            .allow_headers("content-type"),
+        |cors, origin| cors.allow_origin(origin),
+    )
 }
 
 /// The router served on the plain-HTTP LOOPBACK door (fleet mode), as distinct
@@ -450,47 +438,47 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
 /// `/capacity` (plus `/health`/`/readyz`, and read-only `/metrics`). Restricting
 /// it to exactly those routes closes the SSRF pivot without touching the mTLS
 /// control path, which keeps the full API. Everything else 404s on loopback.
-pub fn create_local_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
+pub fn create_local_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> ApiRouter {
     let cors = build_cors(cors_origins);
-    Router::new()
+    Router::<Arc<ApiState>>::new()
         .route("/health", get(handlers::health::health))
         .route("/readyz", get(handlers::health::readyz))
         .route("/capacity", get(handlers::node::capacity))
         .route("/metrics", get(serve_metrics))
-        .layer(middleware::from_fn(trace_id_middleware))
-        .layer(TraceLayer::new_for_http())
-        .layer(cors)
+        .cors(cors)
         .with_state(state)
+        .service_with(trace_id_dispatch as TraceDispatch)
 }
 
 #[cfg(test)]
 mod loopback_router_test {
     use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
+    use h12tiny::util;
+    use h12tiny::web::{Request, StatusCode};
 
-    async fn status(router: axum::Router, method: &str, path: &str) -> StatusCode {
+    async fn status(router: ApiRouter, method: &str, path: &str) -> StatusCode {
         router
-            .oneshot(
+            .call_boxed(
                 Request::builder()
                     .method(method)
                     .uri(path)
-                    .body(Body::empty())
+                    .body(util::boxed_body(util::empty_body()))
                     .unwrap(),
             )
             .await
-            .unwrap()
             .status()
     }
 
     // The loopback door must NOT expose the machine/file/exec API — that is the
     // SSRF pivot this router closes. Liveness routes must still answer.
-    #[tokio::test]
-    async fn loopback_router_excludes_machine_file_exec_api() {
+    #[test]
+    fn loopback_router_excludes_machine_file_exec_api() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = crate::db::SmolvmDb::open_at(&dir.path().join("t.db")).unwrap();
-        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let state = std::sync::Arc::new(
+            crate::api::state::ApiState::with_db(db).with_runtime(runtime.handle()),
+        );
         let local = create_local_router(state.clone(), vec![]);
 
         // The attack surface — every one must be 404 (route absent) on loopback:
@@ -502,19 +490,19 @@ mod loopback_router_test {
             ("POST", "/api/v1/machines"),
         ] {
             assert_eq!(
-                status(local.clone(), m, p).await,
+                runtime.block_on(status(local.clone(), m, p)),
                 StatusCode::NOT_FOUND,
                 "loopback door must NOT expose {m} {p}"
             );
         }
         // Liveness must still work (not 404) so the node-agent poll survives:
         assert_ne!(
-            status(local.clone(), "GET", "/capacity").await,
+            runtime.block_on(status(local.clone(), "GET", "/capacity")),
             StatusCode::NOT_FOUND,
             "loopback /capacity must remain served"
         );
         assert_ne!(
-            status(local.clone(), "GET", "/health").await,
+            runtime.block_on(status(local.clone(), "GET", "/health")),
             StatusCode::NOT_FOUND,
             "loopback /health must remain served"
         );
@@ -522,7 +510,7 @@ mod loopback_router_test {
         // Sanity: the FULL router (mTLS port) still DOES expose the API.
         let full = create_router(state, vec![]);
         assert_ne!(
-            status(full, "GET", "/api/v1/machines").await,
+            runtime.block_on(status(full, "GET", "/api/v1/machines")),
             StatusCode::NOT_FOUND,
             "full router must still expose the machine API on the mTLS port"
         );
@@ -538,7 +526,7 @@ pub fn install_metrics_recorder() -> Option<metrics_exporter_prometheus::Prometh
 }
 
 /// Serve Prometheus metrics as text.
-async fn serve_metrics() -> String {
+async fn serve_metrics(State(_state): State<Arc<ApiState>>) -> String {
     METRICS_HANDLE.get().map(|h| h.render()).unwrap_or_default()
 }
 
@@ -546,6 +534,53 @@ async fn serve_metrics() -> String {
 /// Only accessed by serve.rs (startup) and serve_metrics (handler).
 pub static METRICS_HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
     std::sync::OnceLock::new();
+
+/// Serve the generated OpenAPI document without coupling its route to Axum.
+async fn serve_openapi(State(_state): State<Arc<ApiState>>) -> Json<utoipa::openapi::OpenApi> {
+    Json(ApiDoc::openapi())
+}
+
+/// Preserve the historical Swagger UI entry point's trailing-slash redirect.
+async fn redirect_swagger_ui(State(_state): State<Arc<ApiState>>) -> Response {
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    response.headers_mut().insert(
+        "location",
+        HeaderValue::from_static("/swagger-ui/"),
+    );
+    response
+}
+
+async fn serve_swagger_ui_root(State(_state): State<Arc<ApiState>>) -> Response {
+    swagger_ui_response("")
+}
+
+async fn serve_swagger_ui_path(Path(path): Path<String>) -> Response {
+    swagger_ui_response(&path)
+}
+
+/// Serve the vendored Swagger assets using the framework-neutral support
+/// already provided by `utoipa-swagger-ui`.
+fn swagger_ui_response(path: &str) -> Response {
+    static CONFIG: std::sync::OnceLock<Arc<SwaggerConfig<'static>>> = std::sync::OnceLock::new();
+    let config = CONFIG
+        .get_or_init(|| Arc::new(SwaggerConfig::from("/api-docs/openapi.json")))
+        .clone();
+    match serve_swagger_file(path, config) {
+        Ok(Some(file)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", file.content_type)
+            .body(h12tiny::util::boxed_body(h12tiny::util::bytes_body(
+                file.bytes.into_owned(),
+            )))
+            .expect("Swagger asset response uses valid static headers"),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to serve Swagger UI: {error}"),
+        )
+            .into_response(),
+    }
+}
 
 /// Normalize a request path for Prometheus labels.
 /// Replaces machine IDs with `:id` to prevent cardinality explosion.
@@ -591,9 +626,11 @@ fn normalize_metrics_path(path: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct TraceId(pub String);
 
-/// Middleware that generates a unique trace ID for each request and returns it
-/// in the `X-Trace-Id` response header.
-async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
+/// The application-owned h12tiny transport boundary. It generates the trace
+/// context before extraction, wraps handler execution in the existing request
+/// span, and records the response after routing without a generic middleware
+/// stack or a Tokio executor.
+fn trace_id_dispatch(mut req: Request, router: Router<Arc<ApiState>>) -> HandlerFuture {
     use std::sync::atomic::{AtomicU64, Ordering};
     use tracing::Instrument;
 
@@ -612,16 +649,18 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
     let machine = machine_id_from_path(req.uri().path())
         .unwrap_or("-")
         .to_string();
-    let span = tracing::info_span!("request", trace_id = %trace_id, machine = %machine);
-    let mut response = next.run(req).instrument(span).await;
+    Box::pin(async move {
+        let span = tracing::info_span!("request", trace_id = %trace_id, machine = %machine);
+        let mut response = router.call_boxed(req).instrument(span).await;
 
-    let status = response.status().as_u16().to_string();
-    metrics::counter!("smolvm_api_requests_total", "method" => method, "status" => status, "path" => path_template).increment(1);
+        let status = response.status().as_u16().to_string();
+        metrics::counter!("smolvm_api_requests_total", "method" => method, "status" => status, "path" => path_template).increment(1);
 
-    if let Ok(val) = HeaderValue::from_str(&trace_id) {
-        response.headers_mut().insert("x-trace-id", val);
-    }
-    response
+        if let Ok(val) = HeaderValue::from_str(&trace_id) {
+            response.headers_mut().insert("x-trace-id", val);
+        }
+        response
+    })
 }
 
 #[cfg(test)]

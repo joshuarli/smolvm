@@ -1,8 +1,7 @@
 //! Node-level introspection endpoints.
 
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::{extract::State, Json};
+use h12tiny::web::{IntoResponse, Response, State, StatusCode};
+use crate::api::Json;
 use std::sync::Arc;
 
 use crate::api::state::ApiState;
@@ -86,19 +85,23 @@ mod tests {
     use super::*;
     use crate::db::SmolvmDb;
 
-    use axum::body::to_bytes;
+    use h12tiny::util::BodyExt;
 
-    #[tokio::test]
-    async fn capacity_reports_zero_on_an_idle_node() {
+    #[test]
+    fn capacity_reports_zero_on_an_idle_node() {
         let dir = tempfile::tempdir().unwrap();
         let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
         let state = Arc::new(ApiState::with_db(db));
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
         // A fresh state has heartbeat 0 == "now", so it is not yet stalled.
 
         // No running machines → nothing allocated and nothing in use.
-        let resp = capacity(State(state)).await;
+        let resp = runtime.block_on(capacity(State(state)));
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = runtime
+            .block_on(resp.into_body().collect())
+            .unwrap()
+            .to_bytes();
         let cap: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(cap["allocated_cpus"], 0);
         assert_eq!(cap["allocated_memory_mb"], 0);
@@ -133,22 +136,23 @@ mod tests {
         assert_eq!(cap["cuda_devices"][0]["memoryTotalMib"], 80_000);
     }
 
-    #[tokio::test]
-    async fn capacity_returns_503_when_runtime_heartbeat_is_stale() {
+    #[test]
+    fn capacity_returns_503_when_runtime_heartbeat_is_stale() {
         // Force an immediate stall window so the missing heartbeat counts as stalled.
         std::env::set_var("SMOLVM_RUNTIME_STALE_SECS", "1");
         let dir = tempfile::tempdir().unwrap();
         let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
         let state = Arc::new(ApiState::with_db(db));
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
 
         // Let the 1s stall window elapse with no supervisor heartbeat.
-        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-        let resp = capacity(State(state.clone())).await;
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let resp = runtime.block_on(capacity(State(state.clone())));
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         // A heartbeat clears the stall and capacity answers 200 again.
         state.beat_runtime_heartbeat();
-        let resp = capacity(State(state)).await;
+        let resp = runtime.block_on(capacity(State(state)));
         assert_eq!(resp.status(), StatusCode::OK);
         std::env::remove_var("SMOLVM_RUNTIME_STALE_SECS");
     }

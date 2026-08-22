@@ -1,10 +1,7 @@
 //! Framework-aware fused rollout executor endpoints.
 
-use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    Json,
-};
+use h12tiny::web::{Path, State, StatusCode};
+use crate::api::Json;
 use futures_util::future::join_all;
 use std::sync::Arc;
 
@@ -38,9 +35,9 @@ pub async fn create_executor(
     if let Some(pool) = &request.fallback_pool {
         let db = state.db().clone();
         let pool = pool.clone();
-        let exists = tokio::task::spawn_blocking(move || db.get_fork_pool(&pool))
-            .await
-            .map_err(ApiError::from)?
+        let exists = state
+            .blocking(move || db.get_fork_pool(&pool))
+            .await?
             .map_err(ApiError::database)?
             .is_some();
         if !exists {

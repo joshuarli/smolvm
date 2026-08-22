@@ -1,7 +1,7 @@
 //! Health check endpoint.
 
-use axum::http::StatusCode;
-use axum::{extract::State, Json};
+use h12tiny::web::{State, StatusCode};
+use crate::api::Json;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,9 +70,16 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> 
         (status = 503, description = "Blocking pool saturated — node is dispatch-wedged")
     )
 )]
-pub async fn readyz() -> StatusCode {
-    let probe = tokio::task::spawn_blocking(|| ());
-    match tokio::time::timeout(READYZ_BUDGET, probe).await {
+pub async fn readyz(State(state): State<Arc<ApiState>>) -> StatusCode {
+    let probe = match state.runtime().and_then(|runtime| {
+        runtime
+            .spawn_blocking(|| ())
+            .map_err(crate::api::error::ApiError::internal)
+    }) {
+        Ok(probe) => probe,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE,
+    };
+    match crate::runtime::timeout(READYZ_BUDGET, probe).await {
         Ok(Ok(())) => StatusCode::OK,
         // Timed out (pool saturated) or the task panicked/was cancelled — either way
         // the dispatch path is not servicing work; report unready.
@@ -86,8 +93,12 @@ mod tests {
 
     // On a healthy runtime the blocking-pool round-trip completes well inside the
     // budget, so readiness reports OK.
-    #[tokio::test]
-    async fn readyz_ok_when_pool_responsive() {
-        assert_eq!(readyz().await, StatusCode::OK);
+    #[test]
+    fn readyz_ok_when_pool_responsive() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&directory.path().join("state.db")).unwrap();
+        let runtime = crate::runtime::Runtime::with_workers(1).unwrap();
+        let state = Arc::new(ApiState::with_db(db).with_runtime(runtime.handle()));
+        assert_eq!(runtime.block_on(readyz(State(state))), StatusCode::OK);
     }
 }

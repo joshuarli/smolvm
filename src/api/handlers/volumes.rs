@@ -10,7 +10,8 @@
 //! reaper), and the node-agent does the final mount out-of-band. See smolfleet
 //! docs/d3-replicated-volumes.md.
 
-use axum::{extract::Path, http::StatusCode, Json};
+use h12tiny::web::{Path, State, StatusCode};
+use crate::api::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::api::error::ApiError;
@@ -110,7 +111,7 @@ pub async fn provision_volume(
 /// `DELETE /api/v1/volumes/{id}` — tear down the backing storage. Idempotent:
 /// deleting an already-absent volume succeeds.
 pub async fn deprovision_volume(
-    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::api::state::ApiState>>,
+    State(state): State<std::sync::Arc<crate::api::state::ApiState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     safe_volume_id(&id)?;

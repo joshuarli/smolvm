@@ -8,8 +8,10 @@
 use crate::data::image_source;
 use crate::registry::{registry_client, PullAuth, Reference};
 use crate::{Error, Result, SmolSettings};
+use crate::runtime::Runtime;
 use blake3::Hasher as Blake3Hasher;
 use futures_util::StreamExt;
+use futures_lite::io::AsyncWriteExt;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
@@ -80,9 +82,15 @@ pub fn materialize_registry_archive(reference: &str) -> Result<PreparedRegistryA
     let source_reference = reference.to_string();
     let repository = repository_path(&reference);
     let image_settings = SmolSettings::load()?.images;
-    let client = registry_client(&reference.registry, &image_settings, &PullAuth::FromConfig);
-    let runtime = tokio::runtime::Runtime::new()
+    let runtime = Runtime::with_workers(2)
         .map_err(|error| Error::agent("image materialize", error.to_string()))?;
+    let executor = runtime.handle();
+    let client = registry_client(
+        &reference.registry,
+        &image_settings,
+        &PullAuth::FromConfig,
+        &executor,
+    );
     runtime.block_on(materialize_with_client(
         &client,
         &repository,
@@ -267,7 +275,10 @@ async fn stream_blob_to_file(
         .pull_blob_stream(repository, &descriptor.digest)
         .await
         .map_err(|error| Error::agent("image materialize layer", error.to_string()))?;
-    let mut file = tokio::fs::File::create(output).await?;
+    // `materialize_registry_archive` is driven by the application-owned
+    // futures-lite runtime, not Tokio. Wrap the regular file in async-io so
+    // this sink does not require a Tokio reactor in the calling thread.
+    let mut file = async_io::Async::new(fs::File::create(output)?)?;
     let mut hasher = Sha256::new();
     let mut written = 0u64;
     futures_util::pin_mut!(stream);
@@ -287,9 +298,9 @@ async fn stream_blob_to_file(
             ));
         }
         hasher.update(&chunk);
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+        file.write_all(&chunk).await?;
     }
-    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    file.flush().await?;
     if written != descriptor.size {
         return Err(Error::config(
             "image material manifest",

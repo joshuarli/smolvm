@@ -1296,7 +1296,10 @@ impl PackPushCmd {
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
         let settings = smolvm::SmolSettings::load()?;
-        let client = build_registry_client(&parsed.registry, &settings.machines)?;
+        let rt = smolvm::runtime::Runtime::with_workers(2)
+            .map_err(|e| Error::agent("create application runtime", e.to_string()))?;
+        let executor = rt.handle();
+        let client = build_registry_client(&parsed.registry, &settings.machines, &executor)?;
 
         let repo = parsed.repository();
         let tag = parsed.tag.as_deref().unwrap_or("latest");
@@ -1308,9 +1311,6 @@ impl PackPushCmd {
             repo,
             tag
         );
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
 
         let result = rt
             .block_on(smolvm_registry::push(&client, &repo, tag, &self.file))
@@ -1346,7 +1346,10 @@ impl PackPullCmd {
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
         let settings = smolvm::SmolSettings::load()?;
-        let client = build_registry_client(&parsed.registry, &settings.machines)?;
+        let rt = smolvm::runtime::Runtime::with_workers(2)
+            .map_err(|e| Error::agent("create application runtime", e.to_string()))?;
+        let executor = rt.handle();
+        let client = build_registry_client(&parsed.registry, &settings.machines, &executor)?;
 
         let repo = parsed.repository();
         let tag_or_digest = parsed
@@ -1356,9 +1359,6 @@ impl PackPullCmd {
             .unwrap_or("latest");
 
         eprintln!("Pulling {}/{}:{}", parsed.registry, repo, tag_or_digest);
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
 
         let cache = smolvm_registry::BlobCache::open_default()
             .map_err(|e| Error::agent("open blob cache", e.to_string()))?;
@@ -1442,7 +1442,10 @@ impl PackInspectCmd {
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
         let settings = smolvm::SmolSettings::load()?;
-        let client = build_registry_client(&parsed.registry, &settings.machines)?;
+        let rt = smolvm::runtime::Runtime::with_workers(2)
+            .map_err(|e| Error::agent("create application runtime", e.to_string()))?;
+        let executor = rt.handle();
+        let client = build_registry_client(&parsed.registry, &settings.machines, &executor)?;
 
         let repo = parsed.repository();
         let tag_or_digest = parsed
@@ -1450,9 +1453,6 @@ impl PackInspectCmd {
             .as_deref()
             .or(parsed.tag.as_deref())
             .unwrap_or("latest");
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
 
         rt.block_on(run_inspect(
             &client,
@@ -1561,11 +1561,13 @@ async fn run_inspect(
 fn build_registry_client(
     registry: &str,
     config: &smolvm::registry::RegistryConfig,
+    executor: &smolvm::runtime::RuntimeHandle,
 ) -> smolvm::Result<smolvm_registry::RegistryClient> {
     Ok(smolvm::registry::registry_client(
         registry,
         config,
         &smolvm::registry::PullAuth::FromConfig,
+        executor,
     ))
 }
 
@@ -1694,7 +1696,9 @@ mod tests {
             },
         );
 
-        let client = build_registry_client("registry.smolmachines.com", &config).unwrap();
+        let runtime = smolvm::runtime::Runtime::with_workers(1).unwrap();
+        let executor = runtime.handle();
+        let client = build_registry_client("registry.smolmachines.com", &config, &executor).unwrap();
         assert_eq!(
             client.identity_token(),
             Some("eyJ_upstream_jwt"),
@@ -1715,7 +1719,9 @@ mod tests {
             },
         );
 
-        let client = build_registry_client("ghcr.io", &config).unwrap();
+        let runtime = smolvm::runtime::Runtime::with_workers(1).unwrap();
+        let executor = runtime.handle();
+        let client = build_registry_client("ghcr.io", &config, &executor).unwrap();
         assert_eq!(client.identity_token(), None);
         assert_eq!(
             client.basic_credentials(),
@@ -1737,7 +1743,9 @@ mod tests {
             },
         );
 
-        let client = build_registry_client("custom.registry.io", &config).unwrap();
+        let runtime = smolvm::runtime::Runtime::with_workers(1).unwrap();
+        let executor = runtime.handle();
+        let client = build_registry_client("custom.registry.io", &config, &executor).unwrap();
         assert_eq!(client.identity_token(), None);
         assert_eq!(client.basic_credentials(), None);
     }
@@ -1746,7 +1754,9 @@ mod tests {
     fn build_registry_client_docker_hub_uses_api_endpoint() {
         // docker.io must map to registry-1.docker.io for Distribution API calls.
         let config = smolvm::registry::RegistryConfig::default();
-        let client = build_registry_client("docker.io", &config).unwrap();
+        let runtime = smolvm::runtime::Runtime::with_workers(1).unwrap();
+        let executor = runtime.handle();
+        let client = build_registry_client("docker.io", &config, &executor).unwrap();
         assert_eq!(
             client.base_url(),
             "https://registry-1.docker.io",
@@ -1769,7 +1779,9 @@ mod tests {
             },
         );
 
-        let client = build_registry_client("registry.smolmachines.com", &config).unwrap();
+        let runtime = smolvm::runtime::Runtime::with_workers(1).unwrap();
+        let executor = runtime.handle();
+        let client = build_registry_client("registry.smolmachines.com", &config, &executor).unwrap();
         assert_eq!(
             client.identity_token(),
             Some("eyJ_identity"),

@@ -47,6 +47,7 @@ thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_urlencoded = "0.7"
 serde_yaml = "0.9"
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -57,7 +58,7 @@ libloading = "0.8"
 # Cross-platform AF_UNIX sockets for the agent control channel and vsock-port
 # bridges. std has no UnixStream on Windows, but socket2 (Domain::UNIX) works
 # on Windows 10 1809+. See src/platform/uds.rs.
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 dirs = "5"
 sha2 = "0.10"
 blake3 = "1"
@@ -77,29 +78,35 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 humantime = "2"
 tempfile = "3"
 
+# Application-owned Tokio-free runtime substrate.  These dependencies are
+# intentionally kept at the root boundary so future call-site migrations do
+# not each create an executor or choose incompatible timer/blocking semantics.
+async-channel = "2"
+async-executor = "1"
+async-io = "2"
+futures-lite = { workspace = true }
+# Native HTTP server boundary. h12tiny provides routing, HTTP/1.1 + HTTP/2,
+# TLS lifecycle management, CORS, SSE, WebSocket, and raw H1 upgrades without
+# introducing a Tokio executor into application code. JSON/query extraction is
+# implemented outside h12tiny in this binary.
+h12tiny = { version = "0.1.0", default-features = false, features = ["client", "server", "http1", "http2", "tls", "web", "upgrade", "websocket", "sse", "cors"] }
+async-net = "2"
+
 # HTTP API server
-tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["macros", "ws"] }
-# mTLS for the fleet serve API (control↔node). axum-server's rustls acceptor
-# does the TLS handshake + client-cert verification; rustls-pemfile parses the
-# CA/cert/key PEMs handed to us at enrollment.
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-rustls-pemfile = "2"
+# h12tiny owns HTTP/1.1 + HTTP/2 serving, mTLS handshake/lifecycle, request
+# routing, WebSocket upgrades, and raw upgrades. rustls-pemfile parses the
+# CA/cert/key PEMs handed to us at fleet enrollment.
+rustls = { workspace = true }
+rustls-graviola = "0.4"
+rustls-pemfile = { workspace = true }
 rustls-pki-types = "1"
-tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
-tokio-stream = "0.1"
-# ReaderStream for streaming a cached blob from disk to a peer (GET /p2p/blob).
-tokio-util = { version = "0.7", features = ["io"] }
 parking_lot = "0.12"
 async-stream = "0.3"
-futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+futures-util = { workspace = true }
 
 # OpenAPI documentation
-utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-axum = "0.2"
-utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
+utoipa = "5"
+utoipa-swagger-ui = { version = "9", features = ["vendored"] }
 ipnet = "2.12.0"
 metrics = "0.24"
 
@@ -130,8 +137,6 @@ windows-sys = { version = "0.60", features = [
 tempfile = "3"
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.5" }
 regex = "1"
-tower = { version = "0.5", features = ["util"] }
-wiremock = "0.6"
 
 [build-dependencies]
 pkg-config = "0.3"
@@ -142,6 +147,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 tracing = "0.1"
+futures-lite = { version = "2", default-features = false, features = ["std"] }
+futures-util = "0.3"
+rustls = { version = "0.23", default-features = false }
+rustls-pemfile = "2"
 
 # Release profile optimizations
 [profile.release]
